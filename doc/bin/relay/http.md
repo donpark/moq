@@ -47,8 +47,8 @@ listen = "127.0.0.1:9101"
 
 ### GET /metrics
 
-Prometheus text: bytes, frames, groups, subscriptions, viewers, and sessions
-split by `tier` and `role`, plus accept-loop counters per TCP listener. Alert
+Prometheus text: bytes, frames, groups, announces, subscriptions, viewers, and
+sessions split by `tier` and `role`, plus accept-loop counters per TCP listener. Alert
 on `moq_relay_accept_failures_total{class="exhausted"}`, which means the
 process ran out of a resource `accept` needs. Content dropped for drifting past
 a subscriber's budget is counted separately as `moq_relay_stale_bytes_total`
