@@ -24,6 +24,19 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// `value` microseconds.
+fn us(value: u64) -> MoqTimestamp {
+	MoqTimestamp {
+		value,
+		scale: 1_000_000,
+	}
+}
+
+/// `timestamp` in whole microseconds, whatever scale it was read at.
+fn micros(timestamp: MoqTimestamp) -> u64 {
+	moq_net::Timestamp::try_from(timestamp).unwrap().as_micros() as u64
+}
+
 /// A millisecond track: the frames written here carry timestamps.
 fn timed() -> moq_net::track::Info {
 	moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI)
@@ -603,7 +616,7 @@ async fn raw_audio_activity() {
 		.unwrap();
 	audio
 		.write(MoqAudioFrame {
-			timestamp_us: FIRST_TIMESTAMP_US,
+			timestamp: us(FIRST_TIMESTAMP_US),
 			data: vec![0; FRAME_SAMPLES * std::mem::size_of::<f32>()],
 		})
 		.unwrap();
@@ -612,7 +625,7 @@ async fn raw_audio_activity() {
 		.expect("timed out waiting for raw audio frame")
 		.unwrap()
 		.expect("expected a raw audio frame");
-	assert_eq!(first.timestamp_us, FIRST_TIMESTAMP_US);
+	assert_eq!(micros(first.timestamp), FIRST_TIMESTAMP_US);
 
 	drop(subscription);
 	tokio::time::timeout(TIMEOUT, audio.demand().unwrap().until_unwanted())
@@ -636,7 +649,7 @@ async fn raw_audio_activity() {
 	audio.reanchor().unwrap();
 	audio
 		.write(MoqAudioFrame {
-			timestamp_us: RESUMED_TIMESTAMP_US,
+			timestamp: us(RESUMED_TIMESTAMP_US),
 			data: vec![0; FRAME_SAMPLES * std::mem::size_of::<f32>()],
 		})
 		.unwrap();
@@ -645,14 +658,14 @@ async fn raw_audio_activity() {
 		.expect("timed out waiting for resumed raw audio frame")
 		.unwrap()
 		.expect("expected a resumed raw audio frame");
-	if resumed.timestamp_us == first.timestamp_us {
+	if resumed.timestamp == first.timestamp {
 		resumed = tokio::time::timeout(TIMEOUT, next_encoded_frame(&subscription))
 			.await
 			.expect("timed out waiting for re-anchored raw audio frame")
 			.unwrap()
 			.expect("expected a re-anchored raw audio frame");
 	}
-	assert_eq!(resumed.timestamp_us, RESUMED_TIMESTAMP_US);
+	assert_eq!(micros(resumed.timestamp), RESUMED_TIMESTAMP_US);
 
 	audio.finish().unwrap();
 	broadcast.close().unwrap();
@@ -731,7 +744,7 @@ async fn audio_raw_publish_from_many_threads() {
 		let producer = audio.clone();
 		std::thread::spawn(move || {
 			producer.write(MoqAudioFrame {
-				timestamp_us: 250_000 + index * 20_000,
+				timestamp: us(250_000 + index * 20_000),
 				data: audio_tone(index as usize * 960, 960, 2),
 			})
 		})
@@ -745,13 +758,13 @@ async fn audio_raw_publish_from_many_threads() {
 	while let Some(read) = tokio::time::timeout(TIMEOUT, decoder.next()).await.unwrap().unwrap() {
 		let frame = match read {
 			MoqAudioRead::Frame { frame } => frame,
-			MoqAudioRead::End { end_us } => {
-				assert_eq!(end_us, 250_000 + 8 * 20_000, "the finish ends after the last frame");
+			MoqAudioRead::End { end } => {
+				assert_eq!(micros(end), 250_000 + 8 * 20_000, "the finish ends after the last frame");
 				continue;
 			}
 			MoqAudioRead::Gap { .. } => panic!("nothing was lost"),
 		};
-		assert_eq!(frame.timestamp_us, 250_000 + pcm.len() as u64 / 2 * 1_000_000 / 48_000);
+		assert_eq!(micros(frame.timestamp), 250_000 + pcm.len() as u64 / 2 * 1_000_000 / 48_000);
 		pcm.extend(frame.data.as_chunks::<4>().0.iter().map(|s| f32::from_le_bytes(*s)));
 	}
 	assert_eq!(pcm.len(), 8 * 960 * 2, "finish must preserve the entire PCM duration");
@@ -764,7 +777,7 @@ async fn audio_raw_publish_from_many_threads() {
 	}
 	assert!(matches!(
 		audio.write(MoqAudioFrame {
-			timestamp_us: 0,
+			timestamp: us(0),
 			data: vec![0; 8]
 		}),
 		Err(MoqError::Closed)
@@ -803,7 +816,7 @@ async fn audio_raw_publish_rejects_bad_frames() {
 		assert!(
 			audio
 				.write(MoqAudioFrame {
-					timestamp_us: 0,
+					timestamp: us(0),
 					data: vec![0; size]
 				})
 				.is_err()
@@ -880,7 +893,7 @@ async fn raw_audio_decode_delay() {
 	for i in 0..2 {
 		audio
 			.write(MoqAudioFrame {
-				timestamp_us: i * FRAME_US,
+				timestamp: us(i * FRAME_US),
 				data: audio_tone(i as usize * FRAME_SAMPLES, FRAME_SAMPLES, 1),
 			})
 			.unwrap();
@@ -969,7 +982,7 @@ async fn raw_audio_decode_reports_encoder_ends() {
 		}
 		audio
 			.write(MoqAudioFrame {
-				timestamp_us,
+				timestamp: us(timestamp_us),
 				data: audio_tone(i * FRAME_SAMPLES, FRAME_SAMPLES, 1),
 			})
 			.unwrap();
@@ -980,9 +993,9 @@ async fn raw_audio_decode_reports_encoder_ends() {
 	let mut frames = Vec::new();
 	while let Some(read) = tokio::time::timeout(TIMEOUT, decoder.next()).await.unwrap().unwrap() {
 		match read {
-			MoqAudioRead::Frame { frame } => frames.push((ends.len(), frame.timestamp_us)),
+			MoqAudioRead::Frame { frame } => frames.push((ends.len(), micros(frame.timestamp))),
 			MoqAudioRead::Gap { .. } => panic!("nothing was lost"),
-			MoqAudioRead::End { end_us } => ends.push(end_us),
+			MoqAudioRead::End { end } => ends.push(micros(end)),
 		}
 	}
 	// The reanchor drops whatever the first encoder's lookahead still held, while the
@@ -1039,7 +1052,7 @@ async fn raw_audio_frame_durations() {
 	// 2.5 ms of silence at 48 kHz, mono f32: exactly one encoded frame.
 	audio
 		.write(MoqAudioFrame {
-			timestamp_us: 0,
+			timestamp: us(0),
 			data: vec![0; 120 * std::mem::size_of::<f32>()],
 		})
 		.unwrap();
@@ -1156,7 +1169,7 @@ async fn raw_track_datagram_roundtrip() {
 	let sequence = track
 		.append_datagram(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(123_456),
+			timestamp: Some(us(123_456)),
 		})
 		.unwrap();
 	let datagram = tokio::time::timeout(TIMEOUT, consumer.recv_datagram())
@@ -1166,7 +1179,7 @@ async fn raw_track_datagram_roundtrip() {
 		.expect("expected a datagram");
 
 	assert_eq!(datagram.sequence, sequence);
-	assert_eq!(datagram.timestamp_us, Some(123_456));
+	assert_eq!(datagram.timestamp.map(micros), Some(123_456));
 	assert_eq!(datagram.payload, payload);
 }
 
@@ -1218,7 +1231,7 @@ async fn raw_track_update_does_not_wait_for_pending_read() {
 	track
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(20_000),
+			timestamp: Some(us(20_000)),
 		})
 		.unwrap();
 
@@ -1229,7 +1242,7 @@ async fn raw_track_update_does_not_wait_for_pending_read() {
 		.unwrap()
 		.expect("expected a frame");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, Some(20_000));
+	assert_eq!(frame.timestamp.map(micros), Some(20_000));
 }
 
 /// Subscribe to `name` on `broadcast` as a raw track, for a typed consumer to take over.
@@ -1244,7 +1257,8 @@ async fn subscribe(broadcast: &MoqBroadcastProducer, name: &str) -> Arc<MoqTrack
 
 #[tokio::test(start_paused = true)]
 async fn data_writes_preserve_optional_timestamps() {
-	for timestamp_us in [None, Some(123_456)] {
+	// A 90 kHz tick, which no microsecond count holds exactly.
+	for timestamp in [None, Some(MoqTimestamp { value: 123_457, scale: 90_000 })] {
 		for kind in ["json snapshot", "json stream", "flate snapshot", "flate stream"] {
 			let broadcast = MoqBroadcastProducer::new().unwrap();
 			let track = broadcast
@@ -1254,7 +1268,7 @@ async fn data_writes_preserve_optional_timestamps() {
 						priority: 0,
 						max_age: None,
 						refresh: None,
-						timescale: timestamp_us.map(|_| 1_000_000),
+						timescale: timestamp.map(|timestamp| timestamp.scale),
 						compress: false,
 					}),
 				)
@@ -1273,7 +1287,7 @@ async fn data_writes_preserve_optional_timestamps() {
 					)
 					.unwrap();
 					producer
-						.update(String::from_utf8(payload.to_vec()).unwrap(), timestamp_us)
+						.update(String::from_utf8(payload.to_vec()).unwrap(), timestamp)
 						.unwrap();
 					producer.finish().unwrap();
 				}
@@ -1282,7 +1296,7 @@ async fn data_writes_preserve_optional_timestamps() {
 						MoqJsonStreamProducer::new(&broadcast, &track, MoqJsonStreamConfig { compression: false })
 							.unwrap();
 					producer
-						.append(String::from_utf8(payload.to_vec()).unwrap(), timestamp_us)
+						.append(String::from_utf8(payload.to_vec()).unwrap(), timestamp)
 						.unwrap();
 					producer.finish().unwrap();
 				}
@@ -1296,7 +1310,7 @@ async fn data_writes_preserve_optional_timestamps() {
 						},
 					)
 					.unwrap();
-					producer.update(payload.to_vec(), timestamp_us).unwrap();
+					producer.update(payload.to_vec(), timestamp).unwrap();
 					producer.finish().unwrap();
 				}
 				"flate stream" => {
@@ -1309,15 +1323,15 @@ async fn data_writes_preserve_optional_timestamps() {
 						},
 					)
 					.unwrap();
-					producer.append(payload.to_vec(), timestamp_us).unwrap();
+					producer.append(payload.to_vec(), timestamp).unwrap();
 					producer.finish().unwrap();
 				}
 				_ => unreachable!(),
 			}
 			let frame = consumer.read_frame().await.unwrap().unwrap();
 			assert_eq!(frame.payload, payload, "{kind}");
-			assert_eq!(frame.timestamp_us, timestamp_us, "{kind}");
-			assert_eq!(consumer.info().timescale, timestamp_us.map(|_| 1_000_000));
+			assert_eq!(frame.timestamp, timestamp, "{kind}");
+			assert_eq!(consumer.info().timescale, timestamp.map(|timestamp| timestamp.scale));
 			broadcast.close().unwrap();
 		}
 	}
@@ -1335,14 +1349,14 @@ async fn whole_media_frames_require_the_callers_timestamp() {
 	assert!(matches!(
 		media.write_frame(MoqFrame {
 			payload: b"opus frame".to_vec(),
-			timestamp_us: None
+			timestamp: None
 		}),
 		Err(MoqError::Codec { .. })
 	));
 	media
 		.write_frame(MoqFrame {
 			payload: b"opus frame".to_vec(),
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 	media.finish().unwrap();
@@ -1369,7 +1383,7 @@ async fn catalog_now_fixes_the_clock_for_later_media() {
 	media
 		.write_frame(MoqFrame {
 			payload: b"opus frame".to_vec(),
-			timestamp_us: Some(1_000_000),
+			timestamp: Some(us(1_000_000)),
 		})
 		.unwrap();
 	assert_eq!(
@@ -1408,7 +1422,7 @@ async fn json_snapshot_roundtrip() {
 	let consumer = MoqJsonSnapshotConsumer::new(&*subscribe(&broadcast, "meta").await, config).unwrap();
 
 	for n in 1..=4 {
-		producer.update(format!(r#"{{"a":{n}}}"#), Some(n * 1000)).unwrap();
+		producer.update(format!(r#"{{"a":{n}}}"#), Some(us(n * 1000))).unwrap();
 	}
 
 	let value = tokio::time::timeout(TIMEOUT, consumer.next())
@@ -1420,7 +1434,7 @@ async fn json_snapshot_roundtrip() {
 		serde_json::from_str::<serde_json::Value>(&value.value).unwrap(),
 		serde_json::json!({ "a": 1 })
 	);
-	assert_eq!(value.timestamp_us, Some(1000));
+	assert_eq!(value.timestamp.map(micros), Some(1000));
 
 	let value = tokio::time::timeout(TIMEOUT, consumer.next())
 		.await
@@ -1431,7 +1445,7 @@ async fn json_snapshot_roundtrip() {
 		serde_json::from_str::<serde_json::Value>(&value.value).unwrap(),
 		serde_json::json!({ "a": 2 })
 	);
-	assert_eq!(value.timestamp_us, Some(2000));
+	assert_eq!(value.timestamp.map(micros), Some(2000));
 
 	// `latest` skips the buffered third state.
 	let value = tokio::time::timeout(TIMEOUT, consumer.latest())
@@ -1443,11 +1457,11 @@ async fn json_snapshot_roundtrip() {
 		serde_json::from_str::<serde_json::Value>(&value.value).unwrap(),
 		serde_json::json!({ "a": 4 })
 	);
-	assert_eq!(value.timestamp_us, Some(4000));
+	assert_eq!(value.timestamp.map(micros), Some(4000));
 
 	producer.finish().unwrap();
 	assert!(matches!(
-		producer.update(r#"{"a":5}"#.into(), Some(5000)),
+		producer.update(r#"{"a":5}"#.into(), Some(us(5000))),
 		Err(MoqError::Closed)
 	));
 	let end = tokio::time::timeout(TIMEOUT, consumer.next())
@@ -1595,9 +1609,9 @@ async fn json_window_roundtrip() {
 	let consumer = MoqJsonWindowConsumer::new(&*subscribe(&broadcast, "log").await, config).unwrap();
 
 	for n in 0..3 {
-		producer.push(format!(r#"{{"n":{n}}}"#), Some(n * 1000)).unwrap();
+		producer.push(format!(r#"{{"n":{n}}}"#), Some(us(n * 1000))).unwrap();
 	}
-	producer.pop(2, Some(3000)).unwrap();
+	producer.pop(2, Some(us(3000))).unwrap();
 
 	for n in 0..3 {
 		let event = next_window(&consumer).await.expect("expected a push");
@@ -1605,7 +1619,7 @@ async fn json_window_roundtrip() {
 			event,
 			MoqJsonWindowTimed {
 				event: window_push(n, n),
-				timestamp_us: Some(n * 1000),
+				timestamp: Some(us(n * 1000)),
 			}
 		);
 	}
@@ -1613,16 +1627,16 @@ async fn json_window_roundtrip() {
 		next_window(&consumer).await,
 		Some(MoqJsonWindowTimed {
 			event: MoqJsonWindowEvent::Pop { start: 0, end: 2 },
-			timestamp_us: Some(3000),
+			timestamp: Some(us(3000)),
 		})
 	);
 
 	producer.finish().unwrap();
 	assert!(matches!(
-		producer.push(r#"{"n":3}"#.into(), Some(4000)),
+		producer.push(r#"{"n":3}"#.into(), Some(us(4000))),
 		Err(MoqError::Closed)
 	));
-	assert!(matches!(producer.pop(1, Some(4000)), Err(MoqError::Closed)));
+	assert!(matches!(producer.pop(1, Some(us(4000))), Err(MoqError::Closed)));
 	assert_eq!(next_window(&consumer).await, None);
 }
 
@@ -1655,7 +1669,7 @@ async fn json_window_cut_restates_the_window() {
 			next_window(&consumer).await,
 			Some(MoqJsonWindowTimed {
 				event,
-				timestamp_us: None,
+				timestamp: None,
 			})
 		);
 	}
@@ -1686,7 +1700,7 @@ async fn json_window_cut_restates_the_window() {
 		next_window(&consumer).await,
 		Some(MoqJsonWindowTimed {
 			event: window_push(3, 3),
-			timestamp_us: None,
+			timestamp: None,
 		})
 	);
 
@@ -1739,7 +1753,7 @@ async fn json_window_refreshes_a_bounded_checkpoint_for_a_joiner() {
 			next_window(&consumer).await,
 			Some(MoqJsonWindowTimed {
 				event,
-				timestamp_us: None,
+				timestamp: None,
 			})
 		);
 	}
@@ -1851,7 +1865,7 @@ async fn json_stream_roundtrip() {
 			serde_json::from_str::<serde_json::Value>(&value.value).unwrap(),
 			serde_json::json!({ "n": n })
 		);
-		assert_eq!(value.timestamp_us, None, "an untimed track yields no timestamp");
+		assert_eq!(value.timestamp, None, "an untimed track yields no timestamp");
 	}
 	producer.finish().unwrap();
 }
@@ -1994,7 +2008,7 @@ async fn dynamic_track_request() {
 	track
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 
@@ -2011,7 +2025,7 @@ async fn dynamic_track_request() {
 		.expect("expected a frame");
 
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, Some(0));
+	assert_eq!(frame.timestamp.map(micros), Some(0));
 	track.finish().unwrap();
 }
 
@@ -2024,33 +2038,33 @@ async fn raw_untimed_frames_and_datagrams_roundtrip() {
 	track
 		.write_frame(MoqFrame {
 			payload: b"frame".to_vec(),
-			timestamp_us: None,
+			timestamp: None,
 		})
 		.unwrap();
 	let frame = consumer.read_frame().await.unwrap().unwrap();
 	assert_eq!(frame.payload, b"frame");
-	assert_eq!(frame.timestamp_us, None);
+	assert_eq!(frame.timestamp, None);
 	let group = track.append_group().unwrap();
 	let reader = group.consume().unwrap();
 	group
 		.write_frame(MoqFrame {
 			payload: b"group".to_vec(),
-			timestamp_us: None,
+			timestamp: None,
 		})
 		.unwrap();
 	group.finish().unwrap();
 	let frame = reader.read_frame().await.unwrap().unwrap();
 	assert_eq!(frame.payload, b"group");
-	assert_eq!(frame.timestamp_us, None);
+	assert_eq!(frame.timestamp, None);
 	track
 		.append_datagram(MoqFrame {
 			payload: b"datagram".to_vec(),
-			timestamp_us: None,
+			timestamp: None,
 		})
 		.unwrap();
 	let datagram = consumer.recv_datagram().await.unwrap().unwrap();
 	assert_eq!(datagram.payload, b"datagram");
-	assert_eq!(datagram.timestamp_us, None);
+	assert_eq!(datagram.timestamp, None);
 	track.finish().unwrap();
 }
 
@@ -2061,7 +2075,7 @@ fn raw_writes_need_a_timestamp() {
 	let track = broadcast.publish_track("status".into(), Some(timed_info())).unwrap();
 	let untimed = || MoqFrame {
 		payload: b"ready".to_vec(),
-		timestamp_us: None,
+		timestamp: None,
 	};
 	let refused = |err: MoqError| {
 		matches!(
@@ -2090,7 +2104,7 @@ async fn raw_frame_timestamps() {
 	track
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(12_345),
+			timestamp: Some(us(12_345)),
 		})
 		.unwrap();
 
@@ -2100,7 +2114,7 @@ async fn raw_frame_timestamps() {
 		.unwrap()
 		.expect("expected a frame");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, Some(12_345));
+	assert_eq!(frame.timestamp.map(micros), Some(12_345));
 
 	let group = track.append_group().unwrap();
 	let group_consumer = group.consume().unwrap();
@@ -2108,7 +2122,7 @@ async fn raw_frame_timestamps() {
 	group
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(23_456),
+			timestamp: Some(us(23_456)),
 		})
 		.unwrap();
 	group.finish().unwrap();
@@ -2119,9 +2133,64 @@ async fn raw_frame_timestamps() {
 		.unwrap()
 		.expect("expected a frame");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, Some(23_456));
+	assert_eq!(frame.timestamp.map(micros), Some(23_456));
 
 	track.finish().unwrap();
+}
+
+#[tokio::test]
+async fn timestamps_are_exact() {
+	let broadcast = MoqBroadcastProducer::new().unwrap();
+	let info = MoqTrackInfo {
+		timescale: Some(90_000),
+		..timed_info()
+	};
+	let track = broadcast.publish_track("video".into(), Some(info)).unwrap();
+	let consumer = track.consume(None).unwrap();
+
+	// A present zero stays present, and one 90 kHz tick reads back as itself rather than
+	// the 11 µs it floors to.
+	for value in [0, 1] {
+		let timestamp = MoqTimestamp { value, scale: 90_000 };
+		track
+			.write_frame(MoqFrame {
+				payload: b"frame".to_vec(),
+				timestamp: Some(timestamp),
+			})
+			.unwrap();
+		let frame = tokio::time::timeout(TIMEOUT, consumer.read_frame())
+			.await
+			.unwrap()
+			.unwrap()
+			.unwrap();
+		assert_eq!(frame.timestamp, Some(timestamp));
+	}
+
+	for invalid in [
+		MoqTimestamp { value: 0, scale: 0 },
+		MoqTimestamp {
+			value: 0,
+			scale: 1 << 62,
+		},
+		MoqTimestamp {
+			value: 1 << 61,
+			scale: 90_000,
+		},
+	] {
+		let frame = MoqFrame {
+			payload: b"frame".to_vec(),
+			timestamp: Some(invalid),
+		};
+		assert!(matches!(track.write_frame(frame), Err(MoqError::TimeOverflow)), "{invalid:?}");
+		let range = MoqRange {
+			start: MoqAnchor::Time { timestamp: invalid },
+			end: None,
+		};
+		assert!(matches!(
+			moq_net::track::Range::try_from(range),
+			Err(MoqError::TimeOverflow)
+		));
+	}
 }
 
 #[test]
@@ -2149,7 +2218,7 @@ async fn abort_after_finish_keeps_the_track_handle() {
 	track
 		.write_frame(MoqFrame {
 			payload: b"late abort".to_vec(),
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 	track.finish().unwrap();
@@ -2167,7 +2236,7 @@ async fn abort_after_finish_reaches_group_consumer() {
 	group
 		.write_frame(MoqFrame {
 			payload: b"late abort".to_vec(),
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 	group.finish().unwrap();
@@ -2223,13 +2292,13 @@ async fn fetches_cached_group_without_subscribing() {
 	group
 		.write_frame(MoqFrame {
 			payload: b"first".to_vec(),
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 	group
 		.write_frame(MoqFrame {
 			payload: b"second".to_vec(),
-			timestamp_us: Some(20_000),
+			timestamp: Some(us(20_000)),
 		})
 		.unwrap();
 	group.finish().unwrap();
@@ -2250,10 +2319,10 @@ async fn fetches_cached_group_without_subscribing() {
 	assert_eq!(fetched.sequence(), 0);
 	let frame = fetched.read_frame().await.unwrap().expect("expected first frame");
 	assert_eq!(frame.payload, b"first".to_vec());
-	assert_eq!(frame.timestamp_us, Some(0));
+	assert_eq!(frame.timestamp.map(micros), Some(0));
 	let frame = fetched.read_frame().await.unwrap().expect("expected second frame");
 	assert_eq!(frame.payload, b"second".to_vec());
-	assert_eq!(frame.timestamp_us, Some(20_000));
+	assert_eq!(frame.timestamp.map(micros), Some(20_000));
 	assert!(fetched.read_frame().await.unwrap().is_none());
 }
 
@@ -2302,11 +2371,11 @@ async fn fetches_cached_media_group_and_decodes_container() {
 	assert_eq!(fetched.sequence(), 0);
 	let frame = fetched.next().await.unwrap().expect("expected keyframe");
 	assert_eq!(frame.payload, b"keyframe");
-	assert_eq!(frame.timestamp_us, 1_000_000);
+	assert_eq!(micros(frame.timestamp), 1_000_000);
 	assert!(frame.keyframe);
 	let frame = fetched.next().await.unwrap().expect("expected delta frame");
 	assert_eq!(frame.payload, b"delta");
-	assert_eq!(frame.timestamp_us, 1_020_000);
+	assert_eq!(micros(frame.timestamp), 1_020_000);
 	assert!(!frame.keyframe);
 	assert!(fetched.next().await.unwrap().is_none());
 }
@@ -2384,7 +2453,7 @@ async fn fetch_media_group_decodes_multiple_cmaf_samples() {
 		.unwrap()
 		.expect("expected first sample");
 	assert_eq!(first.payload, b"keyframe");
-	assert_eq!(first.timestamp_us, 2_000_000);
+	assert_eq!(micros(first.timestamp), 2_000_000);
 	assert!(first.keyframe);
 	let second = tokio::time::timeout(TIMEOUT, fetched.next())
 		.await
@@ -2392,7 +2461,7 @@ async fn fetch_media_group_decodes_multiple_cmaf_samples() {
 		.unwrap()
 		.expect("expected second sample");
 	assert_eq!(second.payload, b"delta");
-	assert_eq!(second.timestamp_us, 2_020_000);
+	assert_eq!(micros(second.timestamp), 2_020_000);
 	assert!(!second.keyframe);
 	assert!(
 		tokio::time::timeout(TIMEOUT, fetched.next())
@@ -2469,7 +2538,7 @@ async fn media_group_decodes_arrival_order_groups() {
 	assert_eq!(first_media.sequence(), 0);
 	let frame = next_media(&first_media).await.unwrap().expect("expected a frame");
 	assert_eq!(frame.payload, b"a");
-	assert_eq!(frame.timestamp_us, 1_000_000);
+	assert_eq!(micros(frame.timestamp), 1_000_000);
 	assert!(frame.keyframe);
 
 	// A newer group lands while the first is stalled mid-way.
@@ -2479,7 +2548,7 @@ async fn media_group_decodes_arrival_order_groups() {
 	assert_eq!(second_media.sequence(), 1);
 	let frame = next_media(&second_media).await.unwrap().expect("expected a frame");
 	assert_eq!(frame.payload, b"c");
-	assert_eq!(frame.timestamp_us, 1_040_000);
+	assert_eq!(micros(frame.timestamp), 1_040_000);
 
 	// The stalled group resumes and is still delivered.
 	write_legacy(&mut first, 3, 1_020_000, b"b");
@@ -2488,7 +2557,7 @@ async fn media_group_decodes_arrival_order_groups() {
 		.unwrap()
 		.expect("expected the stalled group's frame");
 	assert_eq!(frame.payload, b"b");
-	assert_eq!(frame.timestamp_us, 1_020_000);
+	assert_eq!(micros(frame.timestamp), 1_020_000);
 	assert!(!frame.keyframe);
 
 	first.finish().unwrap();
@@ -2582,7 +2651,7 @@ async fn dynamic_track_serves_fetch_miss_and_priority() {
 	group
 		.write_frame(MoqFrame {
 			payload: b"fetched".to_vec(),
-			timestamp_us: Some(100_000),
+			timestamp: Some(us(100_000)),
 		})
 		.unwrap();
 	group.finish().unwrap();
@@ -2595,7 +2664,7 @@ async fn dynamic_track_serves_fetch_miss_and_priority() {
 	assert_eq!(fetched.sequence(), 5);
 	let frame = fetched.read_frame().await.unwrap().expect("expected fetched frame");
 	assert_eq!(frame.payload, b"fetched".to_vec());
-	assert_eq!(frame.timestamp_us, Some(100_000));
+	assert_eq!(frame.timestamp.map(micros), Some(100_000));
 }
 
 #[tokio::test]
@@ -2692,7 +2761,7 @@ async fn requested_track_dynamic_survives_accept() {
 	group
 		.write_frame(MoqFrame {
 			payload: b"archive".to_vec(),
-			timestamp_us: Some(180_000),
+			timestamp: Some(us(180_000)),
 		})
 		.unwrap();
 	group.finish().unwrap();
@@ -2704,7 +2773,7 @@ async fn requested_track_dynamic_survives_accept() {
 		.unwrap();
 	let frame = fetched.read_frame().await.unwrap().expect("expected archive frame");
 	assert_eq!(frame.payload, b"archive".to_vec());
-	assert_eq!(frame.timestamp_us, Some(180_000));
+	assert_eq!(frame.timestamp.map(micros), Some(180_000));
 }
 
 #[tokio::test]
@@ -2883,7 +2952,7 @@ async fn dynamic_track_request_can_publish_media() {
 	media
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(20_000),
+			timestamp: Some(us(20_000)),
 		})
 		.unwrap();
 
@@ -2893,7 +2962,7 @@ async fn dynamic_track_request_can_publish_media() {
 		.unwrap()
 		.expect("expected a frame");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, 20_000);
+	assert_eq!(micros(frame.timestamp), 20_000);
 
 	media.discontinuity().unwrap();
 	media.finish().unwrap();
@@ -3548,7 +3617,7 @@ async fn local_publish_consume_audio() {
 	media
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(1_000_000),
+			timestamp: Some(us(1_000_000)),
 		})
 		.unwrap();
 
@@ -3559,7 +3628,7 @@ async fn local_publish_consume_audio() {
 		.expect("expected a frame");
 
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, 1_000_000);
+	assert_eq!(micros(frame.timestamp), 1_000_000);
 
 	broadcast.close().unwrap();
 }
@@ -3619,7 +3688,7 @@ async fn video_publish_consume() {
 	media
 		.write_frame(MoqFrame {
 			payload: keyframe,
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 
@@ -3629,7 +3698,7 @@ async fn video_publish_consume() {
 		.unwrap()
 		.expect("expected frame");
 
-	assert_eq!(frame.timestamp_us, 0);
+	assert_eq!(micros(frame.timestamp), 0);
 	assert!(!frame.payload.is_empty(), "frame should have payload data");
 
 	broadcast.close().unwrap();
@@ -3692,7 +3761,7 @@ async fn video_raw_publish_consume() {
 	for i in 0..5u64 {
 		video
 			.write(MoqVideoFrame {
-				timestamp_us: i * 1_001_000 / 30,
+				timestamp: us(i * 1_001_000 / 30),
 				data: rgba.clone(),
 			})
 			.unwrap();
@@ -3742,7 +3811,7 @@ async fn video_raw_publish_consume() {
 	for i in 5..20u64 {
 		video
 			.write(MoqVideoFrame {
-				timestamp_us: i * 1_001_000 / 30,
+				timestamp: us(i * 1_001_000 / 30),
 				data: rgba.clone(),
 			})
 			.unwrap();
@@ -3804,7 +3873,7 @@ async fn video_decode_frame_ownership() {
 	for i in 0..10u64 {
 		video
 			.write(MoqVideoFrame {
-				timestamp_us: i * 33_333,
+				timestamp: us(i * 33_333),
 				data: rgba.clone(),
 			})
 			.unwrap();
@@ -3852,7 +3921,7 @@ async fn video_decode_frame_ownership() {
 	for i in 10..40u64 {
 		video
 			.write(MoqVideoFrame {
-				timestamp_us: i * 33_333,
+				timestamp: us(i * 33_333),
 				data: rgba.clone(),
 			})
 			.unwrap();
@@ -3966,7 +4035,7 @@ async fn video_raw_publish_from_many_threads() {
 			}
 			video
 				.write(MoqVideoFrame {
-					timestamp_us: i * 33_333,
+					timestamp: us(i * 33_333),
 					data: rgba.as_ref().clone(),
 				})
 				.unwrap();
@@ -4065,7 +4134,7 @@ async fn video_raw_publish_rejects_bad_frames() {
 	assert!(
 		video
 			.write(MoqVideoFrame {
-				timestamp_us: 0,
+				timestamp: us(0),
 				data: vec![0x80u8; 640 * 480 * 4],
 			})
 			.is_err()
@@ -4074,7 +4143,7 @@ async fn video_raw_publish_rejects_bad_frames() {
 	video.finish().unwrap();
 	assert!(matches!(
 		video.write(MoqVideoFrame {
-			timestamp_us: 0,
+			timestamp: us(0),
 			data: vec![0x80u8; 320 * 240 * 4],
 		}),
 		Err(MoqError::Closed)
@@ -4127,7 +4196,7 @@ async fn multiple_frames_ordering() {
 		media
 			.write_frame(MoqFrame {
 				payload: payload.into_bytes(),
-				timestamp_us: Some(ts),
+				timestamp: Some(us(ts)),
 			})
 			.unwrap();
 	}
@@ -4139,7 +4208,7 @@ async fn multiple_frames_ordering() {
 			.unwrap()
 			.unwrap_or_else(|| panic!("expected frame {i}"));
 
-		assert_eq!(frame.timestamp_us, expected_ts, "frame {i} has wrong timestamp");
+		assert_eq!(micros(frame.timestamp), expected_ts, "frame {i} has wrong timestamp");
 		let expected = format!("frame-{i}");
 		assert_eq!(frame.payload, expected.as_bytes(), "frame {i} has wrong payload");
 	}
@@ -4238,7 +4307,7 @@ async fn finish_serves_finished_tracks_until_close() {
 	audio
 		.write_frame(MoqFrame {
 			payload: b"tail".to_vec(),
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 	audio.finish().unwrap();
@@ -4312,7 +4381,7 @@ async fn closing_a_broadcast_ends_its_open_tracks() {
 
 	let frame = MoqFrame {
 		payload: b"late".to_vec(),
-		timestamp_us: Some(0),
+		timestamp: Some(us(0)),
 	};
 	assert!(matches!(raw.write_frame(frame.clone()), Err(MoqError::Closed)));
 	assert!(matches!(raw.finish(), Err(MoqError::Closed)));
@@ -4574,7 +4643,7 @@ async fn dynamic_broadcast_request() {
 	track
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(20_000),
+			timestamp: Some(us(20_000)),
 		})
 		.unwrap();
 
@@ -4584,7 +4653,7 @@ async fn dynamic_broadcast_request() {
 		.unwrap()
 		.expect("expected a frame");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, Some(20_000));
+	assert_eq!(frame.timestamp.map(micros), Some(20_000));
 
 	track.finish().unwrap();
 	served.close().unwrap();
@@ -4703,7 +4772,7 @@ async fn raw_track_next_group_is_repeatable() {
 		track
 			.write_frame(MoqFrame {
 				payload: payload.clone(),
-				timestamp_us: Some(0),
+				timestamp: Some(us(0)),
 			})
 			.unwrap();
 
@@ -4741,7 +4810,7 @@ async fn raw_track_group_order_commits_on_first_read() {
 	track
 		.write_frame(MoqFrame {
 			payload: b"one".to_vec(),
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 
@@ -4759,7 +4828,7 @@ async fn raw_track_group_order_commits_on_first_read() {
 	track
 		.write_frame(MoqFrame {
 			payload: b"two".to_vec(),
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 	let group = tokio::time::timeout(TIMEOUT, consumer.recv_group())
@@ -4773,7 +4842,7 @@ async fn raw_track_group_order_commits_on_first_read() {
 	let sequence = track
 		.append_datagram(MoqFrame {
 			payload: b"beep".to_vec(),
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 	let datagram = tokio::time::timeout(TIMEOUT, consumer.recv_datagram())
@@ -4799,14 +4868,14 @@ fn raw_track() -> (
 fn datagram_frame(payload: &[u8]) -> MoqFrame {
 	MoqFrame {
 		payload: payload.to_vec(),
-		timestamp_us: Some(1),
+		timestamp: Some(us(1)),
 	}
 }
 
 fn group_frame(payload: &[u8]) -> MoqFrame {
 	MoqFrame {
 		payload: payload.to_vec(),
-		timestamp_us: Some(0),
+		timestamp: Some(us(0)),
 	}
 }
 
@@ -5095,7 +5164,7 @@ async fn raw_read_frame_skips_empty_group_on_open_track() {
 	track
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(1_000),
+			timestamp: Some(us(1_000)),
 		})
 		.unwrap();
 
@@ -5106,7 +5175,7 @@ async fn raw_read_frame_skips_empty_group_on_open_track() {
 		.unwrap()
 		.expect("expected a frame");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, Some(1_000));
+	assert_eq!(frame.timestamp.map(micros), Some(1_000));
 }
 
 /// Empty groups already in the cursor are skipped, then the next populated
@@ -5124,7 +5193,7 @@ async fn raw_read_frame_skips_empty_then_populated_groups() {
 	track
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(2_000),
+			timestamp: Some(us(2_000)),
 		})
 		.unwrap();
 
@@ -5134,7 +5203,7 @@ async fn raw_read_frame_skips_empty_then_populated_groups() {
 		.unwrap()
 		.expect("expected the populated group's first frame");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, Some(2_000));
+	assert_eq!(frame.timestamp.map(micros), Some(2_000));
 }
 
 /// A group a hop reset as expired is skipped like an empty one, as a locally expired
@@ -5210,7 +5279,7 @@ async fn raw_read_frame_keeps_group_across_cancelled_call() {
 	group
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(3_000),
+			timestamp: Some(us(3_000)),
 		})
 		.unwrap();
 	group.finish().unwrap();
@@ -5222,7 +5291,7 @@ async fn raw_read_frame_keeps_group_across_cancelled_call() {
 		.unwrap()
 		.expect("cancelled read_frame must not lose the group's first frame");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, Some(3_000));
+	assert_eq!(frame.timestamp.map(micros), Some(3_000));
 
 	assert!(
 		tokio::time::timeout(TIMEOUT, consumer.read_frame())
@@ -5268,7 +5337,7 @@ async fn raw_read_frame_drops_aborted_pending_group() {
 	track
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(4_000),
+			timestamp: Some(us(4_000)),
 		})
 		.unwrap();
 	let frame = tokio::time::timeout(TIMEOUT, consumer.read_frame())
@@ -5277,7 +5346,7 @@ async fn raw_read_frame_drops_aborted_pending_group() {
 		.unwrap()
 		.expect("an aborted pending group must not block later groups");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, Some(4_000));
+	assert_eq!(frame.timestamp.map(micros), Some(4_000));
 }
 
 /// `next_group` and `read_frame` share one ordered cursor. A cancelled
@@ -5294,7 +5363,7 @@ async fn raw_read_frame_and_next_group_share_the_cursor() {
 	first
 		.write_frame(MoqFrame {
 			payload: b"first".to_vec(),
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 	first.finish().unwrap();
@@ -5314,7 +5383,7 @@ async fn raw_read_frame_and_next_group_share_the_cursor() {
 	track
 		.write_frame(MoqFrame {
 			payload: b"second".to_vec(),
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 		})
 		.unwrap();
 	let frame = tokio::time::timeout(TIMEOUT, consumer.read_frame())
@@ -5432,7 +5501,7 @@ fn without_runtime() {
 		media
 			.write_frame(MoqFrame {
 				payload: b"hello".to_vec(),
-				timestamp_us: Some(1000),
+				timestamp: Some(us(1000)),
 			})
 			.unwrap();
 
@@ -5558,7 +5627,7 @@ async fn server_client_roundtrip() {
 	media
 		.write_frame(MoqFrame {
 			payload: payload.clone(),
-			timestamp_us: Some(1_000_000),
+			timestamp: Some(us(1_000_000)),
 		})
 		.unwrap();
 
@@ -5568,7 +5637,7 @@ async fn server_client_roundtrip() {
 		.unwrap()
 		.expect("expected a frame");
 	assert_eq!(frame.payload, payload);
-	assert_eq!(frame.timestamp_us, 1_000_000);
+	assert_eq!(micros(frame.timestamp), 1_000_000);
 
 	// Clean up. Exercise `shutdown()` on the client side and the underlying
 	// `cancel(code)` on the server side, so both shutdown paths run.
@@ -5609,7 +5678,7 @@ async fn roundtrip(media: &MoqMediaTrackProducer, track: &MoqMediaTrackConsumer,
 	media
 		.write_frame(MoqFrame {
 			payload: payload.to_vec(),
-			timestamp_us: Some(timestamp_us),
+			timestamp: Some(us(timestamp_us)),
 		})
 		.unwrap();
 	loop {
@@ -7724,7 +7793,7 @@ async fn shutdown_without_waiter_survives_session_disposal() {
 	let group = track.append_group().unwrap();
 	group
 		.write_frame(MoqFrame {
-			timestamp_us: Some(1),
+			timestamp: Some(us(1)),
 			payload: vec![42; 64 * 1024],
 		})
 		.unwrap();
@@ -7808,7 +7877,7 @@ async fn shutdown_ready(track: &MoqTrackProducer, reader: &MoqTrackConsumer) {
 	let group = track.append_group().unwrap();
 	group
 		.write_frame(MoqFrame {
-			timestamp_us: Some(0),
+			timestamp: Some(us(0)),
 			payload: b"ready".to_vec(),
 		})
 		.unwrap();
@@ -7849,7 +7918,7 @@ async fn shutdown_delivers_the_finished_track() {
 			crate::ffi::detached(async move {
 				let group = track.append_group()?;
 				group.write_frame(MoqFrame {
-					timestamp_us: Some(0),
+					timestamp: Some(us(0)),
 					payload: b"last".to_vec(),
 				})?;
 				group.finish()?;
@@ -7934,7 +8003,7 @@ async fn ascending_subscription_reads_a_cached_backlog_oldest_first() {
 		group
 			.write_frame(MoqFrame {
 				payload: b"x".to_vec(),
-				timestamp_us: Some(timestamp_us),
+				timestamp: Some(us(timestamp_us)),
 			})
 			.unwrap();
 		group.finish().unwrap();
@@ -8145,7 +8214,7 @@ async fn time_anchors_start_at_the_containing_group() {
 		group
 			.write_frame(MoqFrame {
 				payload: b"x".to_vec(),
-				timestamp_us: Some(timestamp_us),
+				timestamp: Some(us(timestamp_us)),
 			})
 			.unwrap();
 		group.finish().unwrap();
@@ -8155,7 +8224,9 @@ async fn time_anchors_start_at_the_containing_group() {
 		priority: 0,
 		max_delay: Some(Duration::from_secs(10)),
 		ranges: Some(vec![MoqRange {
-			start: MoqAnchor::Time { timestamp_us },
+			start: MoqAnchor::Time {
+				timestamp: us(timestamp_us),
+			},
 			end: None,
 		}]),
 		order: Some(MoqOrder::Ascending),
