@@ -2,14 +2,22 @@ https://draft-18-interop.cloudflare.mediaoverquic.com/moq connected via WebTrans
 https://draft-18-interop.cloudflare.mediaoverquic.com/moq negotiated ALPN: moqt-18
 connected version=moq-transport-18
 subscribe_namespace written: requestId=0
-announced: broadcast=smoke-rust-4908-24620.hang active=true
-subscribe start: id=2 broadcast=smoke-rust-4908-24620.hang track=catalog.json
-subscribe written: id=2 broadcast=smoke-rust-4908-24620.hang track=catalog.json
-subscribe ok: id=2 broadcast=smoke-rust-4908-24620.hang track=catalog.json
-subscribe start: id=4 broadcast=smoke-rust-4908-24620.hang track=0.avc3
-subscribe written: id=4 broadcast=smoke-rust-4908-24620.hang track=0.avc3
-subscribe ok: id=4 broadcast=smoke-rust-4908-24620.hang track=0.avc3
-received 7474 bytes from smoke-rust-4908-24620.hang
-subscribe error: id=4 broadcast=smoke-rust-4908-24620.hang track=0.avc3 error=session error: connection error: closed
-announced: broadcast=smoke-rust-4908-24620.hang active=false
-subscribe error: id=2 broadcast=smoke-rust-4908-24620.hang track=catalog.json error=session error: connection error: closed
+announced: broadcast=smoke-rust-4885-27083.hang active=true
+subscribe start: id=2 broadcast=smoke-rust-4885-27083.hang track=catalog.json
+subscribe written: id=2 broadcast=smoke-rust-4885-27083.hang track=catalog.json
+subscribe ok: id=2 broadcast=smoke-rust-4885-27083.hang track=catalog.json
+subscribe start: id=4 broadcast=smoke-rust-4885-27083.hang track=0.avc3
+subscribe written: id=4 broadcast=smoke-rust-4885-27083.hang track=0.avc3
+subscribe ok: id=4 broadcast=smoke-rust-4885-27083.hang track=0.avc3
+received 7474 bytes from smoke-rust-4885-27083.hang
+subscribe_namespace error: session error: connection error: closed
+announced: broadcast=smoke-rust-4885-27083.hang active=false
+broadcast discovery failed; broadcasts resolve on request only. warn: session error: connection error: closed
+ code: "GenericFailure"
+
+      at async #fill (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:167:50)
+      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:333:29)
+      at async <anonymous> (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/ietf/subscriber.js:278:58)
+
+subscribe error: id=2 broadcast=smoke-rust-4885-27083.hang track=catalog.json error=session error: connection error: closed
+subscribe error: id=4 broadcast=smoke-rust-4885-27083.hang track=0.avc3 error=session error: connection error: closed

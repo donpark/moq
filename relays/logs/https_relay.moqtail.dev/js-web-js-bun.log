@@ -11,11 +11,12 @@ announced: broadcast=moqtail/ch02 active=true
 announced: broadcast=moqtail/testsrc active=true
 announced: broadcast=moqtail/ch03 active=true
 announced: broadcast=moqtail/ch00 active=true
-announced: broadcast=smoke-js-web-4908-15789.hang active=true
-subscribe start: id=2 broadcast=smoke-js-web-4908-15789.hang track=catalog.json
-subscribe written: id=2 broadcast=smoke-js-web-4908-15789.hang track=catalog.json
-subscribe ok: id=2 broadcast=smoke-js-web-4908-15789.hang track=catalog.json
+announced: broadcast=smoke-js-web-4885-3059.hang active=true
+subscribe start: id=2 broadcast=smoke-js-web-4885-3059.hang track=catalog.json
+subscribe written: id=2 broadcast=smoke-js-web-4885-3059.hang track=catalog.json
+subscribe ok: id=2 broadcast=smoke-js-web-4885-3059.hang track=catalog.json
 error: timed out waiting for data
+subscribe_namespace error: session error: connection error: closed
 announced: broadcast=moqtail/ch04 active=false
 announced: broadcast=moqtail/ch07 active=false
 announced: broadcast=moqtail/ch06 active=false
@@ -25,5 +26,10 @@ announced: broadcast=moqtail/ch02 active=false
 announced: broadcast=moqtail/testsrc active=false
 announced: broadcast=moqtail/ch03 active=false
 announced: broadcast=moqtail/ch00 active=false
-announced: broadcast=smoke-js-web-4908-15789.hang active=false
-subscribe error: id=2 broadcast=smoke-js-web-4908-15789.hang track=catalog.json error=session error: connection error: closed
+announced: broadcast=smoke-js-web-4885-3059.hang active=false
+broadcast discovery failed; broadcasts resolve on request only. warn: session error: connection error: closed
+ code: "GenericFailure"
+
+      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:333:29)
+
+subscribe error: id=2 broadcast=smoke-js-web-4885-3059.hang track=catalog.json error=session error: connection error: closed

@@ -2,14 +2,20 @@
 [page] announced: prefix=
 [page] announce: prefix=
 [page] announced: broadcast=anon/doom/game/e1m1 active=true
-[page] announced: broadcast=boom-moq-bnsmoke1 active=true
+[page] announced: broadcast=aug-play/e2e-mobile/3e7a71d6-ec03-45f4-8dab-6d0b6721d2f6/camera.hang active=true
+[page] announced: broadcast=aug-play/e2e-mobile/ce0f1a9c-fb62-4016-8e3f-bffd3a892172/camera.hang active=true
+[page] announced: broadcast=aug-play/e2e-mobile/fddd35f6-e5d4-457e-84f2-1ce17b6d729a/camera.hang active=true
+[page] announced: broadcast=aug-play/e2e-prejoin-mobile/1446e733-5c8d-45bd-80c6-0ff57321482b/camera.hang active=true
+[page] announced: broadcast=aug-play/e2e-prejoin-mobile/f3255ad8-207c-4148-a8d3-d992439159ba/camera.hang active=true
+[page] announced: broadcast=aug-play/e2e-room/10aefdda-b091-4399-9794-84f80656f90a/camera.hang active=true
+[page] announced: broadcast=aug-play/e2e-room/20d100a5-efe6-446a-aa18-199493f3b3e4/camera.hang active=true
+[page] announced: broadcast=aug-play/e2e-room/42041c41-8b18-4cc3-a573-23136b13af48/camera.hang active=true
+[page] announced: broadcast=aug-play/e2e-room/905bf17b-5aea-42eb-b938-67d71f2cd832/camera.hang active=true
 [page] announced: broadcast=boom-moq-s2 active=true
-[page] announced: broadcast=room/6add59f11d8068f32675c9f9.hang active=true
-[page] announced: broadcast=smoke-rust-4908-32172.hang active=true
-[page] subscribe start: id=0 broadcast=smoke-rust-4908-32172.hang track=catalog.json
-[page] subscribe ok: id=0 broadcast=smoke-rust-4908-32172.hang track=catalog.json
-[page] received catalog hang smoke-rust-4908-32172.hang {video: Object, audio: Object, archive: Object, clock: Object}
-[page] subscribe start: id=1 broadcast=smoke-rust-4908-32172.hang track=0.avc3
-[page] subscribe ok: id=1 broadcast=smoke-rust-4908-32172.hang track=0.avc3
-[page] subscribe update: id=1 broadcast=smoke-rust-4908-32172.hang track=0.avc3
-decoded 11 frames from smoke-rust-4908-32172.hang (vite)
+[page] announced: broadcast=smoke-rust-4885-12402.hang active=true
+[page] subscribe start: id=0 broadcast=smoke-rust-4885-12402.hang track=catalog.json
+[page] subscribe ok: id=0 broadcast=smoke-rust-4885-12402.hang track=catalog.json
+[page] received catalog hang smoke-rust-4885-12402.hang {video: Object, audio: Object, archive: Object, clock: Object}
+[page] subscribe start: id=1 broadcast=smoke-rust-4885-12402.hang track=0.avc3
+[page] subscribe ok: id=1 broadcast=smoke-rust-4885-12402.hang track=0.avc3
+decoded 11 frames from smoke-rust-4885-12402.hang (vite)

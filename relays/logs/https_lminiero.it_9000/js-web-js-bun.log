@@ -2,16 +2,16 @@ https://lminiero.it:9000/ connected via WebTransport
 https://lminiero.it:9000/ negotiated ALPN: moqt-22
 connected version=moq-transport-22
 subscribe_namespace written: requestId=0
-announced: broadcast=smoke-js-web-4908-13985.hang active=true
-subscribe start: id=2 broadcast=smoke-js-web-4908-13985.hang track=catalog.json
-subscribe written: id=2 broadcast=smoke-js-web-4908-13985.hang track=catalog.json
-subscribe ok: id=2 broadcast=smoke-js-web-4908-13985.hang track=catalog.json
-subscribe start: id=4 broadcast=smoke-js-web-4908-13985.hang track=video
-subscribe written: id=4 broadcast=smoke-js-web-4908-13985.hang track=video
-subscribe ok: id=4 broadcast=smoke-js-web-4908-13985.hang track=video
-received 6587 bytes from smoke-js-web-4908-13985.hang
+announced: broadcast=smoke-js-web-4885-4308.hang active=true
+subscribe start: id=2 broadcast=smoke-js-web-4885-4308.hang track=catalog.json
+subscribe written: id=2 broadcast=smoke-js-web-4885-4308.hang track=catalog.json
+subscribe ok: id=2 broadcast=smoke-js-web-4885-4308.hang track=catalog.json
+subscribe start: id=4 broadcast=smoke-js-web-4885-4308.hang track=video
+subscribe written: id=4 broadcast=smoke-js-web-4885-4308.hang track=video
+subscribe ok: id=4 broadcast=smoke-js-web-4885-4308.hang track=video
+received 6587 bytes from smoke-js-web-4885-4308.hang
 subscribe_namespace error: session error: connection error: closed
-announced: broadcast=smoke-js-web-4908-13985.hang active=false
+announced: broadcast=smoke-js-web-4885-4308.hang active=false
 broadcast discovery failed; broadcasts resolve on request only. warn: session error: connection error: closed
  code: "GenericFailure"
 
@@ -19,5 +19,5 @@ broadcast discovery failed; broadcasts resolve on request only. warn: session er
       at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:333:29)
       at async <anonymous> (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/ietf/subscriber.js:278:58)
 
-subscribe error: id=2 broadcast=smoke-js-web-4908-13985.hang track=catalog.json error=session error: connection error: closed
-subscribe error: id=4 broadcast=smoke-js-web-4908-13985.hang track=video error=session error: connection error: closed
+subscribe error: id=4 broadcast=smoke-js-web-4885-4308.hang track=video error=session error: connection error: closed
+subscribe error: id=2 broadcast=smoke-js-web-4885-4308.hang track=catalog.json error=session error: connection error: closed
