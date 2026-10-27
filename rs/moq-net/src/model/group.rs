@@ -2975,10 +2975,20 @@ impl Consumer {
 
 	/// Pass a read through, releasing the track demand once it reached the group's end.
 	fn ended_on<T>(&self, res: Poll<Result<Option<T>>>) -> Poll<Result<Option<T>>> {
-		if let (Poll::Ready(Ok(None)), Some(expiry)) = (&res, &self.expiry) {
-			expiry.ended();
+		if let Poll::Ready(Ok(None)) = res {
+			self.release_if_finished();
 		}
 		res
+	}
+
+	/// Release the track demand this group holds once it finished, since the track owes it
+	/// nothing more. A range cap ends only this reader, and can be raised, so it keeps it.
+	fn release_if_finished(&self) {
+		if let Some(expiry) = &self.expiry
+			&& self.cursor.state.read().fin.is_some()
+		{
+			expiry.ended();
+		}
 	}
 
 	fn poll_next_frame_once(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<frame::Consumer>>> {
@@ -3117,8 +3127,8 @@ impl Consumer {
 				})
 				.map(|res| res.map(|index| index.expect("finished with an index"))),
 		};
-		if let (Poll::Ready(Ok(_)), Some(expiry)) = (&res, &self.expiry) {
-			expiry.ended();
+		if let Poll::Ready(Ok(_)) = res {
+			self.release_if_finished();
 		}
 		res
 	}

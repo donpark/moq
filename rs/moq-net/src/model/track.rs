@@ -16928,6 +16928,36 @@ mod test {
 		drop(other);
 	}
 
+	/// A reader stopping at its range cap has not reached the group's end: the group is
+	/// still open, so it keeps its track wanted for the others and for a raised cap.
+	#[test]
+	fn a_range_cap_is_not_the_groups_end() {
+		let producer = track_producer("test", Info::timed());
+		let mut subscriber = producer.subscribe(None);
+		let mut writing = producer.append_group().unwrap();
+		writing.write_frame(Timestamp::ZERO, &b"key"[..]).unwrap();
+		let group = subscriber.assert_group();
+		let mut capped = group.clone().with_range(..1);
+		drop(subscriber);
+
+		let waiter = kio::Waiter::noop();
+		assert!(matches!(capped.poll_read_frame(&waiter), Poll::Ready(Ok(Some(_)))));
+		assert!(matches!(capped.poll_read_frame(&waiter), Poll::Ready(Ok(None))));
+		assert!(matches!(capped.poll_finished(&waiter), Poll::Ready(Ok(1))));
+		assert_eq!(producer.demand().wanted(), Some(0), "the cap is not the group's end");
+		drop(group);
+		let producer = producer
+			.abort_unused(Error::Cancel)
+			.expect_err("the capped reader can raise its cap");
+
+		writing.write_frame(Timestamp::ZERO, &b"delta"[..]).unwrap();
+		let mut capped = capped.with_range(..);
+		assert!(matches!(capped.poll_read_frame(&waiter), Poll::Ready(Ok(Some(_)))));
+		writing.finish().unwrap();
+		assert!(matches!(capped.poll_read_frame(&waiter), Poll::Ready(Ok(None))));
+		assert_eq!(producer.demand().wanted(), None, "read to the group's end");
+	}
+
 	/// A fetched group keeps its track wanted after the fetch resolved, while it is read.
 	#[test]
 	#[cfg(feature = "async")]
