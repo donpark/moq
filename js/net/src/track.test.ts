@@ -553,6 +553,19 @@ test("the producer aggregate is clamped without changing subscriber options", as
 	expect(track.subscription.peek()?.maxDelay).toBe(Milli(10_000));
 });
 
+test("a null maxDelay asks for the publisher's max age alone", async () => {
+	const producer = new TrackProducer("test");
+	const history = producer.subscribe({ maxDelay: null });
+	producer.subscribe({ maxDelay: Milli(250) });
+	expect(history.subscription.peek()?.maxDelay).toBeNull();
+	// The most tolerant subscriber wins the aggregate, so null dominates.
+	expect(producer.subscription.peek()?.maxDelay).toBeNull();
+
+	const clamped = producer.subscription.changed();
+	producer.accept({ timescale: Timescale.MILLI, maxAge: Milli(2_000) });
+	expect((await clamped)?.maxDelay).toBe(Milli(2_000));
+});
+
 test("nextGroup skips late arrivals", async () => {
 	const producer = new TrackProducer("test");
 	const track = producer.subscribe().ordered();

@@ -20,6 +20,23 @@ import type { Timestamp } from "./time.ts";
 import type { Demand, Groups, Info, Position, Producer, Request, Subscriber, Subscription } from "./track.ts";
 import type { Advertised, Advertisements } from "./wire.ts";
 
+/**
+ * A subscription's `maxDelay` as a budget in milliseconds, `0` without one: `null` waits as
+ * long as anything could, which the publisher's max age clamps.
+ */
+export function delayBudget(subscription: Pick<Subscription, "maxDelay"> | undefined): number {
+	const maxDelay = subscription?.maxDelay;
+	return maxDelay === null ? Number.POSITIVE_INFINITY : (maxDelay ?? 0);
+}
+
+/**
+ * The `Subscriber Max Age` a wire carries for `maxDelay`: `null` is the publisher's max age
+ * alone, which the largest value every peer can read leaves to its clamp.
+ */
+export function wireDelay(subscription: Pick<Subscription, "maxDelay"> | undefined): number {
+	return Math.min(delayBudget(subscription), Number.MAX_SAFE_INTEGER);
+}
+
 /** Normalize public group bounds into an inclusive start and exclusive end. */
 export function groupBounds(groups: Groups = {}): { start: number; end?: number } {
 	const bound = (value: Groups["start"] | undefined, start: boolean): number | undefined => {

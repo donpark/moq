@@ -52,6 +52,7 @@ import type { Consumer as GroupConsumer } from "./group.ts";
 import {
 	type DropRun,
 	finalSequence,
+	delayBudget,
 	type GroupRecover,
 	groupBounds,
 	hooks,
@@ -912,7 +913,7 @@ class Reader implements ResumeSource {
 
 	/** The reader's budget: how far behind a group may fall before it is skipped. */
 	#budget(): Milli {
-		return this.#shell.subscription.peek()?.maxDelay ?? Milli.zero;
+		return Milli(delayBudget(this.#shell.subscription.peek()));
 	}
 
 	/**

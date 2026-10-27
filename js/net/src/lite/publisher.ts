@@ -368,11 +368,11 @@ function waitForSubscription(
  *
  * A version without the field decodes as `0`, which is indistinguishable from a peer
  * genuinely asking for the live edge. Serving that as real time would discard backlog
- * a legacy subscriber never declined, so fall back to a window wide enough not to drop
+ * a legacy subscriber never declined, so fall back to the publisher's max age alone
  * and leave enforcement to the receiver, as the IETF path does for the same reason.
  */
-function servingMaxDelay(version: Version, requested: number | undefined): number {
-	return carriesMaxDelay(version) ? (requested ?? 0) : Number.MAX_SAFE_INTEGER;
+function servingMaxDelay(version: Version, requested: number): Milli | null {
+	return carriesMaxDelay(version) ? Milli(requested) : null;
 }
 
 /** Whether this version's SUBSCRIBE carries Subscriber Max Age at all. */
@@ -851,7 +851,7 @@ export class Publisher {
 		const track = front.track(msg.track).subscribe({
 			priority: msg.priority,
 			order: msg.order,
-			maxDelay: Milli(servingMaxDelay(this.version, msg.maxDelay)),
+			maxDelay: servingMaxDelay(this.version, msg.maxDelay),
 			groups: {
 				start: msg.startGroup === undefined ? undefined : { included: msg.startGroup },
 				end: endGroup === undefined ? undefined : { excluded: endGroup },
@@ -946,7 +946,7 @@ export class Publisher {
 					track.update({
 						priority: update.priority,
 						order: update.order,
-						maxDelay: Milli(servingMaxDelay(this.version, update.maxDelay)),
+						maxDelay: servingMaxDelay(this.version, update.maxDelay),
 						groups: {
 							start: update.startGroup === undefined ? undefined : { included: update.startGroup },
 							end: end === undefined ? undefined : { excluded: end },

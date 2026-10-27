@@ -22,6 +22,7 @@ import { type Frame, type Consumer as GroupConsumer, Producer as GroupProducer }
 import type { IetfVersion } from "./ietf/version.ts";
 import {
 	type DropRun,
+	delayBudget,
 	dropAt,
 	finalSequence,
 	groupBounds,
@@ -226,11 +227,14 @@ export interface Subscription {
 	 * How long (milliseconds) a non-latest group stays worth delivering, by the same two
 	 * clocks as {@link Info.maxAge}: it is skipped once its successor arrived this long ago
 	 * or starts this far behind the live edge. Defaults to `0`, the live edge only, timed or not.
+	 * `null` is the publisher's {@link Info.maxAge} alone, what a reader reaching back for
+	 * history wants; it dominates when subscriptions combine and goes out as the largest
+	 * delay every peer can read.
 	 * Rounded up to a whole millisecond, so a value derived from a measurement is never
 	 * shortened. A negative or non-finite value, or one past `Number.MAX_SAFE_INTEGER`
 	 * after rounding, is refused.
 	 */
-	maxDelay?: Milli;
+	maxDelay?: Milli | null;
 	/**
 	 * The groups this reader may receive, with an optional floor and cap.
 	 *
@@ -271,7 +275,7 @@ function subscriptionDefaults(subscription: Subscription = {}): Subscription {
 	const bounds = groupBounds(subscription.groups ?? {});
 	return {
 		priority: priorityValue(subscription.priority ?? DEFAULT_PRIORITY),
-		maxDelay: wireMillis("maxDelay", subscription.maxDelay ?? Milli.zero),
+		maxDelay: subscription.maxDelay === null ? null : wireMillis("maxDelay", subscription.maxDelay ?? Milli.zero),
 		order: orderOf(subscription.order),
 		groups: {
 			start: subscription.groups?.start === undefined ? undefined : { included: bounds.start },
@@ -299,7 +303,10 @@ function combineSubscriptions(states: Iterable<TrackState>): Subscription | unde
 		}
 
 		combined.priority = Math.max(combined.priority ?? 0, subscription.priority ?? 0);
-		combined.maxDelay = Milli(Math.max(combined.maxDelay ?? Milli.zero, subscription.maxDelay ?? Milli.zero));
+		combined.maxDelay =
+			combined.maxDelay === null || subscription.maxDelay === null
+				? null
+				: Milli(Math.max(combined.maxDelay ?? Milli.zero, subscription.maxDelay ?? Milli.zero));
 		// One live subscriber held behind another's backlog is worse than a backlog sent late.
 		combined.order =
 			combined.order === "ascending" && subscription.order === "ascending" ? "ascending" : "descending";
@@ -1065,8 +1072,7 @@ export class Producer {
 		const combined = combineSubscriptions(this.#sinks);
 		this.#settle();
 		const retained = this.#state.info.peek()?.maxAge;
-		if (combined && retained !== undefined)
-			combined.maxDelay = Milli(Math.min(combined.maxDelay ?? Milli.zero, retained));
+		if (combined && retained !== undefined) combined.maxDelay = Milli(Math.min(delayBudget(combined), retained));
 		this.#state.update.set(combined);
 		// The requested floor bounds what a pending tail owes.
 		this.#owe();
@@ -1560,7 +1566,7 @@ export class Producer {
 
 	// The grace the session's tail uses, from the max delay the track's subscribers ask for.
 	#grace(): Milli {
-		return grace(this.#state.update.peek()?.maxDelay ?? Milli.zero);
+		return grace(Milli(delayBudget(this.#state.update.peek())));
 	}
 
 	// Tell every reader whether the pending tail still owes a group below the end.
@@ -1832,7 +1838,7 @@ export class Subscriber {
 			}
 		}
 
-		const requested = this.#fetchBudget ?? this.#state.update.peek()?.maxDelay ?? 0;
+		const requested = this.#fetchBudget ?? delayBudget(this.#state.update.peek());
 		const retained = info?.maxAge;
 		return {
 			budget: retained === undefined ? requested : Math.min(requested, retained),

@@ -22,7 +22,16 @@ import {
 } from "../error.ts";
 import * as netGroup from "../group.ts";
 import { Cost, type Hop, MAX_HOPS, type Route, routesEqual, UNKNOWN_HOP } from "../hop.ts";
-import { groupBounds, hiddenBelow, hooks, scopeCaptures, scopeHead, scopeOverlaps } from "../internal.ts";
+import {
+	delayBudget,
+	groupBounds,
+	hiddenBelow,
+	hooks,
+	scopeCaptures,
+	scopeHead,
+	scopeOverlaps,
+	wireDelay,
+} from "../internal.ts";
 import { grace } from "../ledger.ts";
 import type { Lister } from "../listing.ts";
 import * as Path from "../path.ts";
@@ -898,7 +907,7 @@ export class Subscriber {
 			track: request.name,
 			priority: subscription.priority ?? 0,
 			order: subscription.order,
-			maxDelay: subscription.maxDelay,
+			maxDelay: wireDelay(subscription),
 			startGroup: subscription.groups?.start === undefined ? undefined : bounds.start,
 			endGroup: inclusiveGroupEnd(bounds.end),
 		});
@@ -1086,7 +1095,7 @@ export class Subscriber {
 			// presentation-time drift), but it is how long the subscriber was willing to wait
 			// for a late group anyway. Already the smaller of the subscriber's and the track's.
 			tail: new Tail({
-				grace: () => grace(producer.subscription.peek()?.maxDelay ?? Milli.zero),
+				grace: () => grace(Milli(delayBudget(producer.subscription.peek()))),
 			}),
 			requested: msg.startGroup,
 			bounded: msg.endGroup !== undefined,
@@ -1604,7 +1613,7 @@ export class Subscriber {
 				wantedGroup: refresh ?? sentWanted,
 				priority: current.priority ?? 0,
 				order: current.order,
-				maxDelay: current.maxDelay,
+				maxDelay: wireDelay(current),
 				startGroup: current.groups?.start === undefined ? undefined : bounds.start,
 				endGroup: inclusiveGroupEnd(bounds.end),
 			});
@@ -1636,7 +1645,7 @@ export class Subscriber {
 		return (
 			(a.priority ?? 0) === (b.priority ?? 0) &&
 			sameOrder &&
-			(a.maxDelay ?? 0) === (b.maxDelay ?? 0) &&
+			wireDelay(a) === wireDelay(b) &&
 			sameStart &&
 			ag.start === bg.start &&
 			ag.end === bg.end
