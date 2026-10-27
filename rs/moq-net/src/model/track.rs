@@ -445,6 +445,7 @@ pub(crate) struct TrackState {
 	drops: RangeMap<u64, StreamError>,
 	// Bumped on every insert into `drops`, so a cursor rescans it only after a change.
 	drops_revision: u64,
+	drops_changes: ledger::Changes,
 
 	// Whether the cache reflects the live feed: readers get nothing from it while it does
 	// not, since how stale it is cannot be told; fetches still do. A track is live from
@@ -885,7 +886,26 @@ impl TrackState {
 			return;
 		}
 		self.cache.wakes().arrived(groups.clone());
-		self.drops.insert(groups, err);
+		self.change_drops(groups, Some(err));
+	}
+
+	/// Keep the change index aligned with the range map, including the neighbours an
+	/// insertion coalesces and the two pieces a removal can leave.
+	fn change_drops(&mut self, groups: ops::Range<u64>, err: Option<StreamError>) {
+		let mut affected = groups.start.saturating_sub(1)..groups.end.saturating_add(1);
+		let old: Vec<_> = self.drops.overlapping(&affected).map(|(run, _)| run.clone()).collect();
+		for run in old {
+			self.drops_changes.remove(run.start);
+			affected.start = affected.start.min(run.start);
+			affected.end = affected.end.max(run.end);
+		}
+		match err {
+			Some(err) => self.drops.insert(groups, err),
+			None => self.drops.remove(groups),
+		}
+		for (run, _) in self.drops.overlapping(&affected) {
+			self.drops_changes.insert(run.clone());
+		}
 		self.drops_revision += 1;
 	}
 
@@ -1774,7 +1794,7 @@ impl TrackState {
 
 	/// Record that the live feed delivered `sequence`, then fold the gaps that aged out.
 	fn record_arrival(&mut self, sequence: u64, now: crate::time::Instant) {
-		self.arrivals.account(sequence..sequence.saturating_add(1), now);
+		self.arrivals.arrive(sequence, now);
 		// A feed still delivering keeps the gap above its last arrival open.
 		if self.tail.is_some() {
 			self.tail = Some(now);
@@ -1796,8 +1816,7 @@ impl TrackState {
 	/// How long a missing live group is waited for, from the max delay the track's
 	/// subscribers ask for.
 	fn arrival_grace(&self) -> Duration {
-		let max_delay = snapshot_subscription(&self.subscriptions, self.max_age_bound())
-			.map_or(Duration::ZERO, |subscription| subscription.budget());
+		let max_delay = clamp_max_delay(self.subscriptions.lock().max_delay(), self.max_age_bound());
 		ledger::grace(max_delay)
 	}
 
@@ -1907,8 +1926,7 @@ impl TrackState {
 			&& self.drops.contains_key(&sequence)
 			&& let Some(end) = sequence.checked_add(1)
 		{
-			self.drops.remove(sequence..end);
-			self.drops_revision += 1;
+			self.change_drops(sequence..end, None);
 		}
 		let now = self.cache.pool().now_wall();
 		if visible {
@@ -6423,7 +6441,17 @@ impl Cursor {
 			misses.judge(
 				&state,
 				(from, revision, cap),
-				|| below(window.missable(from), cap),
+				|span| {
+					let end = cap.map_or(*span.end(), |cap| (*span.end()).min(cap.saturating_sub(1)));
+					if cap == Some(0) || *span.start() > end {
+						return RangeInclusiveSet::new();
+					}
+					window
+						.missable(*span.start())
+						.take_while(|run| *run.start() <= end)
+						.map(|run| *run.start()..=(*run.end()).min(end))
+						.collect()
+				},
 				drift,
 				&mut given_up,
 				waiter,
@@ -6617,9 +6645,8 @@ impl Cursor {
 
 	/// The next datagram inside this subscriber's range, dropping the ones outside it.
 	///
-	/// The range is the one groups get: the floor, the cap, and the frames its group's
-	/// ranges cover, matched by Object ID.
-	/// Plain datagrams have Object ID 0. A datagram is judged when the cursor reaches
+	/// The floor, cap and time/group ranges select whole datagram groups here; frame
+	/// bounds are applied by the sending session. A datagram is judged when the cursor reaches
 	/// it, against the range in force then, and one outside it is gone for good: unlike a
 	/// group past the cap, nothing holds it for a later raise.
 	fn poll_recv_datagram(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<super::datagram::Stored>>> {
@@ -7177,6 +7204,9 @@ impl Subscriber {
 	/// buffer. Later arrival-order delivery is unchanged, and any outside its group range
 	/// are skipped. A consumer that falls too far behind silently loses the oldest datagrams.
 	///
+	/// A moq-transport group delivers only its normal Object ID 0 payload here. Other
+	/// Object IDs and statuses are skipped; relay paths preserve them with their IDs intact.
+	///
 	/// Returns `Poll::Ready(Ok(Some(datagram)))` when one is available,
 	/// `Poll::Ready(Ok(None))` when the track is finished, `Poll::Ready(Err(e))` when the track
 	/// is aborted, or `Poll::Pending` when none is buffered yet.
@@ -7185,12 +7215,16 @@ impl Subscriber {
 			let Some(datagram) = ready!(self.poll_recv_stored_datagram(waiter))? else {
 				return Poll::Ready(Ok(None));
 			};
-			// A moq-transport status is no datagram an application can read.
-			if datagram
-				.wire
-				.as_ref()
-				.is_some_and(|wire| wire.status.is_some_and(|status| status != 0))
+			// A plain payload cannot identify another object in the same group or a status.
+			if let Some(wire) = &datagram.wire
+				&& (wire.object_id.is_some_and(|id| id > 0) || wire.status.is_some_and(|status| status != 0))
 			{
+				tracing::debug!(
+					sequence = datagram.sequence,
+					object_id = wire.object_id,
+					status = wire.status,
+					"dropping datagram not representable as a plain payload"
+				);
 				continue;
 			}
 			self.meter_datagram(datagram.payload.len() as u64);
@@ -8112,6 +8146,35 @@ mod test {
 	/// normally born from a [`broadcast::Producer`].
 	fn track_producer(name: impl Into<Arc<str>>, info: impl Into<Option<Info>>) -> Producer {
 		Producer::new(Arc::new(broadcast::Info::default()), name, info)
+	}
+
+	#[test]
+	fn drop_changes_follow_split_coalesced_and_recreated_runs() {
+		let producer = track_producer("test", Info::default());
+		let indexed = || {
+			let state = producer.state.read();
+			let mut changed: Vec<_> = state.drops_changes.since(0).collect();
+			changed.sort_by_key(|run| run.start);
+			let current: Vec<_> = state.drops.iter().map(|(run, _)| run.clone()).collect();
+			assert_eq!(changed, current, "one change entry per current drop run");
+		};
+		producer.drop_groups(10..20, StreamError::Old);
+		producer.drop_groups(20..30, StreamError::Old);
+		indexed();
+		producer.drop_groups(15..25, StreamError::Cancel);
+		indexed();
+		producer
+			.create_group(group::Info { sequence: 17 })
+			.unwrap()
+			.finish()
+			.unwrap();
+		indexed();
+		producer.drop_groups(14..26, StreamError::Old);
+		indexed();
+		assert_eq!(
+			producer.state.read().drops_changes.since(0).collect::<Vec<_>>(),
+			vec![10..30]
+		);
 	}
 
 	/// Let `duration` pass on the cache pool `producer`'s groups charge into.
@@ -9403,6 +9466,59 @@ mod test {
 			.insert_datagram(5, Timestamp::ZERO, bytes::Bytes::from_static(b"x"))
 			.unwrap();
 		assert_eq!(recv_datagram(&mut subscriber).sequence, 5);
+	}
+
+	/// Plain readers cannot identify another object in the same datagram group. Skipping it
+	/// must neither consume a late object 0 nor alter the typed reader's arrival stream.
+	#[test]
+	fn plain_datagrams_never_substitute_another_object() {
+		for objects in [&[0, 1, 2][..], &[1, 2, 0], &[1, 2]] {
+			let mut producer = track_producer("test", Info::default());
+			let mut plain = producer.subscribe(None);
+			let mut typed = producer.subscribe(None);
+			let waiter = kio::Waiter::noop();
+			for &object in objects {
+				let stored = super::super::datagram::Stored {
+					datagram: Datagram {
+						sequence: 5,
+						timestamp: None,
+						payload: bytes::Bytes::from(vec![object as u8]),
+					},
+					wire: Some(Arc::new(super::super::datagram::Wire {
+						object_id: Some(object),
+						priority: Some(200),
+						end_of_group: object == 2,
+						status: None,
+						properties: Default::default(),
+					})),
+					deflated: None,
+				};
+				producer.insert_wire_datagram(stored.clone()).unwrap();
+				let Poll::Ready(Ok(Some(kept))) = typed.poll_recv_stored_datagram(&waiter) else {
+					panic!("typed reader lost object {object}");
+				};
+				assert_eq!(kept, stored);
+				match object {
+					0 => {
+						let Poll::Ready(Ok(Some(datagram))) = plain.poll_recv_datagram(&waiter) else {
+							panic!("object 0 was lost in {objects:?}");
+						};
+						assert_eq!((datagram.sequence, &datagram.payload[..]), (5, &[0][..]));
+					}
+					_ => assert!(
+						plain.poll_recv_datagram(&waiter).is_pending(),
+						"object {object} substituted"
+					),
+				}
+			}
+			producer.insert_datagram(6, None, b"next".as_slice()).unwrap();
+			producer.finish().unwrap();
+			let Poll::Ready(Ok(Some(datagram))) = plain.poll_recv_datagram(&waiter) else {
+				panic!("the next datagram was lost in {objects:?}");
+			};
+			assert_eq!((datagram.sequence, &datagram.payload[..]), (6, &b"next"[..]));
+			assert!(matches!(plain.poll_recv_datagram(&waiter), Poll::Ready(Ok(None))));
+		}
 	}
 
 	/// Exercises the full producer -> publisher-encode -> subscriber-decode -> producer seam
