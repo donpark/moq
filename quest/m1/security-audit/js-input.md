@@ -5,7 +5,7 @@
 `@moq/room` refuses `hang/user.json` and `hang/preview.json` values that do
 not match their schema instead of casting them, and the `http://` certificate
 fingerprint fetch in `@moq/net` is aborted when the connection is cancelled
-and accepts only a 64-hex-character SHA-256 fingerprint.
+and reads no more than a 64-hex-character SHA-256 fingerprint.
 
 ## Plan
 
@@ -17,8 +17,11 @@ refused loudly.
 
 `js/net/src/connection/connect.ts` fetches the fingerprint with no abort
 signal (a TODO marks it) and reads an unbounded `.text()`. Wire the
-connection's cancel signal into the fetch and refuse any body that is not
-exactly 64 hex characters.
+connection's cancel signal into the fetch, and read the body incrementally,
+cancelling the stream as soon as it exceeds the fixed fingerprint
+representation (64 hex characters), so the format bounds memory rather than
+the read's completion. A test serves an oversized chunked body with no
+`Content-Length`.
 
 Decided 2026-10-27 (maintainer): keep the `http://` fingerprint path for any
 host, not just loopback (JS-3), so LAN device testing keeps working; its

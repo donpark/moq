@@ -22,7 +22,16 @@ rather than a size pre-check. A pre-check would compare against the frame cap
 that [unbounded groups](/quest/m1/unbounded-groups/README.md) removes, after
 which a large block is a legal large frame. This needs a small block reader
 beside ebml-iterable for the block header and payload; prefer an upstream
-ebml-iterable option if one fits. A test feeds a huge declared block in
-chunks and asserts held bytes stay bounded.
+ebml-iterable option if one fits. Ignored elements are discarded as their
+bytes arrive instead of buffered.
+
+Open, for the maintainer before building: `Import::new` decodes `Info`,
+`Tracks`, and `TrackEntry` as whole masters, so a header declaring a huge one
+still pins input. Bring options with a recommendation, such as handling
+their children incrementally as the importer already does for Clusters; a
+blanket tag-size cap is ruled out above. Tests feed a huge declared block,
+metadata master, and ignored element in chunks and assert held bytes stay
+bounded. Settle this together with the same question in
+[fMP4 import streams mdat](/quest/m1/security-audit/fmp4-stream-mdat.md).
 
 Public API: none expected. Wire: none.
