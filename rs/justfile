@@ -237,6 +237,8 @@ c-tests:
 
 # Benchmarks and examples stay in Nightly; the gate compiles the same targets
 # it tests, with both extremes exercising feature-gated implementation arms.
+# Third-party features come from the workspace-hack here; `features` isolates
+# those nightly.
 
 # Isolate selected packages so a dependent cannot enable a feature that hides a warning.
 [positional-arguments]
@@ -251,6 +253,10 @@ features:
     just rs tokio-features --all
     just rs media-features --all
     bash sh/local.sh cargo check --locked --workspace {{ no_fuzz }} --all-targets --no-default-features
+    # The workspace-hack is a dev-dependency, so only library and binary builds
+    # prove that each crate declares the third-party features it uses.
+    bash sh/local.sh cargo hack check --locked --workspace {{ no_fuzz }} --no-default-features
+    bash sh/local.sh cargo hack check --locked --workspace {{ no_fuzz }} --all-features
     bash sh/local.sh cargo hack check --locked -p moq-tokio --each-feature --exclude-features _transport --features aws-lc-rs
     bash sh/local.sh cargo check --locked -p moq-relay --no-default-features
     just rs relay-minimal
