@@ -35,6 +35,7 @@ jobs:
     name: Plz
 
     runs-on: ubuntu-latest
+    environment: moq-bot
     if: ${{ github.repository_owner == 'moq-dev' && github.ref == 'refs/heads/release' }}
 
     env:

@@ -117,6 +117,7 @@ jobs:
     name: Publish to Go module mirror
     needs: [ffi, package]
     runs-on: ubuntu-latest
+    environment: moq-bot
     if: github.ref_type == 'tag'
 
     steps:

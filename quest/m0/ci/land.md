@@ -77,27 +77,36 @@ Decided 2026-10-26 (maintainer):
   reference the Environment. Only the hosted land job reads it, never the job
   that runs PR code.
 
-Work in this repository:
+Draft source in [moq-dev/moq#7024](https://github.com/moq-dev/moq/pull/7024)
+prepares the three phases, trusted Quest installation, the read-only worker,
+head-pinned Dependabot requests, bot-key Environment declarations, and the
+event policy and setup tests. No workflow was deployed, queue entry changed,
+ruleset written, or credential moved. `release` keeps its own PR checks.
 
-- The workflow: queue events (landing requested through `quest merge
-  --land`, a push dequeuing), one concurrency group, inputs resolved on a
-  hosted job, the chain built and tested on `vars.MOQ_QUEUE_RUNNER` with a
-  read-only token, and the land job on a hosted runner.
-- The main ruleset drops its `merge_queue` rule. It requires a check that PR
-  heads never carry, so GitHub's merge button and auto-merge cannot land
-  around the gate. The admin role keeps its emergency bypass. Ruleset writes
-  are the maintainer's; agents only read.
-- `check.yml` and `alert.yml` stop listing `merge_group`, and Check runs
-  inside the gate. `.github/actions/rust-cache`, `.github/actionlint.yaml`,
-  and `sh/gh/queue.test.ts` follow, and the test asserts the new event policy.
-- `dependabot.yml` requests landing through the gate instead of
-  `gh pr merge --auto`, which the new ruleset leaves with no path to `main`,
-  and keeps its coupled smoke update guard.
-- Docs that describe the queue: `CONTRIBUTING.md` (its merge queue section
-  and priority rule), `README.md`, `doc/setup/dev.md`, `infra/README.md`,
-  `justfile`, `sh/kt/check.sh`, and `test/drill/README.md`.
-- `release` keeps its own ruleset and PR checks. It has no queue.
-- Measure merged PRs per hour and enqueue-to-merged latency for a busy day
-  against the baseline, and record both in the PR.
+Remaining before completion:
+
+- **Maintainer cutover.** On 2026-10-27 the main ruleset still requires
+  `Check`, contains `merge_queue`, and admits only the administrator bypass.
+  Add the bot bypass and replace those two requirements with `quest land`,
+  pinned to an app that never reports it on PR heads. Coordinate source
+  installation with that ruleset change: removing `merge_group` cannot
+  pass the old queue, and changing protection first stops that queue.
+- **Protect the credential's refs.** The `moq-bot` Environment does not yet
+  exist. Create it for `main`, `release`, and `moq-ffi-v*`, with the FFI tag
+  creation/update/deletion restrictions installed first. The current
+  protected release-tag list lacks `moq-ffi-v*`. Put the bot key there, and
+  ensure the workflows still running from `release` name the Environment
+  before removing repository-level keys. See `infra/README.md` for the
+  prepared setup sequence; the maintainer decides the cutover window.
+- **Squash body policy.** The pinned engine is available, but
+  [its message builder](https://github.com/kixelated/quest/blob/fd1d88fb19317afc1c0cbca34cc23e9cf4d32375/src/cli/land.ts#L511)
+  preserves individual commit messages as well as co-author trailers.
+  This quest and CONTRIBUTING require only the trailers. Align the
+  upstream engine with that settled policy before deployment, rather than
+  silently changing repository history policy in the workflow.
+- **Live evidence.** Exercise the gate and its ejections after the
+  maintainer's cutover, including an editable fork, and measure a busy
+  day's merged PRs/hour and enqueue-to-merged latency against the baseline.
+  Local event-policy tests do not establish those outcomes.
 
 Public API: none. Wire: none.

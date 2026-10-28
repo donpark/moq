@@ -10,7 +10,7 @@ name: release-brew
 # download them.
 #
 # Authenticates as the moq-bot GitHub App. The APP_CLIENT_ID and APP_PRIVATE_KEY
-# repo secrets are already wired (see release-swift-lib.yml). The minted
+# Environment secrets are shared with the other release jobs. The minted
 # installation token is scoped to moq-dev/homebrew-tap and expires in 1
 # hour.
 
@@ -42,6 +42,7 @@ jobs:
       github.event.workflow_run.head_repository.full_name == github.repository &&
       startsWith(github.event.workflow_run.head_branch, 'moq-')
     runs-on: ubuntu-latest
+    environment: moq-bot
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

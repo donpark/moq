@@ -211,6 +211,7 @@ jobs:
     # Directly on ffi-release: its gate is what makes the head_sha checkout trusted.
     needs: [ffi-release, build, verify]
     runs-on: ubuntu-latest
+    environment: moq-bot
     if: ${{ needs.build.outputs.publish == 'true' }}
 
     steps:

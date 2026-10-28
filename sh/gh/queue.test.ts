@@ -1,11 +1,10 @@
-// Exercise the event policy: main PRs run no cloud CI, the merge queue runs only
-// Check, and release PRs keep everything, behind Check and the Release gate,
-// since release has no queue.
+// Main PRs run in the isolated batched gate; release PRs retain their own checks.
 import assert from "node:assert/strict";
 import { readdir } from "node:fs/promises";
 
 const workflow = async (name: string) => Bun.YAML.parse(await Bun.file(`.github/workflows/${name}.yml`).text());
 const check = await workflow("check");
+const land = await workflow("land");
 const gate = await workflow("release-gate");
 const platform = await workflow("platform");
 const dart = await workflow("release-dart-ffi");
@@ -20,8 +19,8 @@ function condition(expression: string, event: string, base: string, selected = t
 	return new Function("github", "needs", `return (${source});`)(github, { scope: { outputs } });
 }
 
-// Check is main's only queue gate. Every PR reports its required name, but only release PRs and merge groups do the work.
-assert.ok(check.on.merge_group);
+// Check stays reportable on main PRs, but only release PRs execute it.
+assert.equal(check.on.merge_group, undefined);
 assert.equal(check.on.pull_request.paths, undefined, "required PR contexts must always report");
 assert.equal(check.on.pull_request.branches, undefined, "main PRs must report the required names");
 assert.ok(check.on.pull_request.types.includes("edited"), "retargeting to release must rerun");
@@ -30,14 +29,34 @@ for (const job of [check.jobs.check]) {
 	assert.equal(condition(job.if, "pull_request", "release"), true);
 	assert.equal(condition(job.if, "pull_request", "release", true, "edited"), true);
 	assert.equal(condition(job.if, "pull_request", "release", true, "closed"), false);
-	assert.equal(condition(job.if, "merge_group", "", true, "checks_requested"), true);
-	// A destroyed group's run only cancels its stale build through the shared queue ref.
-	assert.equal(condition(job.if, "merge_group", "", true, "destroyed"), false);
 }
-assert.deepEqual(check.on.merge_group.types, ["checks_requested", "destroyed"]);
 // biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub expression is literal YAML.
 assert.equal(check.concurrency.group, "check-${{ github.ref }}");
 assert.equal(check.concurrency["cancel-in-progress"], true);
+
+// The plan is resolved on hosted infrastructure. PR code sees only a read
+// credential; a separate hosted job rebuilds the chain before pushing it.
+assert.deepEqual(land.permissions, {});
+assert.equal(land.concurrency.group, "land");
+assert.equal(land.concurrency["cancel-in-progress"], false);
+assert.deepEqual(land.on.push.branches, ["main"]);
+for (const event of ["auto_merge_enabled", "auto_merge_disabled", "synchronize"]) {
+	assert.ok(land.on.pull_request_target.types.includes(event));
+}
+assert.equal(land.jobs.resolve["runs-on"], "ubuntu-latest");
+assert.equal(land.jobs.land["runs-on"], "ubuntu-latest");
+assert.equal(land.jobs.resolve.permissions.contents, "read");
+assert.deepEqual(land.jobs.check.permissions, { contents: "read" });
+assert.equal(land.jobs.check.environment, undefined);
+assert.equal(land.jobs.land.environment, "moq-bot");
+assert.deepEqual(land.jobs.land.needs, ["resolve", "check"]);
+for (const job of Object.values(land.jobs) as { steps: { uses?: string; with?: { ref?: string } }[] }[]) {
+	const checkout = job.steps.find((step) => step.uses?.startsWith("actions/checkout@"));
+	assert.equal(checkout?.with?.ref, "main", "every phase installs Quest from trusted main");
+}
+assert.ok(!JSON.stringify(land.jobs.check).includes("APP_PRIVATE_KEY"));
+assert.ok(land.jobs.check.steps.find((step: { id?: string }) => step.id === "check").run.includes('just ci "$base"'));
+assert.ok(land.jobs.land.steps.some((step: { run?: string }) => step.run?.includes("quest land push")));
 
 // Every other workflow stays out of main PRs and main's merge groups: optional
 // checks run nightly on main, and on release PRs through the Release gate.
@@ -48,7 +67,21 @@ for (const file of files) {
 	const config = await workflow(name);
 	assert.equal(config.on.merge_group, undefined, `${file} must not run in the merge queue`);
 	assert.equal(config.on.pull_request, undefined, `${file} must run on release PRs through release-gate.yml`);
+	for (const [id, job] of Object.entries(config.jobs ?? {})) {
+		if (JSON.stringify(job).includes("APP_PRIVATE_KEY")) {
+			assert.equal((job as { environment?: string }).environment, "moq-bot", `${file}/${id} must scope the bot key`);
+		}
+	}
 }
+
+const dependabot = await workflow("dependabot");
+const request = dependabot.jobs["request-landing"];
+const enqueue = request.steps.find((step: { name?: string }) => step.name === "Request checked landing");
+// biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub expression is literal YAML.
+assert.equal(enqueue.env.PR_HEAD, "${{ github.event.pull_request.head.sha }}");
+assert.ok(enqueue.run.includes('quest merge "$PR_URL" "$hold" --land "$PR_HEAD"'));
+assert.ok(enqueue.run.includes("quest land resolve --base main"));
+assert.ok(!JSON.stringify(request).includes("gh pr merge"));
 
 // Release PRs report one context for every optional workflow, retargeted PRs included.
 assert.deepEqual(Object.keys(gate.on), ["pull_request"]);

@@ -1,0 +1,149 @@
+name: Land
+
+# Read the queue on hosted infrastructure, test without a push credential, then
+# reconstruct and land the passing prefix on a separate hosted runner.
+on:
+  pull_request_target:
+    types: [auto_merge_enabled, auto_merge_disabled, synchronize, closed, edited]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: land
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: github.repository == 'moq-dev/moq' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    outputs:
+      plan: ${{ steps.resolve.outputs.plan }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+      - name: Install trusted quest
+        run: |
+          mkdir -p .tmp
+          nix build --out-link .tmp/quest-cli .#quest
+          echo "$PWD/.tmp/quest-cli/bin" >> "$GITHUB_PATH"
+      - name: Resolve queue
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "plan=$(quest land resolve --base main)" >> "$GITHUB_OUTPUT"
+
+  check:
+    needs: resolve
+    runs-on: ${{ vars.MOQ_QUEUE_RUNNER }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.check.outputs.result }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          # The engine fetches queued heads after checkout. This read-only
+          # credential stays on the worker; the bot key never reaches it.
+          persist-credentials: true
+      - uses: ./.github/actions/just
+      - name: Install trusted quest
+        run: |
+          mkdir -p .tmp
+          nix build --out-link .tmp/quest-cli .#quest
+          echo "$PWD/.tmp/quest-cli/bin" >> "$GITHUB_PATH"
+      - name: Rust cache
+        uses: ./.github/actions/rust-cache
+      - name: Check queued prefix
+        id: check
+        env:
+          PLAN: ${{ needs.resolve.outputs.plan }}
+          NEXTEST_TEST_THREADS: 24
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          mkdir -p .tmp/land
+          printf '%s' "$PLAN" > .tmp/land/plan.json
+          base=$(jq -er '.base.sha' .tmp/land/plan.json)
+          echo "result=$(quest land check .tmp/land/plan.json -- nix develop --command just ci "$base")" >> "$GITHUB_OUTPUT"
+      - name: Upload build timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cargo-timings
+          path: target/cargo-timings/cargo-timing-*.html
+          if-no-files-found: ignore
+          retention-days: 14
+
+  land:
+    needs: [resolve, check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: moq-bot
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+      checks: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/nix
+      - name: Install trusted quest
+        run: |
+          mkdir -p .tmp
+          nix build --out-link .tmp/quest-cli .#quest
+          echo "$PWD/.tmp/quest-cli/bin" >> "$GITHUB_PATH"
+      - name: Generate moq-bot token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        id: token
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: moq-dev
+          repositories: moq
+          permission-contents: write
+          permission-workflows: write
+      - name: Authenticate pushes
+        env:
+          BOT_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          header=$(printf 'x-access-token:%s' "$BOT_TOKEN" | base64 -w0)
+          echo "::add-mask::$header"
+          git config http.https://github.com/.extraheader "AUTHORIZATION: basic $header"
+      - name: Land checked prefix
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN: ${{ needs.resolve.outputs.plan }}
+          RESULT: ${{ needs.check.outputs.result }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          mkdir -p .tmp/land
+          printf '%s' "$PLAN" > .tmp/land/plan.json
+          printf '%s' "$RESULT" > .tmp/land/result.json
+          quest land push .tmp/land/plan.json .tmp/land/result.json > .tmp/land/changed
+          cat .tmp/land/changed
+          if [ -s .tmp/land/changed ]; then gh workflow run land.yml --ref main; fi
+      - name: Remove push credential
+        if: ${{ always() }}
+        run: git config --unset-all http.https://github.com/.extraheader || test "$?" = 5
