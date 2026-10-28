@@ -137,4 +137,3 @@ The historical samples locate candidates; they are not controlled benchmarks.
 - [Recovery clips once](/quest/m0/ci/recovery-clips.md) - `recovery_test`'s FFmpeg clips encode once per run, not once per process
 - [Padding runs](/quest/m0/ci/quic-padding.md) - moq-quic parses a PADDING run as one frame, keeping the padding stats' meaning
 - [tracing-test filter](/quest/m0/ci/tracing-filter.md) - moq-tokio's tests stop forcing every crate to format at TRACE
-- [Stats oversize](/quest/m0/ci/stats-oversize.md) - moq-stats refuses an oversized plain snapshot before parsing it back
