@@ -875,15 +875,16 @@ async fn the_video_held_at_the_end_goes_out() {
 // turn once the walk passes the delay, and one running fast makes the buffer grow without bound.
 // The output's clock may follow it only as fast as 13818-1 lets a system clock change, so
 // reaching a source 30 ppm off takes hours (the jitter buffer's own tests run a day); these
-// cases run five minutes of a source at the limit, long enough to measure its rate.
+// cases run a minute of a source at the limit, long enough to measure its rate: frames arrive
+// on the source's exact clock, so the measurement settles within a few steering steps.
 
 /// How far the instant each slot goes out may wander against the source over a run: what
 /// reaching a source at the limit costs under the slew limit (30 ppm squared over twice
 /// 0.075 Hz/s of 27 MHz), and a slot.
 const DRIFT_SLACK: Duration = Duration::from_millis(162 + 25);
 
-/// Five minutes of media.
-const DRIFT_TICKS: u64 = 300_000_000 / VIDEO_US;
+/// A minute of media.
+const DRIFT_TICKS: u64 = 60_000_000 / VIDEO_US;
 
 /// The spread of (slot sent − source's clock at the slot) after the first 10 s over `ticks`
 /// of media, the drops, and the export's stats at the end.
@@ -928,7 +929,7 @@ async fn a_fast_source_clock_keeps_the_delay() {
 /// A source 400 ppm off, past what the output's clock may follow, is measured and counted.
 #[tokio::test(start_paused = true)]
 async fn a_source_past_the_limit_is_counted() {
-	let (_, _, stats) = on_a_scaled_clock(1.0004, 300_000_000 / VIDEO_US).await;
+	let (_, _, stats) = on_a_scaled_clock(1.0004, DRIFT_TICKS).await;
 	let drift = stats.release.drift.expect("a measurement");
 	assert!((drift - 400.0).abs() < 1.0, "measured {drift} ppm");
 	assert!(stats.release.out_of_tolerance > 0, "not counted");
