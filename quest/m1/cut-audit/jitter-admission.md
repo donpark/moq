@@ -38,6 +38,31 @@ the single invariant, check whether acquisition, the leapt/lagging arms,
 and some of the nine tuning constants can go. Land what the measurement
 supports; record what it does not.
 
+Investigation in [moq-dev/moq#7012](https://github.com/moq-dev/moq/pull/7012):
+
+- A mocked-clock 120-second feed, with audio at 1x and video at 3x, reaches
+  4,938 queued frames under the original admission rule. The candidate's
+  newest-deadline check holds at most 54 frames for its two 20 ms tracks
+  and 500 ms delay, including one lookahead frame per track.
+- Admission needs each track's lead before the first two-second steering
+  window. Seeding it from acquisition fixes clean-path losses and the
+  different-lead publisher handoff regression introduced by the first
+  candidate. It does not replace acquisition or discontinuity alignment.
+- The candidate is incomplete. Resolve the TS integration before landing:
+  `declared_reorder_sizes_the_decode_clock_from_the_first_frame` renders
+  different bytes; `a_lost_discontinuity_marker_still_breaks_the_clock`
+  loses an on-time audio frame; and `a_pid_removed_can_return_as_another_stream`,
+  `each_version_out_follows_the_last_by_one_change`, and
+  `the_version_wraps_after_31` miss a decode deadline on PID 32. The
+  reorder, clean-path, drift, and different-lead handoff checks were also
+  compared with the original admission function, where they pass. Keep the
+  production guarantees and test assertions while reconciling admission
+  with TS release keys, source cursor budgets, and timeline transitions.
+- The added admission benchmark sweeps 1/4/16/64 tracks against
+  64/256/1024 source frames. At 64 tracks, the original fill grows from
+  0.507 ms to 7.696 ms, while the candidate stays about 0.230-0.236 ms.
+  This measures bounded read work, not an acceptable final implementation.
+
 Public API: none. Wire: none.
 
 ## Related

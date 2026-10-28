@@ -462,7 +462,7 @@ impl Track {
 		self.release(name, jitter, false)
 	}
 
-	/// Read until a frame is due, or hold the first frame until the program tables are built.
+	/// Read within the jitter window, or hold the first frame until the program tables are built.
 	fn fill(&mut self, name: &str, waiter: &kio::Waiter, input: &mut Input<'_>) -> crate::Result<()> {
 		if self.key.name.is_empty() {
 			self.key.name = name.to_string();
@@ -1807,7 +1807,7 @@ where
 			}
 		}
 
-		// 2. Read each source until it has a frame due, or before the program tables
+		// 2. Read each source within its jitter window, or before the program tables
 		// are built, hold one per track.
 		self.fill(waiter)?;
 
@@ -1953,7 +1953,7 @@ where
 		Ok(())
 	}
 
-	/// Read each source until it has a frame due.
+	/// Read each source within its jitter window.
 	///
 	/// Before the program tables are built, each track holds its first frame instead,
 	/// and slices that arrive before their codec config resolves are dropped: a receiver

@@ -464,7 +464,7 @@ impl<S: Stream> Export<S> {
 		self
 	}
 
-	/// Read each track until it has a frame due, preserving ingress timing before buffering.
+	/// Read each track within its jitter window, preserving ingress timing before buffering.
 	fn fill(&mut self, waiter: &kio::Waiter) -> anyhow::Result<()> {
 		for kind in [0, 1] {
 			let count = if kind == 0 { self.video.len() } else { self.audio.len() };

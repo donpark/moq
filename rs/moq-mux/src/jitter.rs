@@ -570,6 +570,13 @@ impl<K: Ord, T> Acquire<K, T> {
 	/// decode time) is that track's slack less its queueing, and of those, the one with the least
 	/// slack, so the track sent latest against its decode time still has the delay.
 	fn fresh(&self) -> (&K, &Arrival<T>) {
+		self.freshest()
+			.into_iter()
+			.max_by_key(|(_, frame)| since(self.since, frame.read) - frame.decode.as_nanos())
+			.expect("an acquisition holds a frame")
+	}
+
+	fn freshest(&self) -> BTreeMap<&K, &Arrival<T>> {
 		let behind = |frame: &Arrival<T>| since(self.since, frame.read) - frame.decode.as_nanos();
 		let mut freshest: BTreeMap<&K, &Arrival<T>> = BTreeMap::new();
 		for (key, frame) in &self.frames {
@@ -579,9 +586,6 @@ impl<K: Ord, T> Acquire<K, T> {
 			}
 		}
 		freshest
-			.into_iter()
-			.max_by_key(|(_, frame)| behind(frame))
-			.expect("an acquisition holds a frame")
 	}
 
 	/// When it ends: once a frame that could still go out on time falls due on the freshest
@@ -906,6 +910,13 @@ impl<K: Ord + Clone, T> Engine<K, T> {
 			&& kept < horizon
 		{
 			clock.anchor += horizon - kept;
+		}
+		// Admission needs each track's lead before the first steering window completes.
+		for (key, frame) in acquire.freshest() {
+			if let Some(deadline) = self.deadline(&clock, frame.decode) {
+				let lead = since(frame.read, deadline) as f64 / 1e9 - self.delay.as_secs_f64();
+				self.leads.entry(key.clone()).or_insert_with(|| VecDeque::from([lead]));
+			}
 		}
 		self.previous = self.clock.replace(clock);
 		self.steer = Steer::default();
@@ -1386,16 +1397,25 @@ impl<K: Ord + Clone, T> Engine<K, T> {
 			.min()
 	}
 
-	/// Whether `key` has a frame waiting that is already due (any frame, without a delay), so
-	/// reading more of it now would only queue what the output cannot take yet.
+	/// Whether `key` has output due, or its newest queued frame is beyond the delay and its
+	/// measured lead, so reading more would move future backlog out of the source.
 	pub fn full<Q: Ord + ?Sized>(&self, key: &Q) -> bool
 	where
 		K: Borrow<Q>,
 	{
-		self.tracks
-			.get(key)
-			.and_then(|track| track.queue.front())
-			.is_some_and(|(_, _, deadline, _)| self.delay.is_zero() || *deadline <= moq_clock::now())
+		let Some((key, track)) = self.tracks.get_key_value(key) else {
+			return false;
+		};
+		let Some((_, _, first, _)) = track.queue.front() else {
+			return false;
+		};
+		let now = moq_clock::now();
+		if self.delay.is_zero() || *first <= now {
+			return true;
+		}
+		let lead = Duration::from_secs_f64(self.lead(key).unwrap_or(0.0).max(0.0));
+		let (_, _, last, _) = track.queue.back().expect("the first frame is queued");
+		*last > now + self.delay + lead
 	}
 
 	/// How many frames are waiting.
@@ -2855,6 +2875,10 @@ mod tests {
 		tokio::time::advance(Duration::from_millis(100)).await;
 		assert_eq!(due(&mut buffer), ["a20"], "the audio keeps the delay");
 		assert_eq!(buffer.next_deadline(), Some(start + Duration::from_millis(400)));
+		assert!(
+			!buffer.full(&1),
+			"acquisition measures the video lead before steering starts"
+		);
 		assert_eq!(buffer.dropped(), 0);
 	}
 
@@ -2935,23 +2959,59 @@ mod tests {
 		assert_eq!(buffer.dropped(), 0);
 	}
 
-	/// A track is full once a frame of it is due, or holds any frame without a delay, so its
-	/// reader leaves the rest in the source.
+	/// Due output and a future tail each stop reads, while another track and a measured lead
+	/// keep their own admission windows.
 	#[tokio::test(start_paused = true)]
-	async fn a_track_is_full_once_a_frame_is_due() {
+	async fn admission_respects_due_output_the_future_tail_and_each_tracks_lead() {
 		let start = moq_clock::now();
 		let mut buffer = Buffer::new(DELAY).replay();
 		assert!(!buffer.full(&1));
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();
-		assert!(!buffer.full(&1), "a frame not yet due leaves room to read ahead");
+		assert!(!buffer.full(&1), "a frame inside the delay leaves room to read ahead");
+		buffer.push(1, arrival(start, 1, "v1")).unwrap();
+		assert!(
+			buffer.full(&1),
+			"the tail is beyond the delay though the front is not due"
+		);
+		assert!(!buffer.full(&2), "the future tail only stops its own track");
+		buffer.leads.insert(1, VecDeque::from([0.2]));
+		assert!(!buffer.full(&1), "a track sent ahead keeps its measured lead");
+		buffer.push(1, arrival(start, 201, "v201")).unwrap();
+		assert!(buffer.full(&1), "the tail is beyond the delay and lead");
 		tokio::time::advance(DELAY).await;
 		assert!(buffer.full(&1));
 		assert!(!buffer.full(&2), "another track's due frame does not stop this one");
 		assert_eq!(due(&mut buffer), ["v0"]);
-		assert!(!buffer.full(&1));
+		assert!(!buffer.full(&1), "time advancing opens room in the admission window");
 
 		let mut buffer = Buffer::new(Duration::ZERO);
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();
 		assert!(buffer.full(&1));
+	}
+
+	/// A fast track must leave its future backlog in the source beside a real-time track.
+	#[tokio::test(start_paused = true)]
+	async fn admission_bounds_a_fast_track_beside_an_honest_track() {
+		let start = moq_clock::now();
+		let delay = Duration::from_millis(500);
+		let mut buffer = Buffer::new(delay).replay();
+		let mut next = [0, 0];
+		let mut peak = 0;
+		for step in 0..6_000 {
+			let at = start + Duration::from_millis(step * 20);
+			tokio::time::advance(at.saturating_duration_since(moq_clock::now())).await;
+			for (key, speed) in [(0, 1), (1, 3)] {
+				while next[key] <= step * 20 * speed && !buffer.full(&(key as u16)) {
+					buffer.push(key as u16, arrival(at, next[key], "frame")).unwrap();
+					next[key] += 20;
+				}
+			}
+			peak = peak.max(buffer.len());
+			due(&mut buffer);
+		}
+		assert!(
+			peak <= 54,
+			"a 500 ms window at 20 ms/frame plus one lookahead per track: {peak}"
+		);
 	}
 }

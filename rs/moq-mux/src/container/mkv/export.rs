@@ -477,7 +477,7 @@ impl<S: Stream> Export<S> {
 		self
 	}
 
-	/// Read each track until it has a frame due, preserving ingress timing before buffering.
+	/// Read each track within its jitter window, preserving ingress timing before buffering.
 	fn fill(&mut self, waiter: &kio::Waiter) -> Result<()> {
 		for (name, track) in &mut self.tracks {
 			loop {
