@@ -15,9 +15,8 @@ use super::{
 	lease::Rank,
 };
 use crate::{
-	Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
+	Dir, Instant, MAX_STREAM_COUNT, Rate, Side, StreamId, TransportError, VarInt,
 	coding::BufMutExt,
-	Instant, Rate,
 	connection::ConnectionTag,
 	connection::rate::Bucket,
 	connection::stats::{CreditStats, FrameStats},
@@ -4630,7 +4629,7 @@ mod tests {
 			fin: false,
 			data: Bytes::from(vec![0; len]),
 		};
-		server.received(frame(0, 1000), 1000).unwrap();
+		let _ = server.received(frame(0, 1000), 1000).unwrap();
 		assert_eq!(
 			server.received(frame(1000, 1), 1).unwrap_err().code,
 			TransportErrorCode::FLOW_CONTROL_ERROR

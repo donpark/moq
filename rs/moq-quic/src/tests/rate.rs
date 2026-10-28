@@ -159,7 +159,10 @@ fn a_datagram_flood_is_held_to_the_cap() {
 	});
 
 	assert!(sent > 5 * received, "the flood never exceeded the cap");
-	assert!(received <= allowance(RATE, duration, 0), "received {received} past the cap");
+	assert!(
+		received <= allowance(RATE, duration, 0),
+		"received {received} past the cap"
+	);
 	assert!(received >= RATE * duration.as_secs() * 9 / 10, "received {received}");
 }
 
@@ -254,7 +257,10 @@ fn an_idle_sender_banks_at_most_one_burst() {
 
 	let available = pair.server_conn_mut(server_ch).stats().credit.available;
 	assert!(available <= RATE, "an idle peer holds {available} bytes of credit");
-	assert!(available >= RATE * 7 / 8, "an idle peer holds only {available} bytes of credit");
+	assert!(
+		available >= RATE * 7 / 8,
+		"an idle peer holds only {available} bytes of credit"
+	);
 }
 
 /// Stopping a stream returns its memory but not the rate it spent.
@@ -304,7 +310,10 @@ fn a_frame_larger_than_the_burst_arrives_gradually() {
 	});
 
 	let leased = leased.expect("the frame never completed") - start;
-	assert!(leased >= Duration::from_secs(1), "the frame arrived in {leased:?}, past the cap");
+	assert!(
+		leased >= Duration::from_secs(1),
+		"the frame arrived in {leased:?}, past the cap"
+	);
 	assert!(leased <= Duration::from_secs(3), "the frame took {leased:?}");
 	assert_eq!(pair.server_conn_mut(server_ch).stats().credit.evicted, 0);
 }
@@ -324,8 +333,15 @@ fn an_uncapped_session_gets_its_window() {
 		.unwrap();
 	assert_eq!(pair.server_conn_mut(server_ch).stats().credit.available, WINDOW);
 	pair.drive();
-	let written = pair.client_send(client_ch, s).write(&vec![0; PRE_AUTH as usize * 4]).unwrap();
-	assert_eq!(written, PRE_AUTH as usize * 4, "the client still sees the pre-auth window");
+	let written = pair
+		.client_send(client_ch, s)
+		.write(&vec![0; PRE_AUTH as usize * 4])
+		.unwrap();
+	assert_eq!(
+		written,
+		PRE_AUTH as usize * 4,
+		"the client still sees the pre-auth window"
+	);
 }
 
 /// Raising, lowering, and lifting the cap on a live connection each take effect.
@@ -338,7 +354,7 @@ fn a_live_cap_change_takes_effect() {
 	// A path well above every cap, so the lifted phase measures the path, not the simulator.
 	pair.to_server.bottleneck = Some(Bottleneck::new(20 * RATE, 256 * 1024, false));
 
-	let mut phase = |pair: &mut Pair, rate: Option<Rate>| {
+	let phase = |pair: &mut Pair, rate: Option<Rate>| {
 		if let Some(rate) = rate {
 			pair.server_conn_mut(server_ch)
 				.set_limits(Limits {

@@ -93,7 +93,11 @@ impl Bucket {
 	/// When [`Self::available`] reaches `want`, at most the burst, or `None` if it already has.
 	pub(crate) fn ready_at(&self, want: u64) -> Option<Instant> {
 		debug_assert!(want <= self.burst, "{want} bytes never fit a {} byte burst", self.burst);
-		let short = self.charged.saturating_add(want).checked_sub(self.earned).filter(|&s| s > 0)?;
+		let short = self
+			.charged
+			.saturating_add(want)
+			.checked_sub(self.earned)
+			.filter(|&s| s > 0)?;
 		// Not refilled yet means full, which holds every `want` up to the burst.
 		let refilled = self.refilled?;
 		// Round up, so the wait always earns the whole shortfall.

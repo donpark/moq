@@ -32,8 +32,9 @@ mod driver;
 
 pub use driver::{Connection, Lease, RecvStream, SendGroup, SendOptions, SendStream};
 pub use endpoint::Endpoint;
-/// The flow-control limits a live connection can change; see [`Connection::set_limits`].
-pub use moq_quic::{Limits, LimitsError};
+/// The flow-control limits and bitrate caps a live connection can change; see
+/// [`Connection::set_limits`].
+pub use moq_quic::{Limits, LimitsError, Rate};
 
 /// A TLS certificate chain and the private key that signs for it, as PEM.
 /// One value, so neither half can be configured alone.

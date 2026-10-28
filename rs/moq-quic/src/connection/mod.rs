@@ -15,9 +15,9 @@ use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-	Dir, Duration, EndpointConfig, Frame, Instant, Limits, LimitsError, MAX_CID_SIZE, MAX_STREAM_COUNT, Rate,
-	MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError, TransportErrorCode,
-	VarInt,
+	Dir, Duration, EndpointConfig, Frame, Instant, Limits, LimitsError, MAX_CID_SIZE, MAX_STREAM_COUNT,
+	MIN_INITIAL_SIZE, Rate, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
+	TransportErrorCode, VarInt,
 	cid_queue::CidQueue,
 	coding::BufMutExt,
 	config::{ServerConfig, TransportConfig},
@@ -1289,7 +1289,10 @@ impl Connection {
 	/// no-op and therefore are safe.
 	pub fn handle_timeout(&mut self, now: Instant) {
 		if !self.state.is_closed()
-			&& self.streams.receive_rate_deadline().is_some_and(|deadline| deadline <= now)
+			&& self
+				.streams
+				.receive_rate_deadline()
+				.is_some_and(|deadline| deadline <= now)
 			&& self.streams.grant_receive_rate(now).should_transmit()
 		{
 			self.spaces[SpaceId::Data].pending.max_data = true;
