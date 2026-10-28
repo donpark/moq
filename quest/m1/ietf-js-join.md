@@ -25,7 +25,8 @@ Decided 2026-10-28 (maintainer), from [#7088](https://github.com/moq-dev/moq/iss
   anchor, if ever wanted, belongs in
   [JS ranges](/quest/m1/subscribe-ranges/js.md) shared with Rust and lite.
 - **No standalone-FETCH fallback.** A relay that refuses the joining FETCH
-  for a lone subscriber (moqx: "Session has no active subscribe") has a bug of
+  for a lone subscriber (moqx: "Session has no active subscribe", reported as
+  [openmoq/moqx#883](https://github.com/openmoq/moqx/issues/883)) has a bug of
   its own. A refusal costs only that group's head, as in Rust
   ([#6407](https://github.com/moq-dev/moq/pull/6407)).
 - **No FETCH_OK deadline**, matching Rust: the joining FETCH lives as long as

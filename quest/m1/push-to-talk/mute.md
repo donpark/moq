@@ -1,29 +1,43 @@
-# [S] A push-to-talk mute keeps the microphone open
+# [S] The publish element's mute and hide keep capture open
 
 ## Goal
 
-A push-to-talk publisher can mute and unmute without closing the microphone.
-Unmuting pays no getUserMedia, no new AudioContext and no worklet load.
+`<moq-publish muted>` and `<moq-publish invisible>` stop sending audio or
+video without closing the microphone or camera. Unmuting pays no
+getUserMedia, no new AudioContext and no worklet load, and unhiding pays no
+camera reopen. Removing `source` still releases both devices.
 
 ## Plan
 
 Traced 2026-10-28 from [#7101](https://github.com/moq-dev/moq/issues/7101):
-`<moq-publish muted>` sets `audioEnabled = enabled && !muted`
-(`js/publish/src/element.ts:204`). That turns off Capture, which tears down
-the AudioContext and worklet (`capture.ts:177`) and stops the track
-(`microphone.ts:61`). Unmuting then pays 50-300+ ms on real hardware before
-any frame exists. Toggling `Audio.Encoder.enabled` leaves capture running.
+`muted` sets `audioEnabled = enabled && !muted` (`js/publish/src/element.ts:204`),
+and that one signal drives the `Source.Microphone`, the Capture and the
+encoder (`:430-431`). Turning it off tears down the AudioContext and worklet
+(`capture.ts:177`) and stops the track (`microphone.ts:61`). Unmuting then
+pays 50-300+ ms on real hardware before any frame exists. `invisible` does
+the same to the camera. Toggling `Audio.Encoder.enabled` alone leaves
+capture running.
 
-Decided 2026-10-28 (maintainer): provide and document a mute that disables
-the encoder but keeps capture. The browser's microphone indicator stays lit
-while muted, and the docs say so.
+Decided 2026-10-28 (maintainer):
 
-Open for the maintainer when this starts: the shape. Recommended: document
-the library path (`Audio.Encoder.enabled` with capture left on) in
-`doc/lib/js/publish.md`, and give the element one attribute that selects it,
-not a second mute flag.
+- **`muted` keeps the mic open.** It disables only the audio encoder; the
+  source and Capture follow `source` alone. No new attribute: a second mute
+  flag would be the same control twice.
+- **`invisible` does the same for video.** It disables only the video
+  encoder and leaves the camera open. One rule for both, and removing
+  `source` is how a page releases the devices. Rejected: keeping `invisible`
+  releasing the camera as a privacy cue.
+- The browser's microphone and camera indicators stay lit while muted or
+  hidden. The docs say so, and say that releasing one device while keeping
+  the other takes the library (`Source.Microphone` or `Source.Camera`
+  `enabled`), since `source` covers both.
 
-Tests: muting this way keeps the capture's track live, and unmuting encodes
-without a new getUserMedia.
+Docs: the attribute table in `doc/lib/js/publish.md:34` ("Disable audio or
+video capture") and the element's doc comments.
 
-Public API: additive (one element attribute, if chosen). Wire: none.
+Tests: muting keeps the microphone track live and unmuting encodes without a
+new getUserMedia. Hiding keeps the camera track live. Removing `source`
+stops both tracks.
+
+Public API: behavior change to `muted` and `invisible` (capture stays open).
+Wire: none.

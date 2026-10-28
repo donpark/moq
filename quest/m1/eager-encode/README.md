@@ -26,9 +26,10 @@ Decided 2026-10-28 (maintainer), from [#7101](https://github.com/moq-dev/moq/iss
   which is unchanged; their docs present on-demand as their choice.
 - Bandwidth reservations stay keyed on demand: nothing is sent without a
   subscriber.
-- Open for the maintainer when the first child starts: the bitrate an
-  unwatched rendition encodes at. Recommended: its last granted target, else
-  the configured bitrate.
+- An unwatched rendition encodes at its configured bitrate (decided
+  2026-10-28). It needs no remembered state, a past viewer's grant is stale
+  anyway, and the backlog is served from cache rather than paced live.
+  Rejected: the last granted target, and the lowest rung.
 
 Already opt-in, with no built-in gate: moq-c (`moq_encode_*_demand`), moq-ffi,
 the wrappers, OBS and moq-gst. Only their docs change.
