@@ -136,7 +136,9 @@ case "$action" in
         just rs "$action" "${flags[@]}"
         # Workspace feature unification can hide an individual crate's missing
         # gates. Keep the boundary checks isolated and the full matrix nightly.
-        just rs feature-shapes "${flags[@]}"
+        # Isolation compiles each package on its own, so the whole workspace
+        # outgrows a gate job; Features sweeps it instead (`rs feature-sweep`).
+        [[ "$packages" == ALL ]] || just rs feature-shapes "${flags[@]}"
         if wants '(kio|moq-net)'; then just rs loom --no-run; fi
         if wants moq-net; then just rs net-features; fi
         if wants moq-quic; then just rs quic-features; fi

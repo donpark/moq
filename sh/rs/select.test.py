@@ -52,16 +52,20 @@ class SelectTest(unittest.TestCase):
                     self.assertTrue(any(call.startswith(f"rs {action} --workspace ") for call in calls), calls)
 
     def test_queue_checks_selected_feature_shapes(self):
-        for path in ("rs/kio/src/lib.rs", "rs/moq-tokio/src/lib.rs",
-                     "rs/moq-video/src/lib.rs", "Cargo.lock", "sh/rs/nextest.sh"):
+        for path in ("rs/kio/src/lib.rs", "rs/moq-tokio/src/lib.rs", "rs/moq-video/src/lib.rs"):
             for action in ("check", "check-test", "lint"):
                 with self.subTest(path=path, action=action):
                     calls = self.selected(path, action=action)
                     defaults = next(call for call in calls if call.startswith(f"rs {action} "))
                     self.assertIn(defaults.replace(f"rs {action} ", "rs feature-shapes ", 1), calls)
-        for owner in ("tokio", "media", "net"):
-            calls = self.selected(f"sh/rs/{owner}-features.sh")
-            self.assertIn("rs feature-shapes --workspace --exclude moq-net-fuzz --exclude moq-quic-fuzz", calls)
+
+    def test_whole_workspace_leaves_feature_shapes_to_the_sweep(self):
+        for path in ("Cargo.lock", "sh/rs/nextest.sh", "sh/rs/tokio-features.sh"):
+            for action in ("check", "check-test", "lint"):
+                with self.subTest(path=path, action=action):
+                    calls = self.selected(path, action=action)
+                    self.assertIn(f"rs {action} --workspace --exclude moq-net-fuzz --exclude moq-quic-fuzz", calls)
+                    self.assertFalse(any(call.startswith("rs feature-shapes") for call in calls), calls)
 
     def test_boundary_checks_follow_reverse_dependencies(self):
         self.assertIn("rs tokio-features", self.selected("rs/moq-tokio/src/lib.rs"))

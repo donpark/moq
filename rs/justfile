@@ -240,6 +240,10 @@ feature-shapes *args:
     bash sh/local.sh cargo hack clippy --locked --tests --no-default-features "$@" -- -D warnings
     bash sh/local.sh cargo hack clippy --locked --tests --all-features "$@" -- -D warnings
 
+# Isolate every package at its feature extremes, which a whole-workspace gate leaves to Features.
+feature-sweep:
+    just rs feature-shapes --workspace {{ no_fuzz }}
+
 # Compile the full feature matrix, including isolated combinations and their tests.
 features:
     just rs net-features --all

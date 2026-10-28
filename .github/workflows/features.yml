@@ -21,8 +21,10 @@ jobs:
       matrix:
         # The queue checks selected feature extremes. Nightly and release PRs
         # keep the full feature matrix and optimized artifacts; release binding
-        # workflows cover their optimized libraries separately.
-        recipe: ["rs features", "js wasm"]
+        # workflows cover their optimized libraries separately. `rs
+        # feature-sweep` isolates every package, which a whole-workspace gate
+        # skips: one clippy pass per package outgrows the gate's job.
+        recipe: ["rs features", "rs feature-sweep", "js wasm"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

@@ -369,8 +369,9 @@ github() {
 }
 
 # Run one lane's modules in order, appending each phase's seconds to the lane's
-# times file. A failed phase skips the rest of that module, but independent
-# modules still run. A TERM records the phase it cut short.
+# times file and announcing each phase's start and end on fd 3. A failed phase
+# skips the rest of that module, but independent modules still run. A TERM
+# records the phase it cut short.
 run_lane() {
     times=$1
     shift
@@ -390,6 +391,7 @@ run_lane() {
             current="$phase $module"
             began=$SECONDS
             if github; then echo "::group::$current"; else echo "==> $current"; fi
+            echo "$action: $current started" >&3
             # A plain statement, so errexit stays on inside the subshell.
             set +e
             (
@@ -421,7 +423,9 @@ run_lane() {
     return "$lane_status"
 }
 record() {
-    echo "$((SECONDS - began)) $current${1:+ ($1)}" >>"$times"
+    local seconds=$((SECONDS - began))
+    echo "$seconds $current${1:+ ($1)}" >>"$times"
+    echo "$action: $current ${1:-passed} in ${seconds}s" >&3
 }
 cancelled() {
     [[ -n "$current" ]] || return 0
@@ -476,8 +480,11 @@ trap 'exit 143' TERM
 # Each lane runs in its own process group, so a cancel reaches its whole tree;
 # a lane shell defers its own TERM trap until the running phase exits.
 # Concurrent lanes buffer their output and print it whole when they finish; a
-# serial run streams instead. Every lane completes even when another fails,
-# so one unavailable check cannot hide unrelated failures.
+# serial run streams instead. A buffered lane still announces each phase on the
+# run's stderr as it starts and ends, so a run cut off mid-phase, such as by a
+# job timeout that never reaches this script, names the phase it stopped in.
+# Every lane completes even when another fails, so one unavailable check cannot
+# hide unrelated failures.
 set -m
 while true; do
     while [[ -z "$lone" ]] && ((next < ${#lanes[@]} && ${#running[@]} < limit)); do
@@ -488,10 +495,9 @@ while true; do
         next=$((next + 1))
         read -ra lane_modules <<<"${members[$name]}"
         if ((limit == 1)); then
-            run_lane "$logs/$name.times" "${lane_modules[@]}" </dev/null &
+            run_lane "$logs/$name.times" "${lane_modules[@]}" </dev/null 3>/dev/null &
         else
-            echo "$action: started ${lane_modules[*]}" >&2
-            run_lane "$logs/$name.times" "${lane_modules[@]}" </dev/null >"$logs/$name.log" 2>&1 &
+            run_lane "$logs/$name.times" "${lane_modules[@]}" </dev/null 3>&2 >"$logs/$name.log" 2>&1 &
         fi
         running[$!]=$name
         [[ ! -v "alone[$name]" ]] || lone=$!

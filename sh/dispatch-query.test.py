@@ -356,11 +356,17 @@ esac
             with self.subTest(jobs=jobs):
                 run = subprocess.Popen(["bash", "sh/dispatch.sh", "ci", "origin/main"],
                                        cwd=self.repo, env=dict(self.env, CHECK_JOBS=jobs),
-                                       text=True, stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.PIPE)
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 started.read_text()
+                # A job timeout can kill the run without a signal it traps, so
+                # a buffered lane names its running phase before the phase ends.
+                os.set_blocking(run.stderr.fileno(), False)
+                live = (run.stderr.read() or b"").decode()
+                if jobs != "1":
+                    self.assertIn("ci: check rs started", live)
                 run.terminate()
-                _, stderr = run.communicate(timeout=60)
+                os.set_blocking(run.stderr.fileno(), True)
+                stderr = live + run.communicate(timeout=60)[1].decode()
                 self.assertEqual(run.returncode, 143, stderr)
                 self.assertRegex(stderr, r"\d+  check rs \(cancelled\)")
                 with self.assertRaises(ProcessLookupError):
