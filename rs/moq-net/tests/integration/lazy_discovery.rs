@@ -58,7 +58,7 @@ impl Lazy {
 		options.client_subscribe = Some(subscriber.clone());
 		options.client_discovers_all = false;
 		let pair = connect_mock(options).await;
-		moq_clock::sleep(SETTLE).await;
+		kio::clock::sleep(SETTLE).await;
 		Self {
 			subscriber,
 			pair,
@@ -99,7 +99,7 @@ impl Lazy {
 async fn synced(announced: &mut announce::Consumer) -> Vec<String> {
 	let mut seen = Vec::new();
 	while !announced.poll_synced(&moq_net::kio::Waiter::noop()).is_ready() {
-		let event = moq_clock::timeout(SETTLE, announced.next())
+		let event = kio::clock::timeout(SETTLE, announced.next())
 			.await
 			.expect("synced in time")
 			.expect("the stream stays open");
@@ -116,7 +116,7 @@ async fn synced(announced: &mut announce::Consumer) -> Vec<String> {
 }
 
 /// Nothing watched, nothing asked: the peer's broadcasts stay undiscovered.
-#[moq_clock::test]
+#[kio::test]
 async fn asks_nothing_until_watched() {
 	for version in VERSIONS {
 		let lazy = Lazy::new(version).await;
@@ -126,7 +126,7 @@ async fn asks_nothing_until_watched() {
 }
 
 /// A watch asks about its own prefix and nothing else.
-#[moq_clock::test]
+#[kio::test]
 async fn asks_only_about_the_watched_prefix() {
 	for version in VERSIONS {
 		let lazy = Lazy::new(version).await;
@@ -139,7 +139,7 @@ async fn asks_only_about_the_watched_prefix() {
 }
 
 /// A watch made before the session exists is asked about once it connects.
-#[moq_clock::test]
+#[kio::test]
 async fn a_new_session_asks_about_existing_watches() {
 	let subscriber = produce_origin(2);
 	let mut watch = subscriber
@@ -154,7 +154,7 @@ async fn a_new_session_asks_about_existing_watches() {
 }
 
 /// The request outlives its last watcher by the linger, then closes and retracts.
-#[moq_clock::test]
+#[kio::test]
 async fn lingers_after_the_last_watcher() {
 	for version in VERSIONS {
 		let lazy = Lazy::new(version).await;
@@ -162,23 +162,23 @@ async fn lingers_after_the_last_watcher() {
 		synced(&mut watch).await;
 		drop(watch);
 
-		moq_clock::sleep(Duration::from_secs(1)).await;
+		kio::clock::sleep(Duration::from_secs(1)).await;
 		assert!(lazy.routes("a/x").await, "{version}: still lingering");
 
 		// Watched again within the linger: the same request carries on.
 		let again = lazy.watch("a");
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(lazy.routes("a/x").await, "{version}: rewatched");
 		assert_eq!(lazy.requests(), 1, "{version}");
 
 		drop(again);
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(!lazy.routes("a/x").await, "{version}: closed");
 	}
 }
 
 /// A narrower watch rides an open broader request, which stays open while it does.
-#[moq_clock::test]
+#[kio::test]
 async fn a_narrower_watch_rides_the_broader_request() {
 	for version in VERSIONS {
 		let lazy = Lazy::new(version).await;
@@ -189,7 +189,7 @@ async fn a_narrower_watch_rides_the_broader_request() {
 		assert_eq!(lazy.requests(), 1, "{version}");
 
 		drop(root);
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert_eq!(lazy.requests(), 1, "{version}: nothing reopened");
 		assert!(lazy.routes("a/x").await, "{version}");
 		assert!(narrower.try_next().is_none(), "{version}: nothing retracted");
@@ -197,7 +197,7 @@ async fn a_narrower_watch_rides_the_broader_request() {
 }
 
 /// A narrower request open before a broader one stays until the broader one goes.
-#[moq_clock::test]
+#[kio::test]
 async fn a_broader_request_holds_the_narrower_open() {
 	for version in VERSIONS {
 		let lazy = Lazy::new(version).await;
@@ -208,22 +208,22 @@ async fn a_broader_request_holds_the_narrower_open() {
 		assert_eq!(lazy.requests(), 2, "{version}");
 
 		drop(narrower);
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(root.try_next().is_none(), "{version}: nothing retracted");
 
 		// The broader request lingers out, then the narrower one it held does.
 		drop(root);
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(!lazy.routes("b/y").await, "{version}");
 		assert!(lazy.routes("a/x").await, "{version}");
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(!lazy.routes("a/x").await, "{version}");
 	}
 }
 
 /// A narrower request still lingering when a broader one opens is held like one still
 /// watched, rather than lingering out on its own timer.
-#[moq_clock::test]
+#[kio::test]
 async fn a_broader_request_holds_a_lingering_narrower_open() {
 	for version in VERSIONS {
 		let lazy = Lazy::new(version).await;
@@ -231,28 +231,28 @@ async fn a_broader_request_holds_a_lingering_narrower_open() {
 		synced(&mut narrower).await;
 		drop(narrower);
 
-		moq_clock::sleep(Duration::from_secs(1)).await;
+		kio::clock::sleep(Duration::from_secs(1)).await;
 		let mut root = lazy.watch("");
 		assert_eq!(synced(&mut root).await, ["a/x", "b/y"], "{version}");
 		assert_eq!(lazy.requests(), 2, "{version}");
 
 		// Past the narrower request's own linger: it is held, not closed.
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(root.try_next().is_none(), "{version}: nothing retracted");
 
 		// The broader request lingers out, then the narrower one it held does.
 		drop(root);
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(!lazy.routes("b/y").await, "{version}");
 		assert!(lazy.routes("a/x").await, "{version}");
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(!lazy.routes("a/x").await, "{version}");
 	}
 }
 
 /// A broadcast resolved through a discovered route keeps it discovered after the
 /// listing that found it closes.
-#[moq_clock::test]
+#[kio::test]
 async fn a_resolved_broadcast_keeps_its_route() {
 	for version in VERSIONS {
 		let lazy = Lazy::new(version).await;
@@ -261,7 +261,7 @@ async fn a_resolved_broadcast_keeps_its_route() {
 		let broadcast = lazy.subscriber.consume().request_broadcast("a/x", None).await.unwrap();
 		drop(watch);
 
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(lazy.routes("a/x").await, "{version}");
 		assert!(!lazy.routes("b/y").await, "{version}");
 
@@ -270,17 +270,17 @@ async fn a_resolved_broadcast_keeps_its_route() {
 }
 
 /// Waiting on a path asks about it.
-#[moq_clock::test]
+#[kio::test]
 async fn waiting_on_a_path_asks_about_it() {
 	for version in VERSIONS {
 		let lazy = Lazy::new(version).await;
 		let consumer = lazy.subscriber.consume();
-		moq_clock::timeout(SETTLE, consumer.routed_broadcast("a/x"))
+		kio::clock::timeout(SETTLE, consumer.routed_broadcast("a/x"))
 			.await
 			.expect("routed in time")
 			.unwrap();
 		let mut followed = consumer.announced_broadcast("b/y", None).unwrap();
-		moq_clock::timeout(SETTLE, followed.available())
+		kio::clock::timeout(SETTLE, followed.available())
 			.await
 			.expect("announced in time")
 			.unwrap();
@@ -290,7 +290,7 @@ async fn waiting_on_a_path_asks_about_it() {
 
 /// A relay's link asks for everything, watched or not, so discovery never narrows
 /// what a relay learns.
-#[moq_clock::test]
+#[kio::test]
 async fn a_relay_link_asks_for_everything() {
 	for version in VERSIONS {
 		for upstream in [false, true] {
@@ -310,7 +310,7 @@ async fn a_relay_link_asks_for_everything() {
 }
 
 /// A server asks a client for everything it may, so a relay ingests what clients publish.
-#[moq_clock::test]
+#[kio::test]
 async fn a_server_asks_for_everything() {
 	for version in VERSIONS {
 		let publisher = produce_origin(1);
@@ -321,14 +321,14 @@ async fn a_server_asks_for_everything() {
 		options.client_publish = Some(publisher.consume());
 		options.server_subscribe = Some(relay.clone());
 		let _pair = connect_mock(options).await;
-		moq_clock::sleep(SETTLE).await;
+		kio::clock::sleep(SETTLE).await;
 		relay.consume().request_broadcast("a/x", None).await.unwrap();
 	}
 }
 
 /// Serving the peer's own request is no local reader: a client publishing and
 /// consuming through one origin still asks about only what its readers watch.
-#[moq_clock::test]
+#[kio::test]
 async fn serving_the_peer_asks_nothing() {
 	for version in VERSIONS {
 		let local = produce_origin(2);
@@ -343,7 +343,7 @@ async fn serving_the_peer_asks_nothing() {
 		options.server_publish = Some(remote.consume());
 		options.server_subscribe = Some(remote.clone());
 		let pair = connect_mock(options).await;
-		moq_clock::sleep(SETTLE).await;
+		kio::clock::sleep(SETTLE).await;
 
 		let requests = pair
 			.client_transport
@@ -365,7 +365,7 @@ const IETF: &[&str] = &["moq-transport-18", "moq-transport-22"];
 /// Apply what `announced` reports once everything in flight has arrived to `held`, and
 /// say whether any of it ended a prefix.
 async fn settled(announced: &mut announce::Consumer, held: &mut Vec<String>) -> bool {
-	moq_clock::sleep(SETTLE).await;
+	kio::clock::sleep(SETTLE).await;
 	let mut ended = false;
 	while let Some(event) = announced.try_next() {
 		match event {
@@ -385,7 +385,7 @@ async fn settled(announced: &mut announce::Consumer, held: &mut Vec<String>) -> 
 }
 
 /// Nothing watched, nothing asked: the peer's broadcasts stay undiscovered.
-#[moq_clock::test]
+#[kio::test]
 async fn ietf_asks_nothing_until_watched() {
 	for version in IETF {
 		let lazy = Lazy::new(version).await;
@@ -394,7 +394,7 @@ async fn ietf_asks_nothing_until_watched() {
 }
 
 /// A watch asks about its own prefix and nothing else.
-#[moq_clock::test]
+#[kio::test]
 async fn ietf_asks_only_about_the_watched_prefix() {
 	for version in IETF {
 		let lazy = Lazy::new(version).await;
@@ -409,7 +409,7 @@ async fn ietf_asks_only_about_the_watched_prefix() {
 
 /// The request outlives its last watcher by the linger, then ends, and what it reported
 /// goes with it.
-#[moq_clock::test]
+#[kio::test]
 async fn ietf_lingers_after_the_last_watcher() {
 	for version in IETF {
 		let lazy = Lazy::new(version).await;
@@ -417,22 +417,22 @@ async fn ietf_lingers_after_the_last_watcher() {
 		settled(&mut watch, &mut Vec::new()).await;
 		drop(watch);
 
-		moq_clock::sleep(Duration::from_secs(1)).await;
+		kio::clock::sleep(Duration::from_secs(1)).await;
 		assert!(lazy.routes("a/x").await, "{version}: still lingering");
 
 		let again = lazy.watch("a");
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(lazy.routes("a/x").await, "{version}: rewatched");
 
 		drop(again);
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(!lazy.routes("a/x").await, "{version}: ended");
 	}
 }
 
 /// A broader watch after a narrower one discovers everything, and retracts nothing the
 /// narrower one holds.
-#[moq_clock::test]
+#[kio::test]
 async fn ietf_a_broader_watch_retracts_nothing() {
 	for version in IETF {
 		let lazy = Lazy::new(version).await;
@@ -451,7 +451,7 @@ async fn ietf_a_broader_watch_retracts_nothing() {
 		);
 
 		drop(root);
-		moq_clock::sleep(LINGERED).await;
+		kio::clock::sleep(LINGERED).await;
 		assert!(lazy.routes("a/x").await, "{version}: the narrower watch still holds it");
 		assert!(
 			!settled(&mut narrower, &mut held).await,
@@ -459,19 +459,19 @@ async fn ietf_a_broader_watch_retracts_nothing() {
 		);
 
 		drop(narrower);
-		moq_clock::sleep(LINGERED * 2).await;
+		kio::clock::sleep(LINGERED * 2).await;
 		assert!(!lazy.routes("a/x").await, "{version}");
 		assert!(!lazy.routes("b/y").await, "{version}");
 	}
 }
 
 /// Waiting on a path asks about it.
-#[moq_clock::test]
+#[kio::test]
 async fn ietf_waiting_on_a_path_asks_about_it() {
 	for version in IETF {
 		let lazy = Lazy::new(version).await;
 		let consumer = lazy.subscriber.consume();
-		moq_clock::timeout(SETTLE, consumer.routed_broadcast("a/x"))
+		kio::clock::timeout(SETTLE, consumer.routed_broadcast("a/x"))
 			.await
 			.expect("routed in time")
 			.unwrap();
@@ -480,7 +480,7 @@ async fn ietf_waiting_on_a_path_asks_about_it() {
 }
 
 /// A relay's link still asks for everything it may.
-#[moq_clock::test]
+#[kio::test]
 async fn ietf_a_relay_link_asks_for_everything() {
 	for version in IETF {
 		let relay = produce_origin(2);

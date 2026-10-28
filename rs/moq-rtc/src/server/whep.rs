@@ -157,7 +157,7 @@ pub async fn accept(
 	let (creds, inbound, registration) = mux.register();
 	let mut rtc = session::rtc_config_with_codecs(&codecs)
 		.set_local_ice_credentials(creds)
-		.build(moq_clock::now().into_std());
+		.build(kio::clock::now().into_std());
 	for addr in mux.candidates() {
 		let cand = Candidate::host(*addr, "udp").map_err(Error::rtc)?;
 		rtc.add_local_candidate(cand);
@@ -206,11 +206,11 @@ fn is_sdp(headers: &HeaderMap) -> bool {
 /// one, would park the handler forever. No route by the deadline is
 /// [`moq_net::Error::Unroutable`], so the WHEP client sees a 404 and retries (typical).
 async fn resolve(subscriber: &moq_net::origin::Consumer, path: moq_net::Path) -> Result<EgressSource> {
-	let deadline = moq_clock::now() + CATALOG_TIMEOUT;
-	let broadcast = moq_clock::timeout_at(deadline, subscriber.routed_broadcast(path))
+	let deadline = kio::clock::now() + CATALOG_TIMEOUT;
+	let broadcast = kio::clock::timeout_at(deadline, subscriber.routed_broadcast(path))
 		.await
 		.map_err(|_| Error::Moq(moq_net::Error::Unroutable))??;
-	moq_clock::timeout_at(
+	kio::clock::timeout_at(
 		deadline,
 		EgressSource::new(moq_mux::Source::new(subscriber.clone(), broadcast)),
 	)
@@ -276,7 +276,7 @@ mod tests {
 			.with_subscriber(sub_origin.clone())
 			.with_reconnect(false);
 		let url: url::Url = format!("tcp://{addr}/").parse().expect("url");
-		let connection = moq_clock::timeout(TIMEOUT, client.connect(url).established())
+		let connection = kio::clock::timeout(TIMEOUT, client.connect(url).established())
 			.await
 			.expect("connect timed out")
 			.expect("connect");
@@ -328,7 +328,7 @@ mod tests {
 
 		let _router = super::router(crate::server::Server::new(Default::default()), sub_origin.consume());
 		let missing = sub_origin.consume().follow("missing").expect("follow");
-		moq_clock::timeout(TIMEOUT, missing.synced())
+		kio::clock::timeout(TIMEOUT, missing.synced())
 			.await
 			.expect("sync timed out");
 

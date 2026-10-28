@@ -119,8 +119,8 @@ where
 	pending: Option<Box<Program<S>>>,
 	next_program: u64,
 	active_program: u64,
-	follow_until: Option<moq_clock::Instant>,
-	follow_timer: Option<std::pin::Pin<Box<moq_clock::Sleep>>>,
+	follow_until: Option<kio::clock::Instant>,
+	follow_timer: Option<std::pin::Pin<Box<kio::clock::Sleep>>>,
 }
 
 /// Input and mux state belonging to one publisher instance. The release clock
@@ -195,7 +195,7 @@ where
 	/// edge: a test exporting a broadcast it wrote whole.
 	replay: bool,
 	/// Wakes the export when the next grid slot is due on the jitter buffer's clock.
-	slot_timer: Option<std::pin::Pin<Box<moq_clock::Sleep>>>,
+	slot_timer: Option<std::pin::Pin<Box<kio::clock::Sleep>>>,
 	/// Output frames ready to hand out, one per grid slot, each with what it tells
 	/// [`Export::stats`] once returned.
 	queue: VecDeque<(Frame, Tally)>,
@@ -253,9 +253,9 @@ struct Pending {
 	cut: u64,
 	/// When it landed in this node's cache ([`moq_net::frame::Frame::arrived`]), so a stall
 	/// that holds the export back too does not hide that it came late.
-	arrived: moq_clock::Instant,
+	arrived: kio::clock::Instant,
 	/// When it was read.
-	read: moq_clock::Instant,
+	read: kio::clock::Instant,
 }
 
 /// A frame waiting in the jitter buffer, with what it needs from the moment it was read.
@@ -298,9 +298,9 @@ struct Track {
 	pending: Option<Pending>,
 	/// When the source was subscribed. Nothing it delivers reached the export before then,
 	/// however long the cache held it.
-	subscribed: moq_clock::Instant,
+	subscribed: kio::clock::Instant,
 	/// The latest frame arrival or observed loss, which settles frames held for their DTS.
-	latest: moq_clock::Instant,
+	latest: kio::clock::Instant,
 	/// The marker count the decode clock runs under.
 	restart: u64,
 	/// The marker, skip and cut counts of the sources the track read before this one, so the
@@ -372,8 +372,8 @@ impl Track {
 			key: TrackKey::default(),
 			source,
 			pending: None,
-			subscribed: moq_clock::now(),
-			latest: moq_clock::Instant::ZERO,
+			subscribed: kio::clock::now(),
+			latest: kio::clock::Instant::ZERO,
 			restart: 0,
 			base: (0, 0, 0),
 			finished: false,
@@ -496,7 +496,7 @@ impl Track {
 						skip: self.base.1 + self.source.skips(),
 						cut: self.base.2 + self.source.cuts(),
 						arrived,
-						read: moq_clock::now(),
+						read: kio::clock::now(),
 					};
 					// A new timeline must reach the reset before tune-in alignment can drop it.
 					if let Some(start) = input.video_start
@@ -761,8 +761,8 @@ impl Track {
 		};
 		// Logical clocks can begin at zero. Shift both readings by the same representable amount so
 		// their ordering survives even when the full replay lead would precede the clock's origin.
-		let ahead = ahead.min(arrived.duration_since(moq_clock::Instant::ZERO));
-		let ahead = ahead.min(read.duration_since(moq_clock::Instant::ZERO));
+		let ahead = ahead.min(arrived.duration_since(kio::clock::Instant::ZERO));
+		let ahead = ahead.min(read.duration_since(kio::clock::Instant::ZERO));
 		let arrival = Arrival {
 			arrived: arrived - ahead,
 			read: read - ahead,
@@ -1427,7 +1427,7 @@ where
 			if self.pending.is_none() || !super::follower::left(&err) {
 				return Poll::Ready(Err(err));
 			}
-			self.follow_until = Some(moq_clock::now());
+			self.follow_until = Some(kio::clock::now());
 			self.stop_old(waiter)?;
 		}
 		if self.pending.is_some() {
@@ -1496,7 +1496,7 @@ where
 				for (name, track) in &mut self.program.tracks {
 					track.release(name, &mut self.jitter, true)?;
 				}
-				tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "commit-program", now = ?moq_clock::now(), old = self.program.id, new = ready.track.program, generation = ready.generation, pts = ?ready.item.frame.timestamp, key = ?ready.item.key, decode = ?ready.item.decode);
+				tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "commit-program", now = ?kio::clock::now(), old = self.program.id, new = ready.track.program, generation = ready.generation, pts = ?ready.item.frame.timestamp, key = ?ready.item.key, decode = ?ready.item.decode);
 				self.jitter.commit(ready)?;
 				break;
 			}
@@ -1850,7 +1850,7 @@ where
 				}
 			}
 			if self.program.id != self.active_program && !self.jitter.has_pending() && !self.jitter.is_committed() {
-				tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "prepared", now = ?moq_clock::now(), program = self.program.id, old = self.active_program, tracks = self.program.tracks.len(), video_start = ?self.program.video_start);
+				tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "prepared", now = ?kio::clock::now(), program = self.program.id, old = self.active_program, tracks = self.program.tracks.len(), video_start = ?self.program.video_start);
 				self.jitter.start(
 					self.program.tracks.values().map(|track| track.key.clone()),
 					self.program.expected.clone(),
@@ -1860,7 +1860,7 @@ where
 
 			// Hand the held frames to the jitter buffer in arrival order, so the
 			// earliest anchors its clock, then read on.
-			let mut held: Vec<(moq_clock::Instant, String)> = self
+			let mut held: Vec<(kio::clock::Instant, String)> = self
 				.program
 				.tracks
 				.iter()
@@ -1883,12 +1883,12 @@ where
 			return Ok(());
 		}
 
-		let expired = self.follow_until.is_some_and(|until| moq_clock::now() >= until);
+		let expired = self.follow_until.is_some_and(|until| kio::clock::now() >= until);
 		if !expired {
 			if let Some(until) = self.follow_until {
 				let timer = self
 					.follow_timer
-					.get_or_insert_with(|| Box::pin(moq_clock::sleep_until(until)));
+					.get_or_insert_with(|| Box::pin(kio::clock::sleep_until(until)));
 				if timer.deadline() != until {
 					timer.as_mut().reset(until);
 				}
@@ -1896,7 +1896,7 @@ where
 			}
 			return Ok(());
 		}
-		tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "follow-expired", now = ?moq_clock::now(), program = self.program.id, committed = self.jitter.is_committed());
+		tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "follow-expired", now = ?kio::clock::now(), program = self.program.id, committed = self.jitter.is_committed());
 		self.program.retired = true;
 		self.follow_timer = None;
 		self.follow_until = None;
@@ -1925,7 +1925,7 @@ where
 			return Ok(());
 		}
 		let mut next = self.pending.take().expect("checked above");
-		tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "adopt", now = ?moq_clock::now(), old = self.program.id, new = next.id, generation = ready.generation, old_pts = ?self.program.last_timestamp, new_pts = ?ready.item.frame.timestamp, new_key = ?ready.item.key);
+		tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "adopt", now = ?kio::clock::now(), old = self.program.id, new = next.id, generation = ready.generation, old_pts = ?self.program.last_timestamp, new_pts = ?ready.item.frame.timestamp, new_key = ?ready.item.key);
 		let out = self
 			.program
 			.psi
@@ -2294,7 +2294,7 @@ where
 			track.base.1 += track.source.skips() + 1;
 			track.base.2 += track.source.cuts() + 1;
 			track.source = source;
-			track.subscribed = moq_clock::now();
+			track.subscribed = kio::clock::now();
 			track.finished = false;
 		}
 		Ok(())
@@ -2342,7 +2342,7 @@ where
 			track.declared = None;
 			track.source = source.continuing(&track.source);
 			track.finished = false;
-			track.subscribed = moq_clock::now();
+			track.subscribed = kio::clock::now();
 		}
 		Ok(())
 	}
@@ -2448,7 +2448,7 @@ where
 	/// When the next queued frame is due, or the next grid slot while media is queued or
 	/// every source has finished and the tail runs out.
 	#[cfg(test)]
-	pub(super) fn next_due(&self) -> Option<moq_clock::Instant> {
+	pub(super) fn next_due(&self) -> Option<kio::clock::Instant> {
 		let finished = !self.program.tracks.is_empty() && self.program.tracks.values().all(|track| track.finished);
 		let slot = self
 			.slot_due()
@@ -2502,7 +2502,7 @@ where
 		catalog: S,
 		follow: Duration,
 	) -> Result<(), crate::Error> {
-		tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "follow", now = ?moq_clock::now(), program = self.program.id, pending = ?self.pending.as_ref().map(|pending| pending.id), old_epoch = ?self.program.instance, new_epoch = ?broadcast.info().epoch, ?follow);
+		tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "follow", now = ?kio::clock::now(), program = self.program.id, pending = ?self.pending.as_ref().map(|pending| pending.id), old_epoch = ?self.program.instance, new_epoch = ?broadcast.info().epoch, ?follow);
 		if self.pending.is_some() && self.program.instance.is_some() && broadcast.info().epoch == self.program.instance
 		{
 			self.cancel_pending();
@@ -2514,7 +2514,7 @@ where
 			self.cancel_pending();
 			let next = self.replacement(self.program.source.switched(broadcast), catalog);
 			self.pending = Some(Box::new(next));
-			self.follow_until.get_or_insert_with(|| moq_clock::now() + follow);
+			self.follow_until.get_or_insert_with(|| kio::clock::now() + follow);
 			return Ok(());
 		}
 		if let Some(mut pending) = self.pending.take() {
@@ -3389,7 +3389,7 @@ where
 	/// never on when they arrived, and the output keeps the clock's pace while media is queued
 	/// (in the schedule or still in the jitter buffer) or still to decode. `None` without a
 	/// delay, where frames settle the slots instead.
-	fn slot_due(&self) -> Option<(u128, moq_clock::Instant)> {
+	fn slot_due(&self) -> Option<(u128, kio::clock::Instant)> {
 		let (known, settled) = self.slot_settled()?;
 		let settled = Timestamp::from_micros(u64::try_from(settled / 1_000).ok()?).ok()?;
 		// The tail of the generation still going out keeps its own clock after the next is acquired.
@@ -3442,11 +3442,11 @@ where
 	/// Lay out every grid slot whose time has come, and wake when the next one is due.
 	fn lay_due(&mut self, waiter: &kio::Waiter) -> anyhow::Result<()> {
 		while let Some((known, at)) = self.slot_due() {
-			if moq_clock::now() < at {
+			if kio::clock::now() < at {
 				let timer = self
 					.program
 					.slot_timer
-					.get_or_insert_with(|| Box::pin(moq_clock::sleep_until(at)));
+					.get_or_insert_with(|| Box::pin(kio::clock::sleep_until(at)));
 				if timer.deadline() != at {
 					timer.as_mut().reset(at);
 				}
@@ -4557,7 +4557,7 @@ mod tests {
 				payload: bytes::Bytes::from_static(b"frame"),
 				keyframe: at % 600 == 0,
 			};
-			let start = moq_clock::now();
+			let start = kio::clock::now();
 			let mut jitter = super::jitter::Buffer::new(Duration::from_millis(500));
 			jitter.expect([super::TrackKey::new(0, "video"), super::TrackKey::new(0, "audio")]);
 			let mut trimmed = 0;
@@ -4729,7 +4729,7 @@ mod tests {
 		let mut clock = DecodeClock::default();
 		let mut dts = vec![0; pts.len()];
 		for (i, &p) in pts.iter().enumerate() {
-			clock.push(i, p, moq_clock::Instant::ZERO);
+			clock.push(i, p, kio::clock::Instant::ZERO);
 			while let Some((i, d)) = clock.pop(jitter, floor, Settle::Due) {
 				dts[i] = d;
 			}

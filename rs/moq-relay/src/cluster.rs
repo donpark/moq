@@ -1841,10 +1841,10 @@ impl Cluster {
 		dialed: DialMap,
 		http: ClientWithMiddleware,
 	) {
-		let mut tick = moq_clock::interval(CONNECT_API_POLL_INTERVAL);
+		let mut tick = kio::clock::interval(CONNECT_API_POLL_INTERVAL);
 		// A slow fetch must not bank missed ticks into a catch-up burst; just resume
 		// the cadence from the next whole interval.
-		tick.set_missed_tick_behavior(moq_clock::MissedTickBehavior::Skip);
+		tick.set_missed_tick_behavior(kio::clock::MissedTickBehavior::Skip);
 		loop {
 			tick.tick().await;
 
@@ -1975,7 +1975,7 @@ impl Cluster {
 		let mut redial = Redial::default();
 
 		loop {
-			let started = moq_clock::now();
+			let started = kio::clock::now();
 			let result = self.run_remote_once(&addrs, target).await;
 			let elapsed = started.elapsed();
 
@@ -1986,7 +1986,7 @@ impl Cluster {
 			}
 
 			let wait = redial.next(&mut rand::rng());
-			moq_clock::sleep(wait).await;
+			kio::clock::sleep(wait).await;
 		}
 	}
 

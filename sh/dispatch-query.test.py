@@ -350,7 +350,7 @@ class QueryTests(unittest.TestCase):
     "rs lint-changed "*) echo $$ >"{pid}"; echo >"{started}"; exec sleep 600 ;;
 esac
 ''')
-        self.change("rs/moq-clock/src/lib.rs")
+        self.change("rs/kio/src/clock/mod.rs")
         for jobs in ("1", "3"):
             with self.subTest(jobs=jobs):
                 run = subprocess.Popen(["bash", "sh/dispatch.sh", "ci", "origin/main"],
@@ -366,7 +366,7 @@ esac
                     os.kill(int(pid.read_text()), 0)
 
     def test_ci_runs_one_lint_preamble_and_one_test_pass(self):
-        self.change("rs/moq-clock/src/lib.rs")
+        self.change("rs/kio/src/clock/mod.rs")
         calls = self.run_ci()
         self.assertTrue(any(call.startswith("rs lint-changed ") for call in calls), calls)
         self.assertFalse(any(call.startswith("rs check-changed ") for call in calls), calls)

@@ -33,7 +33,7 @@ async fn abandoned_request_reaches_the_publisher(version: &str, relays: u64) {
 	let broadcast = nodes[0].create_broadcast("room").unwrap();
 	let mut dynamic = broadcast.requests();
 	broadcast.announce(Default::default()).unwrap();
-	moq_clock::sleep(Duration::from_secs(1)).await;
+	kio::clock::sleep(Duration::from_secs(1)).await;
 
 	let consumer = nodes[relays as usize]
 		.consume()
@@ -48,20 +48,20 @@ async fn abandoned_request_reaches_the_publisher(version: &str, relays: u64) {
 
 	// The publisher never answers; the reader gives up.
 	drop(waiting);
-	moq_clock::timeout(Duration::from_secs(5), crate::support::unwanted(request.demand()))
+	kio::clock::timeout(Duration::from_secs(5), crate::support::unwanted(request.demand()))
 		.await
 		.unwrap_or_else(|_| panic!("{version:?} over {relays} relays: the publisher's request is still wanted"))
 		.expect("the pending request is still open");
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn abandoned_request_reaches_the_publisher_lite05() {
 	for relays in [1, 2] {
 		abandoned_request_reaches_the_publisher("moq-lite-05", relays).await;
 	}
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn abandoned_request_reaches_the_publisher_lite06() {
 	for relays in [1, 2] {
 		abandoned_request_reaches_the_publisher("moq-lite-06", relays).await;
@@ -103,7 +103,7 @@ async fn withdrawn_broadcast_releases_track_info(version: &str, answered: bool, 
 	};
 	let finished = pair.client_transport.finished_streams();
 	broadcast.close();
-	moq_clock::timeout(Duration::from_secs(5), crate::support::unwanted(demand))
+	kio::clock::timeout(Duration::from_secs(5), crate::support::unwanted(demand))
 		.await
 		.unwrap_or_else(|_| panic!("{version}, answered={answered}, explicit={explicit}: TRACK outlived its broadcast"))
 		.expect("the publisher still owns its track");
@@ -119,7 +119,7 @@ async fn withdrawn_broadcast_releases_track_info(version: &str, answered: bool, 
 	drop(query);
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn a_pending_track_info_ends_with_its_broadcast() {
 	for version in ["moq-lite-05", "moq-lite-06", "moq-lite-07-wip"] {
 		for explicit in [false, true] {
@@ -128,7 +128,7 @@ async fn a_pending_track_info_ends_with_its_broadcast() {
 	}
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn an_answered_track_info_ends_with_its_broadcast() {
 	for version in ["moq-lite-05", "moq-lite-06", "moq-lite-07-wip"] {
 		for explicit in [false, true] {

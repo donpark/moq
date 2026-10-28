@@ -2209,7 +2209,7 @@ mod test {
 	}
 
 	/// A later stream header is not a verdict on the group held from a failed route.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn a_failed_route_waits_for_a_reordered_group_header() {
 		let waiter = kio::Waiter::noop();
 		for arrives in [true, false] {
@@ -2251,7 +2251,7 @@ mod test {
 				assert_eq!(read(&mut held), Some(b"continued".to_vec()));
 				assert_eq!(read(&mut held), None);
 			} else {
-				moq_clock::sleep(Duration::from_secs(1)).await;
+				kio::clock::sleep(Duration::from_secs(1)).await;
 				assert!(matches!(
 					held.poll_read_frame(&waiter),
 					Poll::Ready(Err(Error::NotFound))
@@ -2276,7 +2276,7 @@ mod test {
 		);
 	}
 
-	#[moq_clock::test]
+	#[kio::test]
 	async fn a_declared_end_survives_a_swap_before_it_is_polled() {
 		let routes = Producer::new();
 		let logical = logical(&routes);
@@ -2300,7 +2300,7 @@ mod test {
 		);
 	}
 
-	#[moq_clock::test]
+	#[kio::test]
 	async fn copies_must_agree_on_the_declared_end() {
 		for next in [Position::group(5), Position { group: 4, frame: 3 }, Position::group(6)] {
 			let routes = Producer::new();
@@ -2330,7 +2330,7 @@ mod test {
 	}
 
 	/// A copy that delivers past an end another copy declared contradicts it.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn content_past_the_declared_end_refuses_the_track() {
 		for datagram in [false, true] {
 			let routes = Producer::new();
@@ -2366,7 +2366,7 @@ mod test {
 
 	/// A mid-group end another copy declared caps the group it falls in, even for frames
 	/// that arrive after the group was handed out.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn a_mid_group_end_caps_another_copys_group() {
 		let routes = Producer::new();
 		let logical = logical(&routes);
@@ -2395,7 +2395,7 @@ mod test {
 	}
 
 	/// An end below a group a copy handed out or holds claims other content.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn an_end_below_a_seen_group_refuses_the_track() {
 		for handed_out in [false, true] {
 			let routes = Producer::new();
@@ -2419,7 +2419,7 @@ mod test {
 
 	/// A mid-group end learned late, below a frame or datagram object already seen, claims
 	/// other content.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn a_late_mid_group_end_below_a_seen_object_refuses_the_track() {
 		for datagram in [false, true] {
 			let routes = Producer::new();
@@ -2471,7 +2471,7 @@ mod test {
 	}
 
 	/// The newest datagram handed out bounds a late end after the budget forgets its identity.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn an_end_below_an_expired_datagram_refuses_the_track() {
 		let routes = Producer::new();
 		let logical = logical(&routes);
@@ -2484,7 +2484,7 @@ mod test {
 		routes.serve(b.consume());
 		b.insert_datagram(1, ts(1), b"d".as_ref()).unwrap();
 		assert!(sub.poll_recv_datagram(&kio::Waiter::noop()).is_ready());
-		moq_clock::sleep(Duration::from_secs(2)).await;
+		kio::clock::sleep(Duration::from_secs(2)).await;
 		assert!(sub.poll_recv_datagram(&kio::Waiter::noop()).is_pending());
 		assert_eq!(copies(&routes), 1);
 		b.finish_at(Position::group(5)).unwrap();
@@ -2494,7 +2494,7 @@ mod test {
 		));
 	}
 
-	#[moq_clock::test]
+	#[kio::test]
 	async fn route_flaps_keep_one_copy_per_distinct_route() {
 		let routes = Producer::new();
 		let logical = logical(&routes);
@@ -2523,7 +2523,7 @@ mod test {
 
 	/// A returning route resumes where a fresh copy would: what it buffered while replaced,
 	/// below what another route already handed out, is not handed out again.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn a_returning_route_resumes_at_the_readers_newest() {
 		let routes = Producer::new();
 		let logical = logical(&routes);
@@ -2546,7 +2546,7 @@ mod test {
 		drop(held);
 	}
 
-	#[moq_clock::test]
+	#[kio::test]
 	async fn a_replaced_copy_is_not_kept_for_a_gap_outside_the_window() {
 		let routes = Producer::new();
 		let logical = logical(&routes);
@@ -2652,7 +2652,7 @@ mod test {
 	/// Routes that close without concluding read like a conclusion: a reader stalled
 	/// mid-group parks on the copy it is reading rather than polling the closed routes
 	/// forever, and finishes the group from that copy.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn a_stalled_group_parks_when_the_routes_close() {
 		let routes = Producer::new();
 		let logical = logical(&routes);
@@ -2937,7 +2937,7 @@ mod test {
 
 	/// A run the serving copy gave up waits while a copy it replaced may still deliver it
 	/// under its bound, and goes out once that copy is past the reader's budget.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn a_drop_waits_while_a_replaced_copy_may_still_deliver_it() {
 		let routes = Producer::new();
 		let logical = logical(&routes);
@@ -2960,7 +2960,7 @@ mod test {
 		assert_eq!(drain(&mut sub, false), [3]);
 		assert_eq!(dropped(&mut sub), []);
 
-		moq_clock::sleep(Duration::from_secs(1)).await;
+		kio::clock::sleep(Duration::from_secs(1)).await;
 		assert_eq!(dropped(&mut sub), [(2..3, StreamError::NotFound)]);
 		write(&a, 2);
 		assert_eq!(drain(&mut sub, false), Vec::<u64>::new());
@@ -3610,7 +3610,7 @@ mod test {
 	/// A group the old route was still sending when the new route took over arrives after the
 	/// new copy's first group, once polled: the old copy stays while it may still land, and
 	/// goes once its publisher drops it or the reader's budget passes.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn an_arrival_reader_gets_a_group_still_in_flight_on_the_replaced_route() {
 		for outcome in ["lands", "dropped", "expired"] {
 			let routes = Producer::new();
@@ -3631,7 +3631,7 @@ mod test {
 			match outcome {
 				"lands" => {}
 				"dropped" => a.drop_groups(1..2, StreamError::NotFound),
-				_ => moq_clock::sleep(Duration::from_secs(1)).await,
+				_ => kio::clock::sleep(Duration::from_secs(1)).await,
 			}
 			if outcome != "lands" {
 				assert_eq!(drain(&mut sub, false), Vec::<u64>::new());
@@ -4492,7 +4492,7 @@ mod test {
 	/// arrives, so only the deadline wake can release the reader: against a cold route, and
 	/// against one whose copy already caches groups past the held one, so a cursor that
 	/// skips ahead cannot hide the stall.
-	#[moq_clock::test]
+	#[kio::test]
 	#[cfg(feature = "async")]
 	async fn an_untimed_group_no_route_continues_is_given_up_by_wall_clock() {
 		let untimed = || {
@@ -4645,7 +4645,7 @@ mod test {
 		assert_eq!(routes.subscription(demand, 1).start(), Some(10));
 	}
 
-	#[moq_clock::test]
+	#[kio::test]
 	async fn a_replacement_delivers_unseen_datagrams_below_the_newest_sequence() {
 		let routes = Producer::new();
 		let front = logical(&routes);

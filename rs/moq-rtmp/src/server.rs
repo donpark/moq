@@ -255,7 +255,7 @@ pub struct Server {
 	/// While set, `accept` stops asking the listener until this instant. In-flight handshakes keep
 	/// being polled meanwhile: a connection that already got through must not wait out a backoff
 	/// earned by a different one.
-	accept_retry: Option<moq_clock::Instant>,
+	accept_retry: Option<kio::clock::Instant>,
 }
 
 impl Server {
@@ -355,7 +355,7 @@ impl Server {
 						self.pending.push(Box::pin(async move {
 							// The TLS handshake (if any) and the RTMP handshake share one
 							// budget, so a client that stalls either is dropped.
-							let outcome = moq_clock::timeout(REQUEST_TIMEOUT, async move {
+							let outcome = kio::clock::timeout(REQUEST_TIMEOUT, async move {
 								#[cfg(feature = "tls")]
 								let conn = match tls {
 									Some(acceptor) if starts_tls(&stream).await? => Conn::Tls(Box::new(
@@ -402,7 +402,7 @@ impl Server {
 						tracing::warn!(%err, "failed to accept RTMP connection; continuing");
 						let wait = self.accept_delay.mul_f64(0.5 + rand::rng().random::<f64>() / 2.0);
 						self.accept_delay = (self.accept_delay * 2).min(ACCEPT_RETRY_MAX);
-						self.accept_retry = Some(moq_clock::Instant::now() + wait);
+						self.accept_retry = Some(kio::clock::Instant::now() + wait);
 					}
 				},
 			}
@@ -429,9 +429,9 @@ async fn starts_tls(stream: &TcpStream) -> io::Result<bool> {
 ///
 /// The `select!` arm that uses this is guarded on `at` being set; the pending branch keeps the arm
 /// well-formed rather than leaving the macro with a `None` to unwrap.
-async fn sleep_until(at: Option<moq_clock::Instant>) {
+async fn sleep_until(at: Option<kio::clock::Instant>) {
 	match at {
-		Some(at) => moq_clock::sleep_until(at).await,
+		Some(at) => kio::clock::sleep_until(at).await,
 		None => std::future::pending().await,
 	}
 }
@@ -471,7 +471,7 @@ pub fn configure_socket(stream: &TcpStream, peer: SocketAddr) {
 ///
 /// Returns `Ok(None)` if the client disconnects before issuing `publish` or
 /// `play`. Unlike [`Server`], this applies no timeout: wrap the call in
-/// [`moq_clock::timeout`] to bound how long a connected-but-idle client can
+/// [`kio::clock::timeout`] to bound how long a connected-but-idle client can
 /// hold the task.
 pub async fn accept_stream<S: Stream>(stream: S, peer: SocketAddr) -> Result<Option<Request<S>>> {
 	Ok(accept_until_request(stream, peer).await?)
@@ -801,7 +801,7 @@ impl<S: Stream> Play<S> {
 				tracing::debug!(peer = %self.peer, %path, "viewer disconnected before play started");
 				return Ok(());
 			}
-			resolved = moq_clock::timeout(PLAY_RESOLVE_TIMEOUT, origin.routed_broadcast(&path)) => {
+			resolved = kio::clock::timeout(PLAY_RESOLVE_TIMEOUT, origin.routed_broadcast(&path)) => {
 				match resolved {
 					Ok(resolved) => resolved,
 					Err(_) => {
@@ -828,7 +828,7 @@ impl<S: Stream> Play<S> {
 				tracing::debug!(peer = %self.peer, %path, "viewer disconnected before play started");
 				return Ok(());
 			}
-			catalog = moq_clock::timeout(PLAY_RESOLVE_TIMEOUT, CatalogStream::next(&mut check)) => {
+			catalog = kio::clock::timeout(PLAY_RESOLVE_TIMEOUT, CatalogStream::next(&mut check)) => {
 				match catalog {
 					Ok(Ok(Some(catalog))) => catalog,
 					Ok(Ok(None)) => {
@@ -876,7 +876,7 @@ impl<S: Stream> Play<S> {
 				tracing::debug!(peer = %self.peer, %path, "viewer disconnected before play started");
 				return Ok(());
 			}
-			chunk = moq_clock::timeout(PLAY_RESOLVE_TIMEOUT, export.next()) => {
+			chunk = kio::clock::timeout(PLAY_RESOLVE_TIMEOUT, export.next()) => {
 				match chunk {
 					Ok(Ok(Some(chunk))) => chunk,
 					Ok(Ok(None)) => {
@@ -1234,7 +1234,7 @@ async fn pump<S: Stream>(
 	peer: SocketAddr,
 ) -> anyhow::Result<End> {
 	let mut buffer = [0u8; READ_BUFFER];
-	let mut media_deadline = moq_clock::Instant::now() + PUBLISH_IDLE_TIMEOUT;
+	let mut media_deadline = kio::clock::Instant::now() + PUBLISH_IDLE_TIMEOUT;
 	loop {
 		let mut finished = false;
 		while let Some(result) = work.pop_front() {
@@ -1247,13 +1247,13 @@ async fn pump<S: Stream>(
 					// consumes whole tags atomically, so one bad frame doesn't desync
 					// the stream, and tearing down a live publish over it would be worse.
 					ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
-						media_deadline = moq_clock::Instant::now() + PUBLISH_IDLE_TIMEOUT;
+						media_deadline = kio::clock::Instant::now() + PUBLISH_IDLE_TIMEOUT;
 						if let Err(err) = publisher.push(flv::TAG_AUDIO, timestamp.value, &data) {
 							tracing::warn!(%peer, %err, "dropping RTMP audio frame that failed to demux");
 						}
 					}
 					ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
-						media_deadline = moq_clock::Instant::now() + PUBLISH_IDLE_TIMEOUT;
+						media_deadline = kio::clock::Instant::now() + PUBLISH_IDLE_TIMEOUT;
 						if let Err(err) = publisher.push(flv::TAG_VIDEO, timestamp.value, &data) {
 							tracing::warn!(%peer, %err, "dropping RTMP video frame that failed to demux");
 						}
@@ -1277,7 +1277,7 @@ async fn pump<S: Stream>(
 
 		let n = tokio::select! {
 			res = stream.read(&mut buffer) => res?,
-			_ = moq_clock::sleep_until(media_deadline) => {
+			_ = kio::clock::sleep_until(media_deadline) => {
 				anyhow::bail!("peer {peer} sent no RTMP media for {:?}", PUBLISH_IDLE_TIMEOUT);
 			}
 		};

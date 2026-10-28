@@ -354,7 +354,7 @@ impl Client {
 
 		let session = match self.timeout.is_zero() {
 			true => attempt.await?,
-			false => moq_clock::timeout(self.timeout, attempt)
+			false => kio::clock::timeout(self.timeout, attempt)
 				.await
 				.map_err(|_| Error::ConnectTimeout(self.timeout))??,
 		};
@@ -424,7 +424,7 @@ impl Client {
 		// arm was still pending.
 		let dialed = match self.timeout.is_zero() {
 			true => attempt.await?,
-			false => match moq_clock::timeout(self.timeout, attempt).await {
+			false => match kio::clock::timeout(self.timeout, attempt).await {
 				Ok(res) => res?,
 				Err(_) => return Err(Error::ConnectTimeout(self.timeout)),
 			},

@@ -37,11 +37,11 @@ async fn read_all(group: &mut group::Consumer) -> moq_net::Result<Vec<Vec<u8>>> 
 /// The relay cancels its idle upstream subscription, resetting that group mid-transfer.
 /// Resuming the rejoin at the frame where the reset landed would ask upstream for a tail
 /// whose head is gone, so the group would never reach the returning reader.
-#[moq_clock::test]
+#[kio::test]
 async fn rejoin_recovers_the_group_reset_on_leave() {
 	for advance in [false, true] {
 		for version in ["moq-lite-05", "moq-lite-06"] {
-			moq_clock::timeout(TEST_TIMEOUT, async {
+			kio::clock::timeout(TEST_TIMEOUT, async {
 				let publisher = produce_origin(1);
 				let relay = produce_origin(2);
 
@@ -125,7 +125,7 @@ async fn rejoin_recovers_the_group_reset_on_leave() {
 /// on meanwhile. The cache is stale until the route answers again, so the rejoining reader
 /// starts at the live edge, whether the answer carries the largest position (lite-07) or
 /// the first frame says where the feed is.
-#[moq_clock::test]
+#[kio::test]
 async fn rejoin_skips_a_cache_kept_by_another_handle() {
 	for version in [
 		"moq-lite-05",
@@ -134,7 +134,7 @@ async fn rejoin_skips_a_cache_kept_by_another_handle() {
 		"moq-transport-18",
 		"moq-transport-22",
 	] {
-		moq_clock::timeout(TEST_TIMEOUT, async {
+		kio::clock::timeout(TEST_TIMEOUT, async {
 			let publisher = produce_origin(1);
 			let relay = produce_origin(2);
 
@@ -188,7 +188,7 @@ async fn rejoin_skips_a_cache_kept_by_another_handle() {
 /// The client still holds the group's head when it rejoins, so it may ask the relay for
 /// only the rest. A later reader at the relay joins at the live edge and needs the group
 /// from its first frame, so the relay's copy must keep it.
-#[moq_clock::test]
+#[kio::test]
 async fn rejoin_mid_group_keeps_the_head_for_later_readers() {
 	for version in [
 		"moq-lite-05",
@@ -197,7 +197,7 @@ async fn rejoin_mid_group_keeps_the_head_for_later_readers() {
 		"moq-transport-18",
 		"moq-transport-22",
 	] {
-		moq_clock::timeout(TEST_TIMEOUT, async {
+		kio::clock::timeout(TEST_TIMEOUT, async {
 			let publisher = produce_origin(1);
 			let relay = produce_origin(2);
 			let client = produce_origin(3);
@@ -267,10 +267,10 @@ async fn rejoin_mid_group_keeps_the_head_for_later_readers() {
 /// The publisher accepts the join, but its stream is lost before its header. The open group
 /// is gone for this copy, but the groups after it must still reach readers, local and
 /// downstream, rather than wait on a head that is never coming.
-#[moq_clock::test]
+#[kio::test]
 async fn rejoin_goes_live_without_the_join_head() {
 	for version in ["moq-transport-18", "moq-transport-22"] {
-		moq_clock::timeout(TEST_TIMEOUT, async {
+		kio::clock::timeout(TEST_TIMEOUT, async {
 			let publisher = produce_origin(1);
 			let relay = produce_origin(2);
 			let client = produce_origin(3);
@@ -302,7 +302,7 @@ async fn rejoin_goes_live_without_the_join_head() {
 
 			// The rejoin's join stream is lost before its header.
 			upstream.server_transport.hold_unis();
-			let rejoin = moq_clock::sim::spawn(async move {
+			let rejoin = kio::clock::sim::spawn(async move {
 				let mut sub = remote.track("video").unwrap().subscribe(None).await.unwrap();
 				loop {
 					let mut group = sub.recv_group().await.unwrap().unwrap();
@@ -312,7 +312,7 @@ async fn rejoin_goes_live_without_the_join_head() {
 				}
 			});
 			crate::support::wanted(track.demand()).await.unwrap();
-			moq_clock::sleep(Duration::from_millis(100)).await;
+			kio::clock::sleep(Duration::from_millis(100)).await;
 			upstream.server_transport.drop_unis();
 
 			let mut next = track.append_group().unwrap();
@@ -338,10 +338,10 @@ async fn rejoin_goes_live_without_the_join_head() {
 /// Cancelling waits on the publisher, a round trip on a slow link, but the publisher stops
 /// serving as soon as the cancel lands. A reader returning in between must already find the
 /// copy idle, or it takes the cached group as the live edge.
-#[moq_clock::test]
+#[kio::test]
 async fn rejoin_during_the_cancel_skips_the_cache() {
 	for version in support::every_version() {
-		moq_clock::timeout(TEST_TIMEOUT, async {
+		kio::clock::timeout(TEST_TIMEOUT, async {
 			let publisher = produce_origin(1);
 			let relay = produce_origin(2);
 
@@ -396,7 +396,7 @@ async fn rejoin_during_the_cancel_skips_the_cache() {
 /// rejoin with that group, right after the one the relay cached. Its header lands before its
 /// first frame. Shown in between, it would leave the cached group without a stamped
 /// successor, and a reader at the live edge would be handed that older group first.
-#[moq_clock::test]
+#[kio::test]
 async fn rejoin_waits_for_the_answers_first_frame() {
 	// Lite01/02 carry no max age, so the publisher serves the relay's cached head again and
 	// that answer is what makes the cache current.
@@ -405,7 +405,7 @@ async fn rejoin_waits_for_the_answers_first_frame() {
 		.into_iter()
 		.filter(|version| !unbudgeted.contains(&version.as_str()))
 	{
-		moq_clock::timeout(TEST_TIMEOUT, async {
+		kio::clock::timeout(TEST_TIMEOUT, async {
 			let publisher = produce_origin(1);
 			let relay = produce_origin(2);
 
@@ -441,7 +441,7 @@ async fn rejoin_waits_for_the_answers_first_frame() {
 
 			pair.server_transport.split_unis();
 			let mut sub = remote.track("video").unwrap().subscribe(None).await.unwrap();
-			let early = moq_clock::timeout(Duration::from_secs(1), sub.recv_group()).await;
+			let early = kio::clock::timeout(Duration::from_secs(1), sub.recv_group()).await;
 			assert!(
 				early.is_err(),
 				"{version}: the rejoining reader got the cached group {:?} first",
@@ -468,7 +468,7 @@ async fn rejoin_waits_for_the_answers_first_frame() {
 /// A catalog's latest group can sit unread past the cache's idle expiry. A downstream
 /// session that read it and then leaves must not take the relay's copy of that group with
 /// it: a reader that joins afterwards needs it, and no newer group may ever come.
-#[moq_clock::test]
+#[kio::test]
 async fn leaving_after_the_cache_window_keeps_the_latest_group() {
 	for version in [
 		"moq-lite-05",
@@ -477,7 +477,7 @@ async fn leaving_after_the_cache_window_keeps_the_latest_group() {
 		"moq-transport-18",
 		"moq-transport-22",
 	] {
-		moq_clock::timeout(TEST_TIMEOUT + moq_net::cache::DEFAULT_EXPIRY * 3, async {
+		kio::clock::timeout(TEST_TIMEOUT + moq_net::cache::DEFAULT_EXPIRY * 3, async {
 			let version: Version = version.parse().unwrap();
 			let publisher = produce_origin(1);
 			let relay = produce_origin(2);
@@ -519,7 +519,7 @@ async fn leaving_after_the_cache_window_keeps_the_latest_group() {
 			let mut sub = leaver.track("catalog").unwrap().subscribe(None).await.unwrap();
 			let mut group = sub.recv_group().await.unwrap().unwrap();
 			assert_eq!(read_all(&mut group).await.unwrap(), [b"c0"], "{version}");
-			moq_clock::sleep(moq_net::cache::DEFAULT_EXPIRY * 2).await;
+			kio::clock::sleep(moq_net::cache::DEFAULT_EXPIRY * 2).await;
 			drop((group, sub, leaver, leaver_session));
 
 			// Right after the leave, and again once the leaver's front has lingered and let go
@@ -528,10 +528,10 @@ async fn leaving_after_the_cache_window_keeps_the_latest_group() {
 				(5, Duration::from_millis(100)),
 				(6, moq_net::cache::DEFAULT_EXPIRY + Duration::from_secs(1)),
 			] {
-				moq_clock::sleep(after).await;
+				kio::clock::sleep(after).await;
 				let (later, _later) = session(hop).await;
 				let mut sub = later.track("catalog").unwrap().subscribe(None).await.unwrap();
-				let group = moq_clock::timeout(Duration::from_secs(1), sub.recv_group()).await;
+				let group = kio::clock::timeout(Duration::from_secs(1), sub.recv_group()).await;
 				let mut group = group
 					.unwrap_or_else(|_| panic!("{version}: reader {hop} never got the latest group"))
 					.unwrap()
@@ -550,10 +550,10 @@ async fn leaving_after_the_cache_window_keeps_the_latest_group() {
 /// The returning subscription opts out of the track's properties from draft-22, since the
 /// copy already learned them, so its units must come from that first answer rather than
 /// the empty block the second one carries.
-#[moq_clock::test]
+#[kio::test]
 async fn rejoin_keeps_source_timestamps() {
 	for version in ["moq-transport-18", "moq-transport-22"] {
-		moq_clock::timeout(TEST_TIMEOUT, async {
+		kio::clock::timeout(TEST_TIMEOUT, async {
 			let publisher = produce_origin(1);
 			let client = produce_origin(2);
 
@@ -607,7 +607,7 @@ async fn rejoin_keeps_source_timestamps() {
 /// group must stay protected while that reader holds the track open: a reader joining
 /// after the cache window needs it, and no newer group may ever come. Once a newer group
 /// supersedes it, it expires like any other.
-#[moq_clock::test]
+#[kio::test]
 async fn rejoined_quiet_catalog_survives_cache_expiry() {
 	for version in [
 		"moq-lite-05",
@@ -625,7 +625,7 @@ async fn rejoined_quiet_catalog_survives_cache_expiry() {
 /// The publisher reconnects while a reader holds the catalog. A late reader through the
 /// new connection still needs the quiet catalog, even on a wire without epochs where
 /// the old reader ends with its route.
-#[moq_clock::test]
+#[kio::test]
 async fn taken_over_quiet_catalog_survives_cache_expiry() {
 	for version in [
 		"moq-lite-05",
@@ -639,7 +639,7 @@ async fn taken_over_quiet_catalog_survives_cache_expiry() {
 }
 
 async fn quiet_catalog_survives_cache_expiry(version: Version, takeover: bool) {
-	moq_clock::timeout(TEST_TIMEOUT + moq_net::cache::DEFAULT_EXPIRY * 5, async {
+	kio::clock::timeout(TEST_TIMEOUT + moq_net::cache::DEFAULT_EXPIRY * 5, async {
 		let publisher = produce_origin(1);
 		let relay = produce_origin(2);
 		let broadcast = publisher.create_broadcast("bench").unwrap();
@@ -707,9 +707,9 @@ async fn quiet_catalog_survives_cache_expiry(version: Version, takeover: bool) {
 			(holder, remote, pair)
 		};
 
-		moq_clock::sleep(moq_net::cache::DEFAULT_EXPIRY * 2 + Duration::from_secs(2)).await;
+		kio::clock::sleep(moq_net::cache::DEFAULT_EXPIRY * 2 + Duration::from_secs(2)).await;
 		let (mut later, later_remote, _later_pair) = session(5).await;
-		let mut group = moq_clock::timeout(Duration::from_secs(1), later.recv_group())
+		let mut group = kio::clock::timeout(Duration::from_secs(1), later.recv_group())
 			.await
 			.unwrap_or_else(|_| panic!("{version} takeover={takeover}: late reader lost the latest catalog"))
 			.unwrap()
@@ -726,13 +726,13 @@ async fn quiet_catalog_survives_cache_expiry(version: Version, takeover: bool) {
 		// Epochless wires end the old holder on takeover. The late reader uses the
 		// current route on every version, and keeps that copy live for the expiry check.
 		assert_eq!(later.recv_group().await.unwrap().unwrap().sequence, 1, "{version}");
-		moq_clock::sleep(moq_net::cache::DEFAULT_EXPIRY * 2 + Duration::from_secs(2)).await;
+		kio::clock::sleep(moq_net::cache::DEFAULT_EXPIRY * 2 + Duration::from_secs(2)).await;
 		let old = async {
 			let mut group = later_remote.track("catalog").unwrap().fetch_group(0, None).await?;
 			group.read_frame().await
 		};
 		assert!(
-			moq_clock::timeout(Duration::from_secs(1), old).await.unwrap().is_err(),
+			kio::clock::timeout(Duration::from_secs(1), old).await.unwrap().is_err(),
 			"{version} takeover={takeover}: the superseded catalog never expired"
 		);
 		drop(upstream_session);

@@ -215,7 +215,7 @@ impl Server {
 			Poll::Ready(Some(_)) => Poll::Ready(true),
 			Poll::Pending => routes.poll_synced(waiter).map(|()| false),
 		});
-		if !moq_clock::timeout(RESOLVE_TIMEOUT, routed).await.unwrap_or(false) {
+		if !kio::clock::timeout(RESOLVE_TIMEOUT, routed).await.unwrap_or(false) {
 			return None;
 		}
 
@@ -223,7 +223,7 @@ impl Server {
 			.map_err(|err| tracing::warn!(%err, %name, "failed to follow broadcast"))
 			.ok()?;
 		// A covering dynamic route may never answer, so the resolution is bounded too.
-		let broadcast = match moq_clock::timeout(RESOLVE_TIMEOUT, instances.next()).await {
+		let broadcast = match kio::clock::timeout(RESOLVE_TIMEOUT, instances.next()).await {
 			Ok(Ok(follow::Event::Start(broadcast))) => broadcast,
 			// Nothing was handed out, so there is nothing to end.
 			Ok(Ok(follow::Event::End)) => return None,
@@ -412,7 +412,7 @@ mod tests {
 		let origin = produce_origin();
 		let server = Server::new(origin.consume(), Config::default());
 
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		assert!(server.broadcaster("live").await.is_none());
 		assert_eq!(start.elapsed(), Duration::ZERO);
 	}
@@ -486,7 +486,7 @@ mod tests {
 			if ready().await {
 				return;
 			}
-			moq_clock::sleep(Duration::from_millis(100)).await;
+			kio::clock::sleep(Duration::from_millis(100)).await;
 		}
 		panic!("never happened");
 	}

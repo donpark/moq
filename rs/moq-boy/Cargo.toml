@@ -34,7 +34,7 @@ boytacean = { version = "0.13", features = ["gen-mock"] }
 bytes = { workspace = true }
 hang = { workspace = true }
 moq-audio = { workspace = true }
-moq-clock = { workspace = true }
+kio = { workspace = true, features = ["runtime"] }
 moq-json = { workspace = true }
 moq-mux = { workspace = true }
 moq-net = { workspace = true }

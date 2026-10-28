@@ -690,9 +690,9 @@ fn connections_share_one_tx_buffer_fairly() {
 				.expect("second client socket");
 			let mut second_config = dial_config(server);
 			second_config.transport.idle_timeout = Duration::from_millis(500);
-			let started = moq_clock::now();
+			let started = kio::clock::now();
 			let second = quic::client::connect(second_sock, &second_config).await;
-			let elapsed = moq_clock::now() - started;
+			let elapsed = kio::clock::now() - started;
 			running.set(false);
 			let second = second.expect("the second connection must not starve");
 			assert!(

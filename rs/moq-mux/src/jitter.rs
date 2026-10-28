@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
 
-use moq_clock::{Instant, Sleep};
+use kio::clock::{Instant, Sleep};
 use moq_net::Timestamp;
 
 /// One active publisher and at most one independently acquiring replacement.
@@ -234,7 +234,7 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 			.horizon
 			.zip(first)
 			.map_or(Duration::ZERO, |(old, new)| old.saturating_duration_since(new));
-		tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "commit-clock", now = ?moq_clock::now(), old_horizon = ?self.active.horizon, new_first = ?first, ?shift, old_clock = ?self.active.clock.map(|clock| (clock.anchor, clock.base, clock.generation)), new_clock = ?engine.clock.map(|clock| (clock.anchor, clock.base, clock.generation)));
+		tracing::debug!(target: "moq_mux::container::ts::handoff", phase = "commit-clock", now = ?kio::clock::now(), old_horizon = ?self.active.horizon, new_first = ?first, ?shift, old_clock = ?self.active.clock.map(|clock| (clock.anchor, clock.base, clock.generation)), new_clock = ?engine.clock.map(|clock| (clock.anchor, clock.base, clock.generation)));
 		let offset = self.active.clock.map_or(0, |clock| clock.generation + 1);
 		for clock in [&mut engine.clock, &mut engine.previous].into_iter().flatten() {
 			clock.anchor = clock.anchor.checked_add(shift).ok_or(moq_net::TimeOverflow)?;
@@ -1253,7 +1253,7 @@ impl<K: Ord + Clone, T> Engine<K, T> {
 
 	fn poll_available(&mut self, waiter: &kio::Waiter, held: Option<&BTreeMap<K, Ready<K, T>>>) -> Poll<Ready<K, T>> {
 		loop {
-			let now = moq_clock::now();
+			let now = kio::clock::now();
 			let acquired = self.acquired_by();
 			if acquired.is_some_and(|end| now >= end) {
 				self.acquired();
@@ -1286,7 +1286,9 @@ impl<K: Ord + Clone, T> Engine<K, T> {
 				self.timer = None;
 				return Poll::Pending;
 			};
-			let timer = self.timer.get_or_insert_with(|| Box::pin(moq_clock::sleep_until(wake)));
+			let timer = self
+				.timer
+				.get_or_insert_with(|| Box::pin(kio::clock::sleep_until(wake)));
 			if timer.deadline() != wake {
 				timer.as_mut().reset(wake);
 			}
@@ -1395,7 +1397,7 @@ impl<K: Ord + Clone, T> Engine<K, T> {
 		self.tracks
 			.get(key)
 			.and_then(|track| track.queue.front())
-			.is_some_and(|(_, _, deadline, _)| self.delay.is_zero() || *deadline <= moq_clock::now())
+			.is_some_and(|(_, _, deadline, _)| self.delay.is_zero() || *deadline <= kio::clock::now())
 	}
 
 	/// How many frames are waiting.
@@ -1503,9 +1505,9 @@ mod tests {
 	const DELAY: Duration = Duration::from_millis(100);
 
 	/// A pending publisher cannot clobber active expected tracks or automatic clock jumps.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn pending_keys_and_active_timeline_jumps_use_independent_clocks() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let delay = Duration::from_millis(500);
 		let mut buffer = Buffer::new(delay).replay();
 		buffer.expect([0u16]);
@@ -1516,7 +1518,7 @@ mod tests {
 		buffer.expect_pending([1, 3], [1, 3]);
 		buffer.push(2, arrival(start, 0, "A2")).unwrap();
 		buffer.push(3, arrival(start, 10_000, "B3")).unwrap();
-		moq_clock::sleep(delay).await;
+		kio::clock::sleep(delay).await;
 		assert_eq!(due(&mut buffer), ["A0", "A2"]);
 		let Poll::Ready(first) = buffer.poll_pending(&kio::Waiter::noop()) else {
 			panic!("B ready");
@@ -1533,17 +1535,17 @@ mod tests {
 				0,
 				Arrival {
 					restart: 1,
-					..arrival(moq_clock::now(), 0, "A restart")
+					..arrival(kio::clock::now(), 0, "A restart")
 				},
 			)
 			.unwrap();
-		buffer.push(3, arrival(moq_clock::now(), 10_020, "B next")).unwrap();
-		moq_clock::sleep(Duration::from_millis(20)).await;
+		buffer.push(3, arrival(kio::clock::now(), 10_020, "B next")).unwrap();
+		kio::clock::sleep(Duration::from_millis(20)).await;
 		let Poll::Ready(next) = buffer.poll_pending(&kio::Waiter::noop()) else {
 			panic!("B clock kept its deadline");
 		};
 		assert_eq!((next.item, next.generation), ("B next", 0));
-		moq_clock::sleep(delay - Duration::from_millis(20)).await;
+		kio::clock::sleep(delay - Duration::from_millis(20)).await;
 		let Poll::Ready(next) = buffer.poll_next(&kio::Waiter::noop()) else {
 			panic!("A restart ready");
 		};
@@ -1551,9 +1553,9 @@ mod tests {
 	}
 
 	/// A caller can hold B's first issued item, cancel before adoption, and resume A.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn cancelling_an_issued_replacement_keeps_the_active_clock_and_queue() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let delay = Duration::from_millis(500);
 		let mut buffer = Buffer::new(delay).replay();
 		buffer.push(0u16, arrival(start, 0, "A0")).unwrap();
@@ -1563,14 +1565,14 @@ mod tests {
 		buffer.push(1, arrival(start, 10_000, "B")).unwrap();
 		buffer.lose(&1, true);
 		buffer.lose(&1, true);
-		moq_clock::sleep(delay).await;
+		kio::clock::sleep(delay).await;
 		assert_eq!(due(&mut buffer), ["A0"]);
 		let Poll::Ready(first) = buffer.poll_pending(&kio::Waiter::noop()) else {
 			panic!("B ready");
 		};
 		buffer.commit(first).unwrap();
 		assert_eq!(buffer.reporting().dropped(), 1);
-		moq_clock::sleep(Duration::from_millis(100)).await;
+		kio::clock::sleep(Duration::from_millis(100)).await;
 		let Poll::Ready(tail) = buffer.poll_next(&kio::Waiter::noop()) else {
 			panic!("A tail retained");
 		};
@@ -1582,12 +1584,12 @@ mod tests {
 		buffer.cancel();
 		assert_eq!(buffer.reporting().dropped(), 1);
 		assert_eq!(buffer.at(0, ms(200)), Some(start + delay + Duration::from_millis(200)));
-		buffer.push(0, arrival(moq_clock::now(), 200, "A resumed")).unwrap();
+		buffer.push(0, arrival(kio::clock::now(), 200, "A resumed")).unwrap();
 		buffer.start([2], [2]);
-		buffer.push(2, arrival(moq_clock::now(), 20_000, "C")).unwrap();
-		moq_clock::sleep(Duration::from_millis(100)).await;
+		buffer.push(2, arrival(kio::clock::now(), 20_000, "C")).unwrap();
+		kio::clock::sleep(Duration::from_millis(100)).await;
 		assert_eq!(due(&mut buffer), ["A resumed"]);
-		moq_clock::sleep(Duration::from_millis(400)).await;
+		kio::clock::sleep(Duration::from_millis(400)).await;
 		let Poll::Ready(first) = buffer.poll_pending(&kio::Waiter::noop()) else {
 			panic!("C ready");
 		};
@@ -1601,33 +1603,33 @@ mod tests {
 	}
 
 	/// A restart the old publisher is still acquiring at commit goes out before the replacement.
-	#[moq_clock::test]
+	#[kio::test]
 	async fn a_commit_drains_the_old_publishers_acquiring_restart() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let delay = Duration::from_millis(500);
 		let mut buffer = Buffer::new(delay);
 		buffer.push(0u16, arrival(start, 0, "A0")).unwrap();
-		moq_clock::sleep(delay).await;
+		kio::clock::sleep(delay).await;
 		assert_eq!(released(&mut buffer), [("A0", 0)]);
 		buffer.start([1], [1]);
-		buffer.push(1, arrival(moq_clock::now(), 10_000, "B")).unwrap();
-		moq_clock::sleep(Duration::from_millis(10)).await;
+		buffer.push(1, arrival(kio::clock::now(), 10_000, "B")).unwrap();
+		kio::clock::sleep(Duration::from_millis(10)).await;
 		buffer
-			.push(0, after(1, arrival(moq_clock::now(), 5_000, "A restart")))
+			.push(0, after(1, arrival(kio::clock::now(), 5_000, "A restart")))
 			.unwrap();
-		moq_clock::sleep(delay - Duration::from_millis(10)).await;
+		kio::clock::sleep(delay - Duration::from_millis(10)).await;
 		let Poll::Ready(first) = buffer.poll_pending(&kio::Waiter::noop()) else {
 			panic!("B ready");
 		};
 		// A's acquisition has 10 ms left to run, so only the commit can settle it.
 		buffer.commit(first).unwrap();
-		moq_clock::sleep(Duration::from_millis(10)).await;
+		kio::clock::sleep(Duration::from_millis(10)).await;
 		assert_eq!(released(&mut buffer), [("A restart", 1), ("B", 2)]);
 	}
 
-	#[moq_clock::test]
+	#[kio::test]
 	async fn a_handoff_past_the_clock_range_returns_overflow() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY).replay();
 		buffer.push(0u16, arrival(start, 0, "A")).unwrap();
 		let last = Instant::ZERO.checked_add(Duration::from_nanos(u64::MAX)).unwrap();
@@ -1644,16 +1646,16 @@ mod tests {
 		buffer.start([1], [1]);
 		buffer.push(1, arrival(start, 0, "B first")).unwrap();
 		buffer.push(1, arrival(start, 1, "B after last")).unwrap();
-		moq_clock::sleep(DELAY).await;
+		kio::clock::sleep(DELAY).await;
 		let Poll::Ready(first) = buffer.poll_pending(&kio::Waiter::noop()) else {
 			panic!("B ready");
 		};
 		assert_eq!(buffer.commit(first), Err(moq_net::TimeOverflow));
 	}
 
-	#[moq_clock::test]
+	#[kio::test]
 	async fn decode_before_zero_keeps_its_deadline_and_media_order() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY).replay();
 		buffer.push(2, arrival(start, 0, "audio")).unwrap();
 		let before_zero = Decode::from_nanos(-22_223);
@@ -1671,13 +1673,13 @@ mod tests {
 			Some(start + DELAY - Duration::from_nanos(22_223))
 		);
 		assert_eq!(buffer.at(0, ms(0)), Some(start + DELAY));
-		moq_clock::sleep(DELAY).await;
+		kio::clock::sleep(DELAY).await;
 		assert_eq!(due(&mut buffer), ["video", "audio"]);
 	}
 
-	#[moq_clock::test]
+	#[kio::test]
 	async fn moving_media_zero_preserves_acquisition_and_deadlines() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut negative = Buffer::new(DELAY);
 		let mut positive = Buffer::new(DELAY);
 		for buffer in [&mut negative, &mut positive] {
@@ -1696,7 +1698,7 @@ mod tests {
 					.unwrap();
 			}
 		}
-		moq_clock::sleep(DELAY).await;
+		kio::clock::sleep(DELAY).await;
 		assert_eq!(due(&mut negative), due(&mut positive));
 		for nanos in [-22_223, -11_112, 0, 11_111] {
 			assert_eq!(
@@ -1768,7 +1770,7 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn acquisition_observes_every_tracks_available_frames() {
 		for order in [[1, 2], [2, 1]] {
-			let start = moq_clock::now();
+			let start = kio::clock::now();
 			let mut buffer = Buffer::new(Duration::from_millis(500));
 			buffer.expect([1, 2]);
 			// The held first frames reach the jitter buffer before the rest of the fill.
@@ -1808,7 +1810,7 @@ mod tests {
 
 	#[tokio::test(start_paused = true)]
 	async fn releases_at_the_delay_in_decode_order() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY).replay();
 		assert_eq!(buffer.push(1, arrival(start, 0, "v0")).unwrap(), Push::Queued);
 		assert_eq!(buffer.push(1, arrival(start, 40, "v40")).unwrap(), Push::Queued);
@@ -1873,7 +1875,7 @@ mod tests {
 	/// its deadline, emit the same order.
 	#[tokio::test(start_paused = true)]
 	async fn arrival_skew_does_not_change_the_order() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let (mut early, mut late) = (Buffer::new(DELAY).replay(), Buffer::new(DELAY).replay());
 		let frames = [
 			(1, 0, "v0"),
@@ -1905,7 +1907,7 @@ mod tests {
 	/// dropped a frame waits for its next sync frame.
 	#[tokio::test(start_paused = true)]
 	async fn late_frames_are_dropped_until_a_sync_frame() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY).replay();
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();
 		buffer.push(2, arrival(start, 0, "a0")).unwrap();
@@ -1975,7 +1977,7 @@ mod tests {
 	/// A restart before anything went out keeps the clock, so the tracks stay on one.
 	#[tokio::test(start_paused = true)]
 	async fn a_skip_before_the_first_release_keeps_one_clock() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY).replay();
 		// The video's first group is stale and anchors the clock; the audio is live.
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();
@@ -2003,7 +2005,7 @@ mod tests {
 	/// runs on it, whether or not that track saw the restart.
 	#[tokio::test(start_paused = true)]
 	async fn every_track_joins_a_new_generation_at_its_next_frame() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY).replay();
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();
 		buffer.push(2, arrival(start, 0, "a0")).unwrap();
@@ -2013,7 +2015,7 @@ mod tests {
 
 		// The publisher resumes a second later with its timeline five seconds on.
 		let resume = start + Duration::from_secs(1);
-		tokio::time::advance(resume - moq_clock::now()).await;
+		tokio::time::advance(resume - kio::clock::now()).await;
 		assert_eq!(
 			buffer.push(1, after(1, arrival(resume, 5_000, "v5000"))).unwrap(),
 			Push::Queued
@@ -2039,7 +2041,7 @@ mod tests {
 	/// clock anchors on it, the track sent latest, so it keeps the delay.
 	#[tokio::test(start_paused = true)]
 	async fn a_track_without_the_restart_joins_the_acquisition() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY);
 		buffer.expect([1, 2]);
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();
@@ -2050,19 +2052,19 @@ mod tests {
 		// The publisher resumes a second later with its timeline five seconds on, and sends
 		// the audio further behind the video than the delay.
 		let resume = start + Duration::from_secs(1);
-		tokio::time::advance(resume - moq_clock::now()).await;
+		tokio::time::advance(resume - kio::clock::now()).await;
 		assert_eq!(
 			buffer.push(1, after(1, arrival(resume, 5_000, "v5000"))).unwrap(),
 			Push::Queued
 		);
 		let lag = resume + DELAY + Duration::from_millis(50);
-		tokio::time::advance(lag - moq_clock::now()).await;
+		tokio::time::advance(lag - kio::clock::now()).await;
 		assert_eq!(buffer.push(2, arrival(lag, 5_000, "a5000")).unwrap(), Push::Queued);
 		tokio::time::advance(Duration::from_millis(20)).await;
-		let next = moq_clock::now();
+		let next = kio::clock::now();
 		assert_eq!(buffer.push(2, arrival(next, 5_020, "a5020")).unwrap(), Push::Queued);
 
-		tokio::time::advance(lag + DELAY - moq_clock::now()).await;
+		tokio::time::advance(lag + DELAY - kio::clock::now()).await;
 		assert_eq!(released(&mut buffer), [("v5000", 1), ("a5000", 1)]);
 		tokio::time::advance(Duration::from_millis(20)).await;
 		assert_eq!(released(&mut buffer), [("a5020", 1)]);
@@ -2074,7 +2076,7 @@ mod tests {
 	/// timeline 15 seconds on: each released frame's generation, and how many were dropped.
 	async fn cross(steps: u64, tail: u64) -> (Vec<u64>, u64) {
 		const LAG: u64 = 300;
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY);
 		buffer.expect([1, 2]);
 
@@ -2097,7 +2099,7 @@ mod tests {
 		let mut out = Vec::new();
 		for (read, key, restart, decode) in frames {
 			let at = start + Duration::from_millis(read);
-			tokio::time::advance(at - moq_clock::now()).await;
+			tokio::time::advance(at - kio::clock::now()).await;
 			out.extend(released(&mut buffer).into_iter().map(|(_, generation)| generation));
 			buffer.push(key, after(restart, arrival(at, decode, "frame"))).unwrap();
 		}
@@ -2135,7 +2137,7 @@ mod tests {
 	/// neither clock, so it drops as late without steering, and the track's next frame on the
 	/// new timeline still joins it.
 	async fn stray(to: u64) {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY);
 		buffer.expect([1]);
 		buffer.push(1, arrival(start, 10_000, "v")).unwrap();
@@ -2144,12 +2146,12 @@ mod tests {
 		assert_eq!(due(&mut buffer), ["v", "d"]);
 
 		let resume = start + Duration::from_secs(1);
-		tokio::time::advance(resume - moq_clock::now()).await;
+		tokio::time::advance(resume - kio::clock::now()).await;
 		buffer.push(1, after(1, arrival(resume, to, "v'"))).unwrap();
 		tokio::time::advance(DELAY).await;
 		assert_eq!(released(&mut buffer), [("v'", 1)]);
 
-		let now = moq_clock::now();
+		let now = kio::clock::now();
 		assert_eq!(buffer.push(2, arrival(now, 10_040, "d")).unwrap(), Push::Late);
 		assert!(buffer.is_empty(), "the old frame was queued on the new clock");
 		assert!(buffer.steer.floor.is_none(), "the old frame was steered on");
@@ -2172,7 +2174,7 @@ mod tests {
 	/// dropped, and the next on-time frame goes out on the same generation.
 	#[tokio::test(start_paused = true)]
 	async fn a_skip_keeps_the_clock() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY);
 		buffer.push(1, arrival(start, 0, "a0")).unwrap();
 		tokio::time::advance(DELAY).await;
@@ -2180,7 +2182,7 @@ mod tests {
 
 		// Group 1 is skipped: frames from 100 ms on arrive after a 250 ms stall.
 		let stalled = start + Duration::from_millis(350);
-		tokio::time::advance(stalled - moq_clock::now()).await;
+		tokio::time::advance(stalled - kio::clock::now()).await;
 		let skipped = |decode, item| Arrival {
 			skip: 1,
 			..arrival(stalled, decode, item)
@@ -2196,13 +2198,13 @@ mod tests {
 	/// publisher shed, so it opens a generation.
 	#[tokio::test(start_paused = true)]
 	async fn a_skip_that_leaps_ahead_opens_a_generation() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY);
 		buffer.push(1, arrival(start, 0, "a0")).unwrap();
 		tokio::time::advance(DELAY).await;
 		assert_eq!(due(&mut buffer), ["a0"]);
 
-		let now = moq_clock::now();
+		let now = kio::clock::now();
 		let leapt = Arrival {
 			skip: 1,
 			..arrival(now, 5_000, "a5000")
@@ -2217,13 +2219,13 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn a_track_sent_ahead_resuming_after_a_skip_keeps_the_clock() {
 		const LEAD: u64 = 300;
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY);
 		buffer.expect([1, 2]);
 		let mut out = Vec::new();
 		for at in (0..12_000).step_by(40) {
-			tokio::time::advance(start + Duration::from_millis(at) - moq_clock::now()).await;
-			let now = moq_clock::now();
+			tokio::time::advance(start + Duration::from_millis(at) - kio::clock::now()).await;
+			let now = kio::clock::now();
 			assert_eq!(buffer.push(1, arrival(now, at, "v")).unwrap(), Push::Queued);
 			// Track 2 is sent LEAD ahead, and skips a second of its own.
 			let decode = at + LEAD;
@@ -2259,7 +2261,7 @@ mod tests {
 				sync,
 				skip: cut,
 				cut,
-				..arrival(moq_clock::now(), decode, item)
+				..arrival(kio::clock::now(), decode, item)
 			};
 			buffer.push(1, video(0, true, 0, "v0")).unwrap();
 			tokio::time::advance(Duration::from_millis(40)).await;
@@ -2283,7 +2285,7 @@ mod tests {
 	/// clock puts earlier.
 	#[tokio::test(start_paused = true)]
 	async fn generations_go_out_in_turn() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY).replay();
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();
 		buffer.push(1, arrival(start, 40, "v40")).unwrap();
@@ -2292,7 +2294,7 @@ mod tests {
 		assert_eq!(due(&mut buffer), ["v0"]);
 
 		// A backlog across a jump in the timeline, read in one go.
-		let now = moq_clock::now();
+		let now = kio::clock::now();
 		buffer.push(1, after(1, arrival(now, 5_000, "v5000"))).unwrap();
 		buffer.push(2, arrival(now, 4_900, "a4900")).unwrap();
 		buffer.push(2, arrival(now, 5_020, "a5020")).unwrap();
@@ -2330,8 +2332,8 @@ mod tests {
 	/// fails.
 	async fn drift(ppm: f64, hours: f64, settled: f64, queueing: impl Fn(f64) -> Duration) -> Run {
 		let delay = Duration::from_millis(500);
-		let start = moq_clock::now();
-		let clock = moq_clock::Deadlines::new(start);
+		let start = kio::clock::now();
+		let clock = kio::clock::Deadlines::new(start);
 		let _entered = clock.enter();
 		let mut buffer = Buffer::new(delay);
 		let mut run = Run {
@@ -2520,8 +2522,8 @@ mod tests {
 	/// clock reaching us at `arrive(track, sent)`, or with the frame of its track before it if
 	/// that is later, or never if `None`, in the order they reach us, until a push fails.
 	async fn feed(shape: &Shape, ppm: f64, secs: f64, arrive: impl Fn(u16, f64) -> Option<f64>) -> Fed {
-		let start = moq_clock::now();
-		let clock = moq_clock::Deadlines::new(start);
+		let start = kio::clock::now();
+		let clock = kio::clock::Deadlines::new(start);
 		let _entered = clock.enter();
 		let mut buffer = Buffer::new(shape.delay);
 		let mut frames = Vec::new();
@@ -2758,7 +2760,7 @@ mod tests {
 	/// goes out a delay after it arrived.
 	#[tokio::test(start_paused = true)]
 	async fn a_joiner_anchors_on_its_freshest_frame() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY);
 		let video = |arrived, decode, sync, item| Arrival {
 			sync,
@@ -2843,7 +2845,7 @@ mod tests {
 	/// keep the delay: anchored on the video, every audio frame would be late.
 	#[tokio::test(start_paused = true)]
 	async fn a_joiner_anchors_on_the_track_sent_latest() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY);
 		buffer.expect([1, 2]);
 		// Video is sent 300 ms ahead of its decode time, audio as it decodes.
@@ -2862,7 +2864,7 @@ mod tests {
 	/// the one sent latest, but two delays at most.
 	#[tokio::test(start_paused = true)]
 	async fn the_acquisition_waits_two_delays_at_most_for_a_silent_track() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY);
 		buffer.expect([1, 2]);
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();
@@ -2876,7 +2878,7 @@ mod tests {
 	/// moment each was read.
 	#[tokio::test(start_paused = true)]
 	async fn a_steering_step_does_not_reorder_a_tie() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let order = |first: (u16, &'static str), second: (u16, &'static str)| {
 			let mut buffer = Buffer::new(DELAY).replay();
 			buffer.push(1, arrival(start, 0, "v0")).unwrap();
@@ -2896,7 +2898,7 @@ mod tests {
 	/// acquisition ends when the first of them falls due rather than drop it.
 	#[tokio::test(start_paused = true)]
 	async fn the_acquisition_ends_before_a_held_frame_is_due() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY);
 		// Joined 60 ms into a group: its keyframe is due 40 ms from now.
 		let key = Arrival {
@@ -2922,7 +2924,7 @@ mod tests {
 	/// frame behind the clock still goes out.
 	#[tokio::test(start_paused = true)]
 	async fn zero_delay_releases_on_arrival() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(Duration::ZERO);
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();
 		buffer.push(1, arrival(start, 40, "v40")).unwrap();
@@ -2939,7 +2941,7 @@ mod tests {
 	/// reader leaves the rest in the source.
 	#[tokio::test(start_paused = true)]
 	async fn a_track_is_full_once_a_frame_is_due() {
-		let start = moq_clock::now();
+		let start = kio::clock::now();
 		let mut buffer = Buffer::new(DELAY).replay();
 		assert!(!buffer.full(&1));
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();

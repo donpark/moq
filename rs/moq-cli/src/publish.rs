@@ -669,7 +669,7 @@ async fn decode(
 	// diagnosed by the rate at which these climb, and stdin may never end, so
 	// they have to surface as they accumulate rather than at exit.
 	let mut log = ts::stats::Log::default();
-	let mut sampled = moq_clock::now();
+	let mut sampled = kio::clock::now();
 	let sections = report.as_ref().map(crate::report::Stats::sections);
 	let report_mpegts = |snapshot: &ts::stats::Snapshot| {
 		if let Some(sections) = &sections {
@@ -694,7 +694,7 @@ async fn decode(
 			}
 
 			if sampled.elapsed() >= ts::stats::Log::INTERVAL {
-				sampled = moq_clock::now();
+				sampled = kio::clock::now();
 				if let Some(stats) = decoder.stats() {
 					report_mpegts(&stats);
 					log.sample(stats);
@@ -1480,9 +1480,9 @@ pub(crate) mod tests {
 		let Source::Stream { decoder, .. } = &mut publish.source else {
 			panic!("expected a stream source");
 		};
-		let before = moq_clock::wall();
+		let before = kio::clock::wall();
 		decoder.decode_chunk(BBB).unwrap();
-		let after = moq_clock::wall();
+		let after = kio::clock::wall();
 		decoder.finish().unwrap();
 
 		let catalog = hang::catalog::Catalog::<()>::subscribe(&consumer)

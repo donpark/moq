@@ -94,7 +94,7 @@ impl Chain {
 /// Every group `subscriber` receives until it goes quiet.
 async fn received(subscriber: &mut track::Subscriber) -> BTreeSet<u64> {
 	let mut got = BTreeSet::new();
-	while let Ok(group) = moq_clock::timeout(Duration::from_secs(1), subscriber.recv_group()).await {
+	while let Ok(group) = kio::clock::timeout(Duration::from_secs(1), subscriber.recv_group()).await {
 		let group = group.unwrap().expect("the track is live");
 		assert!(got.insert(group.sequence), "group {} delivered twice", group.sequence);
 	}
@@ -102,58 +102,58 @@ async fn received(subscriber: &mut track::Subscriber) -> BTreeSet<u64> {
 }
 
 /// What the subscriber reads after widening its own max age, through a relay or not.
-#[moq_clock::test]
+#[kio::test]
 async fn a_widened_reader_gets_what_was_skipped() {
 	for relay in [false, true] {
 		let chain = Chain::new(relay).await;
-		let mut reader = moq_clock::timeout(TIMEOUT, chain.subscribe(NARROW)).await.unwrap();
-		let first = moq_clock::timeout(TIMEOUT, received(&mut reader)).await.unwrap();
+		let mut reader = kio::clock::timeout(TIMEOUT, chain.subscribe(NARROW)).await.unwrap();
+		let first = kio::clock::timeout(TIMEOUT, received(&mut reader)).await.unwrap();
 		assert_eq!(first, (6..GROUPS).collect(), "relay={relay}");
 
 		let wide = Subscription::default()
 			.with_max_delay(WIDE)
 			.with_ranges([Range::oldest()]);
 		reader.update(wide).unwrap();
-		let widened = moq_clock::timeout(TIMEOUT, received(&mut reader)).await.unwrap();
+		let widened = kio::clock::timeout(TIMEOUT, received(&mut reader)).await.unwrap();
 		assert_eq!(widened, (2..6).collect(), "relay={relay}: only what was skipped");
 	}
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn a_warm_relay_serves_a_wider_newcomer_what_a_cold_one_would() {
 	let cold = Chain::new(true).await;
-	let mut wide = moq_clock::timeout(TIMEOUT, cold.subscribe(WIDE)).await.unwrap();
-	let want = moq_clock::timeout(TIMEOUT, received(&mut wide)).await.unwrap();
+	let mut wide = kio::clock::timeout(TIMEOUT, cold.subscribe(WIDE)).await.unwrap();
+	let want = kio::clock::timeout(TIMEOUT, received(&mut wide)).await.unwrap();
 	assert_eq!(want, (2..GROUPS).collect(), "cold");
 
 	let warm = Chain::new(true).await;
-	let mut narrow = moq_clock::timeout(TIMEOUT, warm.subscribe(NARROW)).await.unwrap();
-	let first = moq_clock::timeout(TIMEOUT, received(&mut narrow)).await.unwrap();
+	let mut narrow = kio::clock::timeout(TIMEOUT, warm.subscribe(NARROW)).await.unwrap();
+	let first = kio::clock::timeout(TIMEOUT, received(&mut narrow)).await.unwrap();
 	assert_eq!(first, (6..GROUPS).collect(), "the narrow reader warms the relay");
 
-	let mut wide = moq_clock::timeout(TIMEOUT, warm.subscribe(WIDE)).await.unwrap();
-	let got = moq_clock::timeout(TIMEOUT, received(&mut wide)).await.unwrap();
+	let mut wide = kio::clock::timeout(TIMEOUT, warm.subscribe(WIDE)).await.unwrap();
+	let got = kio::clock::timeout(TIMEOUT, received(&mut wide)).await.unwrap();
 	assert_eq!(got, want, "warm");
-	let late = moq_clock::timeout(TIMEOUT, received(&mut narrow)).await.unwrap();
+	let late = kio::clock::timeout(TIMEOUT, received(&mut narrow)).await.unwrap();
 	assert!(late.is_empty(), "the narrow reader still skips {late:?}");
 }
 
 /// A reader joining with the max age the relay already asks for changes nothing upstream.
-#[moq_clock::test]
+#[kio::test]
 async fn the_same_max_age_sends_no_update() {
 	let mut chain = Chain::new(true).await;
-	let mut narrow = moq_clock::timeout(TIMEOUT, chain.subscribe(NARROW)).await.unwrap();
-	moq_clock::timeout(TIMEOUT, received(&mut narrow)).await.unwrap();
-	while moq_clock::timeout(Duration::from_secs(1), chain.source.subscription_changed())
+	let mut narrow = kio::clock::timeout(TIMEOUT, chain.subscribe(NARROW)).await.unwrap();
+	kio::clock::timeout(TIMEOUT, received(&mut narrow)).await.unwrap();
+	while kio::clock::timeout(Duration::from_secs(1), chain.source.subscription_changed())
 		.await
 		.is_ok()
 	{}
 
-	let mut same = moq_clock::timeout(TIMEOUT, chain.subscribe(NARROW)).await.unwrap();
+	let mut same = kio::clock::timeout(TIMEOUT, chain.subscribe(NARROW)).await.unwrap();
 	assert_eq!(
-		moq_clock::timeout(TIMEOUT, received(&mut same)).await.unwrap(),
+		kio::clock::timeout(TIMEOUT, received(&mut same)).await.unwrap(),
 		(6..GROUPS).collect()
 	);
-	let changed = moq_clock::timeout(Duration::from_secs(1), chain.source.subscription_changed()).await;
+	let changed = kio::clock::timeout(Duration::from_secs(1), chain.source.subscription_changed()).await;
 	assert!(changed.is_err(), "the publisher saw {changed:?}");
 }

@@ -141,7 +141,7 @@ impl IncomingToken {
 				}
 				if issued
 					.checked_add(server_config.retry_token_lifetime)
-					.is_none_or(|expires| expires < moq_clock::wall())
+					.is_none_or(|expires| expires < kio::clock::wall())
 				{
 					return Err(InvalidRetryTokenError);
 				}
@@ -158,7 +158,7 @@ impl IncomingToken {
 				}
 				if issued
 					.checked_add(server_config.validation_token.lifetime)
-					.is_none_or(|expires| expires < moq_clock::wall())
+					.is_none_or(|expires| expires < kio::clock::wall())
 				{
 					return Ok(unvalidated);
 				}

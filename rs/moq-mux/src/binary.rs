@@ -35,7 +35,7 @@
 //!
 //! A payload timed on the broadcast [`Clock`](crate::Clock) is written at that timestamp as given,
 //! and the entry advertises how late payloads reach the transport as its `jitter` and `delay`, the
-//! way a media rendition does. A capture [`Instant`](moq_clock::Instant) converts with
+//! way a media rendition does. A capture [`Instant`](kio::clock::Instant) converts with
 //! [`Clock::capture`](crate::Clock::capture) on the catalog's clock:
 //!
 //! ```no_run
@@ -43,7 +43,7 @@
 //! #     catalog: &moq_mux::catalog::Producer,
 //! #     thumbnail: &mut moq_mux::binary::Snapshot,
 //! #     jpeg: bytes::Bytes,
-//! #     captured: moq_clock::Instant,
+//! #     captured: kio::clock::Instant,
 //! # ) -> moq_mux::Result<()> {
 //! let at = catalog.clock().capture(captured)?;
 //! thumbnail.update(moq_net::Timed::from(jpeg).at(at))?;
@@ -627,7 +627,7 @@ mod test {
 	/// payload would read as a near-zero bitrate.
 	#[test]
 	fn an_unset_host_clock_still_marks_a_reanchor() {
-		use moq_clock::Wall;
+		use kio::clock::Wall;
 		use std::time::Duration;
 
 		crate::clock::fake_host_wall(Wall::UNIX_EPOCH + Duration::from_secs(86_400));
