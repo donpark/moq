@@ -53,7 +53,9 @@ impl Stream {
 		if !buf.has_remaining_mut() {
 			return Poll::Ready(Ok(Some(0)));
 		}
-		self.parked(cx, |this, waiter| this.poll_read_generic(waiter, |chunks| fill(chunks, buf)))
+		self.parked(cx, |this, waiter| {
+			this.poll_read_generic(waiter, |chunks| fill(chunks, buf))
+		})
 	}
 
 	/// Fill `buf` with data from the stream.
@@ -422,7 +424,9 @@ impl Drop for Lease<'_> {
 
 impl std::fmt::Debug for Lease<'_> {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("Lease").field("stream", &self.stream.id).finish_non_exhaustive()
+		f.debug_struct("Lease")
+			.field("stream", &self.stream.id)
+			.finish_non_exhaustive()
 	}
 }
 

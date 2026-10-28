@@ -232,9 +232,7 @@ async fn connect(
 
 /// Send `len` bytes on a fresh stream from `from` and read them all at `to`.
 async fn transfer(handle: &moq_uring::Handle, from: &mut quic::Connection, to: &mut quic::Connection, len: usize) {
-	let mut send = from.open_uni(Default::default())
-		.await
-		.expect("open_uni");
+	let mut send = from.open_uni(Default::default()).await.expect("open_uni");
 	handle.spawn(async move {
 		if send.write_all(bytes::Bytes::from(vec![7u8; len])).await.is_ok() {
 			let _ = send.finish().stopped().await;
@@ -242,15 +240,10 @@ async fn transfer(handle: &moq_uring::Handle, from: &mut quic::Connection, to: &
 	});
 
 	let read = within(handle, "the transfer", async {
-		let mut recv = to.accept_uni()
-			.await
-			.expect("accept_uni");
+		let mut recv = to.accept_uni().await.expect("accept_uni");
 		let mut buf = vec![0u8; 64 * 1024];
 		let mut read = 0;
-		while let Some(n) = recv.read(&mut &mut buf[..])
-			.await
-			.expect("read")
-		{
+		while let Some(n) = recv.read(&mut &mut buf[..]).await.expect("read") {
 			read += n;
 		}
 		read

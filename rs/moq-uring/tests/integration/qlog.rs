@@ -81,11 +81,7 @@ fn a_connection_writes_a_trace() {
 	worker
 		.block_on(async move {
 			let conn = quic::client::connect(client_sock, &dial).await.expect("quic connect");
-			assert_eq!(
-				conn.protocol(),
-				Some(ALPN),
-				"negotiated ALPN"
-			);
+			assert_eq!(conn.protocol(), Some(ALPN), "negotiated ALPN");
 		})
 		.expect("worker");
 

@@ -155,11 +155,7 @@ fn an_endpoint_runs_on_the_worker_that_adopted_its_socket() {
 	owner
 		.block_on(async {
 			let accepted = endpoint.accept().await.expect("accept on the owner");
-			assert_eq!(
-				accepted.protocol(),
-				Some(ALPN),
-				"negotiated ALPN"
-			);
+			assert_eq!(accepted.protocol(), Some(ALPN), "negotiated ALPN");
 			accepted.close(moq_uring::quic::VarInt::from_u32(0), b"done");
 			accepted.closed().await;
 		})

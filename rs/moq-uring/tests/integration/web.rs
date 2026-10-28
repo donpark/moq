@@ -437,12 +437,7 @@ fn an_abandoned_handshake_closes_the_connection() {
 
 			// Nothing here closed it by hand; the guard on the dropped request
 			// is what does.
-			within(
-				&handle,
-				"the abandoned connection to close",
-				watch.closed(),
-			)
-			.await;
+			within(&handle, "the abandoned connection to close", watch.closed()).await;
 		})
 		.expect("worker");
 
@@ -466,12 +461,7 @@ fn an_unpolled_handshake_closes_the_connection() {
 			let conn = endpoint.accept().await.expect("accept");
 			let watch = conn.clone();
 			drop(quic::web::Request::accept(conn));
-			within(
-				&handle,
-				"the unpolled handshake's connection to close",
-				watch.closed(),
-			)
-			.await;
+			within(&handle, "the unpolled handshake's connection to close", watch.closed()).await;
 		})
 		.expect("worker");
 
@@ -643,11 +633,7 @@ fn a_reset_stream_keeps_its_header() {
 			let err = recv.read_chunk(usize::MAX).await.expect_err("the server reset it");
 			assert!(matches!(err, moq_tokio::quic::web::ReadError::Reset(7)), "got {err:?}");
 
-			session
-				.open_uni(Default::default())
-				.await
-				.expect("open_uni")
-				.reset(8);
+			session.open_uni(Default::default()).await.expect("open_uni").reset(8);
 			session.closed().await;
 		})
 	});
@@ -819,18 +805,14 @@ fn dropped_session_delivers_close(explicit: bool) {
 			let watch = conn.clone();
 
 			// The client half of the handshake: SETTINGS, then the CONNECT.
-			let mut control = peer.open_uni(Default::default())
-				.await
-				.expect("control stream");
+			let mut control = peer.open_uni(Default::default()).await.expect("control stream");
 			let mut settings = web_transport_proto::Settings::default();
 			settings.enable_webtransport(1);
 			let mut bytes = Vec::new();
 			settings.encode(&mut bytes);
 			write_raw(&mut control, &bytes).await;
 
-			let (mut connect_send, mut connect_recv) = peer.open_bi(Default::default())
-				.await
-				.expect("CONNECT stream");
+			let (mut connect_send, mut connect_recv) = peer.open_bi(Default::default()).await.expect("CONNECT stream");
 			let url = url::Url::parse(&format!("https://localhost:{}/", server.local_addr().port())).expect("url");
 			let mut bytes = Vec::new();
 			web_transport_proto::ConnectRequest::new(url)
@@ -862,9 +844,7 @@ fn dropped_session_delivers_close(explicit: bool) {
 
 			// The server's control stream, read past its SETTINGS so that
 			// anything it reports from here on is the stream ending.
-			let mut server_control = peer.accept_uni()
-				.await
-				.expect("server control stream");
+			let mut server_control = peer.accept_uni().await.expect("server control stream");
 			let mut received = Vec::new();
 			loop {
 				read_more(&mut server_control, &mut received).await;
@@ -913,12 +893,7 @@ fn dropped_session_delivers_close(explicit: bool) {
 
 			// The peer acts on the capsule, as a browser would.
 			peer.close(0u32.into(), b"");
-			within(
-				&handle,
-				"the connection to close",
-				watch.closed(),
-			)
-			.await;
+			within(&handle, "the connection to close", watch.closed()).await;
 			drop(control);
 		})
 		.expect("worker");
@@ -947,9 +922,7 @@ fn cancelling_a_pending_web_handshake(send_settings: bool) {
 			let mut control = None;
 			if send_settings {
 				let before = watch.stats().udp_rx.bytes;
-				let mut stream = peer.open_uni(Default::default())
-					.await
-					.expect("control stream");
+				let mut stream = peer.open_uni(Default::default()).await.expect("control stream");
 				let mut settings = web_transport_proto::Settings::default();
 				settings.enable_webtransport(1);
 				let mut bytes = Vec::new();
@@ -958,8 +931,7 @@ fn cancelling_a_pending_web_handshake(send_settings: bool) {
 				control = Some(stream);
 				within(&handle, "peer SETTINGS to arrive", async {
 					loop {
-						if watch.stats().udp_rx.bytes > before
-						{
+						if watch.stats().udp_rx.bytes > before {
 							break;
 						}
 						let mut tick = moq_uring::Timer::after(&handle, std::time::Duration::from_millis(10));
@@ -980,19 +952,9 @@ fn cancelling_a_pending_web_handshake(send_settings: bool) {
 			.await;
 			drop(handshake);
 
-			let err = within(
-				&handle,
-				"cancelled WebTransport connection to close",
-				watch.closed(),
-			)
-			.await;
+			let err = within(&handle, "cancelled WebTransport connection to close", watch.closed()).await;
 			assert!(matches!(err, quic::Error::App { code: 0x101, .. }), "got {err:?}");
-			within(
-				&handle,
-				"peer to receive the close",
-				peer.closed(),
-			)
-			.await;
+			within(&handle, "peer to receive the close", peer.closed()).await;
 			drop(control);
 
 			let sibling = within(&handle, "sibling dial", client.connect(&dial))

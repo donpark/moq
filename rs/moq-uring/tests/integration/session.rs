@@ -111,11 +111,7 @@ fn lite_session_over_the_worker() {
 	let payload = worker
 		.block_on(async move {
 			let conn = quic::client::connect(client_sock, &dial).await.expect("quic connect");
-			assert_eq!(
-				conn.protocol(),
-				Some(ALPN),
-				"negotiated ALPN"
-			);
+			assert_eq!(conn.protocol(), Some(ALPN), "negotiated ALPN");
 
 			let (session, driver) = moq_net::Client::new()
 				.with_subscriber(sub.clone())
@@ -348,11 +344,7 @@ fn configured_roots_verify_the_server() {
 	worker
 		.block_on(async move {
 			let conn = quic::client::connect(client_sock, &dial).await.expect("quic connect");
-			assert_eq!(
-				conn.protocol(),
-				Some(ALPN),
-				"negotiated ALPN"
-			);
+			assert_eq!(conn.protocol(), Some(ALPN), "negotiated ALPN");
 		})
 		.expect("worker");
 }
@@ -469,11 +461,7 @@ fn a_root_bundle_is_loaded_whole() {
 	worker
 		.block_on(async move {
 			let conn = quic::client::connect(client_sock, &dial).await.expect("quic connect");
-			assert_eq!(
-				conn.protocol(),
-				Some(ALPN),
-				"negotiated ALPN"
-			);
+			assert_eq!(conn.protocol(), Some(ALPN), "negotiated ALPN");
 		})
 		.expect("worker");
 }

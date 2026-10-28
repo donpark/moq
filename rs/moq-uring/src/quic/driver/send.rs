@@ -263,7 +263,12 @@ impl Half {
 	}
 
 	fn set_priority(&mut self, priority: i64) {
-		let _ = self.shared.conn.borrow_mut().send_stream(self.id).set_priority(priority);
+		let _ = self
+			.shared
+			.conn
+			.borrow_mut()
+			.send_stream(self.id)
+			.set_priority(priority);
 	}
 
 	fn priority(&self) -> i64 {
@@ -279,7 +284,6 @@ impl Half {
 		let group = group.map(Group::id);
 		let _ = self.shared.conn.borrow_mut().send_stream(self.id).set_group(group);
 	}
-
 }
 
 /// Wait for send stream `id` to end: moq-quic keeps how it ended until its handle releases it.

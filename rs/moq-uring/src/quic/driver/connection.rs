@@ -557,7 +557,9 @@ impl Connection {
 	/// # Panics
 	/// - when `options.group` belongs to another connection
 	pub async fn open_uni(&self, options: send::Options<'_>) -> Result<send::Stream, Error> {
-		kio::wait(|waiter| open(&self.shared, Dir::Uni, options, waiter)).await.map(|(send, _)| send)
+		kio::wait(|waiter| open(&self.shared, Dir::Uni, options, waiter))
+			.await
+			.map(|(send, _)| send)
 	}
 
 	/// Open a bidirectional stream scheduled by `options`, once the peer's stream credit
@@ -587,7 +589,11 @@ impl Connection {
 	}
 
 	/// [`Self::open_uni`], as a poll.
-	pub(crate) fn poll_open_uni(&mut self, cx: &Context<'_>, options: send::Options<'_>) -> Poll<Result<send::Stream, Error>> {
+	pub(crate) fn poll_open_uni(
+		&mut self,
+		cx: &Context<'_>,
+		options: send::Options<'_>,
+	) -> Poll<Result<send::Stream, Error>> {
 		open(&self.shared, Dir::Uni, options, self.park.hold(cx)).map_ok(|(send, _)| send)
 	}
 
@@ -597,7 +603,8 @@ impl Connection {
 		cx: &Context<'_>,
 		options: send::Options<'_>,
 	) -> Poll<Result<(send::Stream, recv::Stream), Error>> {
-		open(&self.shared, Dir::Bi, options, self.park.hold(cx)).map_ok(|(send, recv)| (send, recv.expect("bidirectional")))
+		open(&self.shared, Dir::Bi, options, self.park.hold(cx))
+			.map_ok(|(send, recv)| (send, recv.expect("bidirectional")))
 	}
 
 	/// [`Self::read_datagram`], as a poll.

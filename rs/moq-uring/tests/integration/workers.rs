@@ -151,11 +151,7 @@ fn a_steered_group_serves_a_shared_port() {
 					.udp(UdpSocket::bind("127.0.0.1:0").expect("bind"), udp::Config::default())
 					.expect("client socket");
 				let conn = quic::client::connect(socket, &dial).await.expect("connect");
-				assert_eq!(
-					conn.protocol(),
-					Some(ALPN),
-					"negotiated ALPN"
-				);
+				assert_eq!(conn.protocol(), Some(ALPN), "negotiated ALPN");
 				// The client's handshake completes a flight before the
 				// server's, so closing here could discard the client's Finished
 				// (still behind the pacer, say) and the server would never

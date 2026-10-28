@@ -136,17 +136,11 @@ fn leases_spend_the_connection_window() {
 		.block_on(async move {
 			let dialed = client.connect(&dial).await.expect("dial");
 			let accepted = server.accept().await.expect("accept");
-			let send = dialed.open_uni(Default::default())
-				.await
-				.expect("open_uni");
+			let send = dialed.open_uni(Default::default()).await.expect("open_uni");
 			write(&handle, send, WINDOW + 500);
-			let mut recv = within(
-				&handle,
-				"the stream",
-				accepted.accept_uni(),
-			)
-			.await
-			.expect("accept_uni");
+			let mut recv = within(&handle, "the stream", accepted.accept_uni())
+				.await
+				.expect("accept_uni");
 
 			// A lease returns nothing, so the peer stops at the window.
 			assert_eq!(leased(&handle, &mut recv, WINDOW).await, (WINDOW, false));
@@ -178,9 +172,7 @@ fn stuck_window_evicts_the_lower_priority() {
 			let dialed = client.connect(&dial).await.expect("dial");
 			let accepted = server.accept().await.expect("accept");
 			for _ in 0..2 {
-				let send = dialed.open_uni(Default::default())
-					.await
-					.expect("open_uni");
+				let send = dialed.open_uni(Default::default()).await.expect("open_uni");
 				write(&handle, send, WINDOW);
 			}
 			let mut streams = Vec::new();
@@ -216,7 +208,10 @@ fn stuck_window_evicts_the_lower_priority() {
 				}),
 			)
 			.await;
-			assert!(matches!(low_done, Some(Err(quic::recv::Error::Evicted))), "{low_done:?}");
+			assert!(
+				matches!(low_done, Some(Err(quic::recv::Error::Evicted))),
+				"{low_done:?}"
+			);
 			assert_eq!(high_done.expect("polled").expect("lease"), WINDOW);
 		})
 		.expect("worker");
@@ -259,9 +254,7 @@ fn chunked_writes_stop_at_the_window() {
 			let dialed = client.connect(&dial).await.expect("dial");
 			let accepted = server.accept().await.expect("accept");
 
-			let mut send = dialed.open_uni(Default::default())
-				.await
-				.expect("open_uni");
+			let mut send = dialed.open_uni(Default::default()).await.expect("open_uni");
 
 			// The bytes past the window stay in the caller's buffer, untaken,
 			// and moq-quic keeps the ones it took by reference, not as a copy.
@@ -278,33 +271,21 @@ fn chunked_writes_stop_at_the_window() {
 				let _ = send.finish().stopped().await;
 			});
 
-			let mut recv = within(
-				&handle,
-				"the stream",
-				accepted.accept_uni(),
-			)
-			.await
-			.expect("accept_uni");
+			let mut recv = within(&handle, "the stream", accepted.accept_uni())
+				.await
+				.expect("accept_uni");
 
 			// Straight out of moq-quic, capped at `max`.
-			let first = within(
-				&handle,
-				"stream data",
-				recv.read_chunk(1000),
-			)
-			.await
-			.expect("read")
-			.expect("not finished");
+			let first = within(&handle, "stream data", recv.read_chunk(1000))
+				.await
+				.expect("read")
+				.expect("not finished");
 			assert!(!first.is_empty() && first.len() <= 1000);
 
 			let mut received = first.to_vec();
-			while let Some(chunk) = within(
-				&handle,
-				"stream data",
-				recv.read_chunk(usize::MAX),
-			)
-			.await
-			.expect("read")
+			while let Some(chunk) = within(&handle, "stream data", recv.read_chunk(usize::MAX))
+				.await
+				.expect("read")
 			{
 				received.extend_from_slice(&chunk);
 			}
@@ -332,26 +313,16 @@ fn tiny_frames_do_not_pin_receive_buffers() {
 			dialed
 				.send_datagram(Bytes::from_static(b"x"), Default::default())
 				.expect("send_datagram");
-			let datagram = within(
-				&handle,
-				"the datagram",
-				accepted.read_datagram(),
-			)
-			.await
-			.expect("recv_datagram");
+			let datagram = within(&handle, "the datagram", accepted.read_datagram())
+				.await
+				.expect("recv_datagram");
 			assert!(owns_exactly(datagram));
 
-			let send = dialed.open_uni(Default::default())
-				.await
-				.expect("open_uni");
+			let send = dialed.open_uni(Default::default()).await.expect("open_uni");
 			write(&handle, send, 1);
-			let mut recv = within(
-				&handle,
-				"the stream",
-				accepted.accept_uni(),
-			)
-			.await
-			.expect("accept_uni");
+			let mut recv = within(&handle, "the stream", accepted.accept_uni())
+				.await
+				.expect("accept_uni");
 			let taken = within(
 				&handle,
 				"stream data",
@@ -389,13 +360,21 @@ fn a_held_lease_does_not_stall_the_connection() {
 			let dialed = client.connect(&dial).await.expect("dial");
 			let accepted = server.accept().await.expect("accept");
 
-			write(&handle, dialed.open_uni(Default::default()).await.expect("open_uni"), 100);
+			write(
+				&handle,
+				dialed.open_uni(Default::default()).await.expect("open_uni"),
+				100,
+			);
 			let mut held = within(&handle, "the first stream", accepted.accept_uni())
 				.await
 				.expect("accept_uni");
 			let lease = within(&handle, "stream data", held.lease(100)).await.expect("lease");
 
-			write(&handle, dialed.open_uni(Default::default()).await.expect("open_uni"), WINDOW / 2);
+			write(
+				&handle,
+				dialed.open_uni(Default::default()).await.expect("open_uni"),
+				WINDOW / 2,
+			);
 			let mut other = within(&handle, "the second stream", accepted.accept_uni())
 				.await
 				.expect("accept_uni");

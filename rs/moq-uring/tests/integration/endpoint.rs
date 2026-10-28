@@ -80,11 +80,7 @@ fn dial_and_accept_share_one_socket() {
 			let a_in = a.accept().await.expect("a accepts b");
 
 			for conn in [&a_to_b, &b_in, &b_to_a, &a_in] {
-				assert_eq!(
-					conn.protocol(),
-					Some(ALPN),
-					"negotiated ALPN"
-				);
+				assert_eq!(conn.protocol(), Some(ALPN), "negotiated ALPN");
 			}
 			for (conn, peer) in [(&a_to_b, b_addr), (&b_in, a_addr), (&b_to_a, a_addr), (&a_in, b_addr)] {
 				assert_eq!(conn.remote_addr(), peer, "peer address");
@@ -138,13 +134,9 @@ fn dropped_raw_session_closes(explicit: bool) {
 			std::future::poll_fn(|cx| send.poll_write(cx, b"alive"))
 				.await
 				.expect("write");
-			let mut recv = peer.accept_uni()
-				.await
-				.expect("accept stream");
+			let mut recv = peer.accept_uni().await.expect("accept stream");
 			let mut payload = [0; 5];
-			let read = recv.read(&mut &mut payload[..])
-				.await
-				.expect("read");
+			let read = recv.read(&mut &mut payload[..]).await.expect("read");
 			assert_eq!(read, Some(5));
 			assert_eq!(&payload, b"alive");
 			let code = if explicit {
@@ -393,29 +385,17 @@ fn a_peer_stop_reaches_the_accepted_stream() {
 
 			// Held, not dropped: dropping the send half would reset it, and
 			// the peer would then see a reset rather than the stop.
-			let (mut send, recv) = dialed.open_bi(Default::default())
-				.await
-				.expect("open_bi");
+			let (mut send, recv) = dialed.open_bi(Default::default()).await.expect("open_bi");
 			// One byte makes the stream readable before the stop arrives. Nothing
 			// is awaited between them, so both frames leave in the same flush.
 			send.write_all(&b"x"[..]).await.expect("write");
 			recv.stop(CLOSE_CODE.into());
 
-			let (send, _recv) = within(
-				&handle,
-				"the stopped stream to arrive",
-				accepted.accept_bi(),
-			)
-			.await
-			.expect("accept_bi");
+			let (send, _recv) = within(&handle, "the stopped stream to arrive", accepted.accept_bi())
+				.await
+				.expect("accept_bi");
 
-			match within(
-				&handle,
-				"the stop to be reported",
-				send.stopped(),
-			)
-			.await
-			{
+			match within(&handle, "the stop to be reported", send.stopped()).await {
 				Ok(Some(code)) => assert_eq!(code, CLOSE_CODE.into(), "stop code"),
 				other => panic!("expected the peer's stop, got {other:?}"),
 			}
@@ -623,7 +603,8 @@ fn connections_share_one_tx_buffer_fairly() {
 				.expect("first connection");
 			let first_server = endpoint.accept().await.expect("first accepted connection");
 
-			let mut send = first_server.open_uni(Default::default())
+			let mut send = first_server
+				.open_uni(Default::default())
 				.await
 				.expect("open busy stream");
 			let running = std::rc::Rc::new(std::cell::Cell::new(true));
@@ -659,12 +640,11 @@ fn connections_share_one_tx_buffer_fairly() {
 			let recv_running = running.clone();
 			handle.spawn(async move {
 				let first_client = first_client;
-				let mut recv = first_client.accept_uni()
-					.await
-					.expect("accept busy stream");
+				let mut recv = first_client.accept_uni().await.expect("accept busy stream");
 				let mut chunk = vec![0; 64 * 1024];
 				while recv_running.get() {
-					if recv.read(&mut &mut chunk[..])
+					if recv
+						.read(&mut &mut chunk[..])
 						.await
 						.expect("read busy stream")
 						.is_none()
