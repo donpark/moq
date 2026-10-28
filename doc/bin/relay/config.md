@@ -338,7 +338,9 @@ duration = "30s"                     # Cap how long a non-latest group is kept, 
 `capacity` is a byte target, repaid as active publishers write. `duration`
 (30s by default) bounds memory by age, and sweeps on a timer, so a publisher
 that stalls but stays connected still has its idle groups reclaimed. The latest
-group of every track is always kept, even past `capacity`.
+group of every track, and any group still being read, is kept past `capacity` but
+sheds its oldest frames; a reader that still needs one refetches it from
+upstream.
 
 ## \[stats]
 

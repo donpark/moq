@@ -42,11 +42,14 @@ continues after them.
 Upgrading from an older release: see moq-flate's
 [MIGRATE.md](https://github.com/moq-dev/moq/blob/main/rs/moq-flate/MIGRATE.md).
 
-A stream rides one group, so the whole log shares moq-net's group budget:
-32 MiB of payload and 8192 payloads. An `append` that might not fit returns
-`moq_net::Error::GroupTooLarge` before it is encoded and leaves the log intact,
-compressed or not. Once the budget is spent every `append` is refused; start a
-new track to keep going. Any other failed append aborts the track, so readers
+A stream rides one group, which grows for the track's life: under cache
+pressure its oldest payloads are shed, and a late reader refills them from
+upstream or fails with `Evicted`. A payload over 32 MiB returns
+`moq_net::Error::FrameTooLarge` and leaves the log intact. A compressed stream
+instead shares one 32 MiB budget, since every reader's decoder holds the whole
+log: an `append` that might not fit returns `moq_net::Error::GroupTooLarge`
+before it is encoded, and once it is spent every `append` is refused; start a new
+track to keep going. Any other failed append aborts the track, so readers
 see the error rather than a log that looks complete.
 
 The group-scoped codec underneath is exported as `Encoder`/`Decoder`, which
