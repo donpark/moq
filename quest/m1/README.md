@@ -123,7 +123,6 @@ surface and zero-copy texture import, land before the cut.
 - [Lite-05/06 timestamps pass through](/quest/m1/lite-timestamps-through.md) - a timed track received over lite-05/06 stays timed and is forwarded with its timestamps over every version
 - [Exact timestamps in every binding](/quest/m1/binding-timestamps.md) - bindings carry `{value, scale}` timestamps instead of lossy microseconds
 - [Announcement takeover](/quest/m1/announce-takeover.md) - a new independent route explicitly continues instances served through its predecessor, with shared Rust/JS semantics and lite-07 wire
-- [The transport may start a group mid-way](/quest/m1/transport-frame-offsets.md) - a hop may request and deliver a group from any frame it needs, while applications still ask for whole groups
 - [Subscribe ranges](/quest/m1/subscribe-ranges/README.md) - a lite-07 SUBSCRIBE asks for past and live ranges with absolute or relative ends, in either order, and replaces FETCH; merged ranges never starve a subscriber; relays fill misses by range, including over moq-transport
 - [Drop set](/quest/m1/drop-set.md) - each cursor judges missing groups against its own budget, so a narrow reader drops promptly and a widening re-offers groups already reported dropped on lite-07
 - [Broadcast archives](/quest/m1/archive/README.md) - ANNOUNCE, TRACKS, and a SUBSCRIBE per track record every track under a prefix to any object_store, a host serves a stored broadcast back, and the catalog drops its archive pointer for an opt-in `hls` field
@@ -153,7 +152,6 @@ surface and zero-copy texture import, land before the cut.
 - [WebGPU on Safari](/quest/m1/webgpu-safari.md) - the WebGPU renderer is verified on Safari 26 for macOS and iOS
 - [CI housekeeping](/quest/m1/ci-housekeeping.md) - remove the actionlint queue ignore once a release after 1.7.12 reaches the dev shell
 - [Main is no slower than release](/quest/m1/release-perf/README.md) - every benchmark where main is slower than release is fixed or accepted with a reason, checked by a final paired run before the cut
-- [Generated JS API reference](/quest/m1/js-api-reference.md) - the doc site renders an API reference for every `@moq/*` package from API Extractor's doc model
 - [Interop coverage](/quest/m1/interop-coverage/README.md) - the riskiest moq-transport features moq-net exposes get cross-implementation tests over drafts 18 and 22
 - [Calibrate the paired nightly benchmarks](/quest/m1/bench-ci.md) - A/A and deliberately slowed Nightly runs set the paired comparison's threshold, so its regression alerts can be trusted
 - [HLS opt-in for gateways](/quest/m1/hls-opt-in-gateways.md) - SRT, RTMP, WebRTC ingest and the bindings can publish HLS records
@@ -168,6 +166,7 @@ surface and zero-copy texture import, land before the cut.
 - [fMP4 boundary sync](/quest/m1/fmp4-boundary-sync.md) - a declared fMP4 boundary opens a passthrough group only on a sync sample
 - [Segment cuts hold bounded state](/quest/m1/segmenter-cuts.md) - the HLS segmenter keeps one pending cut, so `styp` input without sync samples cannot grow it
 - [Next Object on a cold Rust copy](/quest/m1/next-object-cold-copy.md) - a join after an upstream group report starts at the first frame received, never skipping
+- [Container consumers buffer by backpressure](/quest/m1/container-backpressure.md) - Rust and JS container consumers decode ahead only a byte budget, so a hostile publisher cannot grow them
 - [One moq-ffi build definition](/quest/m1/ffi-build-flags.md) - every binding takes moq-ffi's default features from one place
 - [A reported drop means the same everywhere](/quest/m1/resume-drop-final.md) - Rust and JS agree whether a group reported dropped can still be served
 - [moq-clock moves into kio::clock](/quest/m1/kio-clock.md) - moq-clock and its test macro become `kio::clock` and `#[kio::test]` before the cut publishes them
