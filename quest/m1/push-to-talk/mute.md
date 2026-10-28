@@ -5,7 +5,8 @@
 `<moq-publish muted>` and `<moq-publish invisible>` stop sending audio or
 video without closing the microphone or camera. Unmuting pays no
 getUserMedia, no new AudioContext and no worklet load, and unhiding pays no
-camera reopen. Removing `source` still releases both devices.
+camera reopen. Removing `source`, or removing the element from the
+document, still releases both devices.
 
 ## Plan
 
@@ -21,8 +22,10 @@ capture running.
 Decided 2026-10-28 (maintainer):
 
 - **`muted` keeps the mic open.** It disables only the audio encoder; the
-  source and Capture follow `source` alone. No new attribute: a second mute
-  flag would be the same control twice.
+  source and Capture follow the element's lifecycle gate (`#enabled`, cleared
+  by `disconnectedCallback`, `element.ts:356-359`) and `source`, independent
+  of `muted` and `invisible`. No new attribute: a second mute flag would be
+  the same control twice.
 - **`invisible` does the same for video.** It disables only the video
   encoder and leaves the camera open. One rule for both, and removing
   `source` is how a page releases the devices. Rejected: keeping `invisible`
@@ -37,7 +40,8 @@ video capture") and the element's doc comments.
 
 Tests: muting keeps the microphone track live and unmuting encodes without a
 new getUserMedia. Hiding keeps the camera track live. Removing `source`
-stops both tracks.
+stops both tracks, and so does detaching the element; reattaching it
+reopens them.
 
 Public API: behavior change to `muted` and `invisible` (capture stays open).
 Wire: none.
