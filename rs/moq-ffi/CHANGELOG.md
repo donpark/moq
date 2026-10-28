@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.19](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.18...moq-ffi-v0.4.19) - 2026-10-28
+
+### Added
+
+- *(ffi)* add an async MoqSession.drain()
+
+### Other
+
+- share default FFI artifacts across Go, Kotlin and Swift ([#5549](https://github.com/moq-dev/moq/pull/5549))
+- Merge pull request #6642 from moq-dev/fix/release-ffi-drain
+- *(ffi)* say IETF sessions close without draining on release
+
 ## [0.4.18](https://github.com/moq-dev/moq/compare/moq-ffi-v0.4.17...moq-ffi-v0.4.18) - 2026-10-22
 
 ### Fixed
