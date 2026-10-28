@@ -151,6 +151,8 @@ fn announce_info(announced: u32) -> moq_announce_event {
 		captures_len: 0,
 		has_captures: false,
 		kind: moq_announce_kind::MOQ_ANNOUNCE_KIND_START,
+		predecessor: std::ptr::null(),
+		predecessor_len: 0,
 	};
 	assert_eq!(unsafe { moq_origin_announced_info(announced, &mut info) }, 0);
 	info

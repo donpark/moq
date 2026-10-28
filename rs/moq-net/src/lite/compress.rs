@@ -115,6 +115,24 @@ impl AnnounceDecoder {
 		Ok((suffix, hops))
 	}
 
+	/// An ANNOUNCE_TAKEOVER: resolve it like a start against the live `predecessor`,
+	/// returning the predecessor's suffix too. One at the predecessor's own suffix
+	/// retires the predecessor, since a suffix holds one advertisement.
+	pub fn takeover(&mut self, predecessor: u64, suffix: PathRef, hops: HopsRef) -> Result<(Path, Path, Hops), Error> {
+		let previous = self
+			.live
+			.entries
+			.get(&predecessor)
+			.ok_or(Error::ProtocolViolation)?
+			.suffix
+			.clone();
+		let (suffix, hops) = self.start(suffix, hops)?;
+		if suffix == previous {
+			self.live.entries.remove(&predecessor);
+		}
+		Ok((previous, suffix, hops))
+	}
+
 	/// An ANNOUNCE_UPDATE: resolve its chain before replacing the old one, which it
 	/// may itself be based on.
 	pub fn update(&mut self, id: u64, hops: HopsRef) -> Result<(Path, Hops), Error> {
@@ -269,6 +287,22 @@ impl AnnounceEncoder {
 		self.tails.insert(reversed(&hops), id);
 		self.live.entries.insert(id, Entry { suffix, hops });
 		(Some(id), path, chain)
+	}
+
+	/// An ANNOUNCE_TAKEOVER of the live `predecessor`: like [`Self::start`], retiring
+	/// the predecessor when it holds the same suffix.
+	pub fn takeover(&mut self, predecessor: u64, suffix: Path, hops: Hops) -> (u64, PathRef, HopsRef) {
+		let replaces = self
+			.live
+			.entries
+			.get(&predecessor)
+			.is_some_and(|entry| entry.suffix == suffix);
+		let (id, path, chain) = self.start(suffix, hops);
+		let id = id.expect("a takeover is only sent on a version with announce ids");
+		if replaces {
+			self.end(predecessor);
+		}
+		(id, path, chain)
 	}
 
 	/// An ANNOUNCE_UPDATE for a live `id`: its wire hop chain.

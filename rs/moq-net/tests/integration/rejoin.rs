@@ -691,7 +691,14 @@ async fn quiet_catalog_survives_cache_expiry(version: Version, takeover: bool) {
 			let replacement = upstream(1).await;
 			let event = follow.next().await;
 			assert!(
-				matches!(event, Some(announce::Event::Update(_) | announce::Event::Restart(_))),
+				matches!(
+					event,
+					Some(
+						announce::Event::Update(_)
+							| announce::Event::Restart(_)
+							| announce::Event::Takeover { announce: _, .. }
+					)
+				),
 				"{version}: {event:?}"
 			);
 			upstream_session = replacement;

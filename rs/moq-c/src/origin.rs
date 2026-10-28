@@ -76,6 +76,7 @@ struct AnnouncedRecord {
 	captures: Option<Vec<String>>,
 	capture_views: Vec<moq_string>,
 	kind: moq_announce_kind,
+	predecessor: String,
 }
 
 // The raw pointers only borrow immutable String allocations owned by this record.
@@ -85,11 +86,16 @@ unsafe impl Send for AnnouncedRecord {}
 impl AnnouncedRecord {
 	fn new(event: moq_net::announce::Event) -> Self {
 		use moq_net::announce::Event;
-		let (update, kind) = match event {
-			Event::Start(update) => (update, moq_announce_kind::MOQ_ANNOUNCE_KIND_START),
-			Event::Update(update) => (update, moq_announce_kind::MOQ_ANNOUNCE_KIND_UPDATE),
-			Event::End(update) => (update, moq_announce_kind::MOQ_ANNOUNCE_KIND_END),
-			Event::Restart(update) => (update, moq_announce_kind::MOQ_ANNOUNCE_KIND_RESTART),
+		let (update, kind, predecessor) = match event {
+			Event::Start(update) => (update, moq_announce_kind::MOQ_ANNOUNCE_KIND_START, String::new()),
+			Event::Update(update) => (update, moq_announce_kind::MOQ_ANNOUNCE_KIND_UPDATE, String::new()),
+			Event::End(update) => (update, moq_announce_kind::MOQ_ANNOUNCE_KIND_END, String::new()),
+			Event::Restart(update) => (update, moq_announce_kind::MOQ_ANNOUNCE_KIND_RESTART, String::new()),
+			Event::Takeover { announce, predecessor } => (
+				announce,
+				moq_announce_kind::MOQ_ANNOUNCE_KIND_TAKEOVER,
+				predecessor.to_string(),
+			),
 		};
 		let captures = update.captures.map(|captures| {
 			captures
@@ -112,6 +118,7 @@ impl AnnouncedRecord {
 			captures,
 			capture_views,
 			kind,
+			predecessor,
 		}
 	}
 }
@@ -192,6 +199,8 @@ impl Origin {
 			captures_len: announced.capture_views.len(),
 			has_captures: announced.captures.is_some(),
 			kind: announced.kind,
+			predecessor: announced.predecessor.as_ptr().cast::<c_char>(),
+			predecessor_len: announced.predecessor.len(),
 		};
 		Ok(())
 	}

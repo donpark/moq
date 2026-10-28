@@ -11,8 +11,9 @@ use crate::{Epoch, Error, Path, broadcast};
 /// and a request resolves through the most specific one, so only that route's events come
 /// through. Another route taking over is a [`Restart`](AnnounceEvent::Restart), unless both
 /// carry the same epoch: those serve the same bytes, so it is an
-/// [`Update`](AnnounceEvent::Update). Routes beneath the path serve other broadcasts and are
-/// ignored.
+/// [`Update`](AnnounceEvent::Update). One announced as a
+/// [`Takeover`](AnnounceEvent::Takeover) of the serving route continues it, and comes through
+/// as one. Routes beneath the path serve other broadcasts and are ignored.
 pub struct Follow {
 	announced: AnnounceConsumer,
 	path: Path,
@@ -135,6 +136,7 @@ impl Follow {
 		let (AnnounceEvent::Start(announce)
 		| AnnounceEvent::Update(announce)
 		| AnnounceEvent::Restart(announce)
+		| AnnounceEvent::Takeover { announce, .. }
 		| AnnounceEvent::End(announce)) = &event;
 		if !self.path.has_prefix(&announce.prefix) {
 			return None;
@@ -149,11 +151,12 @@ impl Follow {
 			.iter()
 			.position(|standing| standing.announce.prefix == prefix)
 			.map(|index| self.covering.swap_remove(index).since);
-		let (announce, since, restart) = match event {
-			AnnounceEvent::End(_) => (None, None, false),
-			AnnounceEvent::Start(announce) => (Some(announce), None, false),
-			AnnounceEvent::Update(announce) => (Some(announce), standing, false),
-			AnnounceEvent::Restart(announce) => (Some(announce), standing, true),
+		let (announce, since, restart, predecessor) = match event {
+			AnnounceEvent::End(_) => (None, None, false, None),
+			AnnounceEvent::Start(announce) => (Some(announce), None, false, None),
+			AnnounceEvent::Update(announce) => (Some(announce), standing, false, None),
+			AnnounceEvent::Restart(announce) => (Some(announce), standing, true, None),
+			AnnounceEvent::Takeover { announce, predecessor } => (Some(announce), None, true, Some(predecessor)),
 		};
 		if let Some(announce) = announce {
 			self.covering.push(Standing {
@@ -175,6 +178,15 @@ impl Follow {
 				if before.prefix == prefix && before.prefix != after.prefix && since > self.dry.max(seen) =>
 			{
 				Some(AnnounceEvent::End(before))
+			}
+			// The serving route continues as this one.
+			(Some((before, _)), Some((after, _)))
+				if after.prefix == prefix && predecessor.as_ref() == Some(&before.prefix) =>
+			{
+				Some(AnnounceEvent::Takeover {
+					announce: after,
+					predecessor: before.prefix,
+				})
 			}
 			(Some((before, _)), Some((after, _))) if before.prefix != after.prefix => {
 				let same = before.route.epoch.is_some() && before.route.epoch == after.route.epoch;
@@ -285,8 +297,9 @@ impl AnnouncedBroadcast {
 				self.unseen = false;
 				self.last = None;
 			}
-			// The same instance over another route, which its subscriptions ride out.
-			AnnounceEvent::Update(_) => return false,
+			// The same instance over another route, which its subscriptions ride out, or one
+			// continuing what was handed out.
+			AnnounceEvent::Update(_) | AnnounceEvent::Takeover { .. } => return false,
 		}
 		true
 	}
@@ -313,6 +326,7 @@ mod tests {
 			AnnounceEvent::Start(announce) => ("start", announce.prefix.to_string()),
 			AnnounceEvent::Update(announce) => ("update", announce.prefix.to_string()),
 			AnnounceEvent::Restart(announce) => ("restart", announce.prefix.to_string()),
+			AnnounceEvent::Takeover { announce, .. } => ("takeover", announce.prefix.to_string()),
 			AnnounceEvent::End(announce) => ("end", announce.prefix.to_string()),
 		}
 	}
@@ -335,7 +349,7 @@ mod tests {
 		let epoch = Epoch::mint();
 
 		// A prefix above the path covers it.
-		let pool = origin.requests_route("pool", route(&epoch)).unwrap();
+		let pool = origin.requests_route("pool", route(&epoch), None).unwrap();
 		assert_eq!(followed(&mut follow).await, ("start", "pool".into()));
 
 		// A route beneath the path serves another broadcast.
@@ -370,7 +384,7 @@ mod tests {
 	#[moq_clock::test]
 	async fn follow_starts_on_the_serving_route_when_joining_late() {
 		let origin = Hop::new(1).unwrap().produce();
-		let _pool = origin.requests_route("pool", Route::default()).unwrap();
+		let _pool = origin.requests_route("pool", Route::default(), None).unwrap();
 		let _exact = origin.publish("pool/job", Route::default()).unwrap();
 
 		let mut follow = origin.consume().follow("pool/job").unwrap();
@@ -391,7 +405,7 @@ mod tests {
 		// Both land before the follower reads again, and the cursor delivers the prefix's start
 		// ahead of the path's end, but the path went unserved in between.
 		drop(exact);
-		let _pool = origin.requests_route("pool", route(&epoch)).unwrap();
+		let _pool = origin.requests_route("pool", route(&epoch), None).unwrap();
 		assert_eq!(followed(&mut follow).await, ("end", "pool/job".into()));
 		assert_eq!(followed(&mut follow).await, ("start", "pool".into()));
 
@@ -412,7 +426,7 @@ mod tests {
 		assert_eq!(followed(&mut follow).await, ("start", "pool/job".into()));
 
 		let epoch = Epoch::mint();
-		let _pool = origin.requests_route("pool", route(&epoch)).unwrap();
+		let _pool = origin.requests_route("pool", route(&epoch), None).unwrap();
 		exact.announce(route(&epoch)).unwrap();
 		assert_eq!(followed(&mut follow).await, ("restart", "pool/job".into()));
 
@@ -426,7 +440,7 @@ mod tests {
 		let origin = Hop::new(1).unwrap().produce();
 		let mut follow = origin.consume().follow("pool/job").unwrap();
 
-		let _pool = origin.requests_route("pool", Route::default()).unwrap();
+		let _pool = origin.requests_route("pool", Route::default(), None).unwrap();
 		assert_eq!(followed(&mut follow).await, ("start", "pool".into()));
 
 		let _exact = origin.publish("pool/job", Route::default()).unwrap();
@@ -442,7 +456,7 @@ mod tests {
 		let _chat = origin
 			.scope("", &chat)
 			.unwrap()
-			.requests_route("room/alice", Route::default())
+			.requests_route("room/alice", Route::default(), None)
 			.unwrap();
 		let mut follow = origin.consume().follow("room/alice").unwrap();
 
@@ -560,7 +574,7 @@ mod tests {
 		let exact = origin.publish("live", route(&epoch)).unwrap();
 		let first = available(&mut announced).await;
 
-		let dynamic = origin.requests_route("", route(&epoch)).unwrap();
+		let dynamic = origin.requests_route("", route(&epoch), None).unwrap();
 		exact.unannounce();
 		let served = broadcast::Info::new().produce();
 		let (again, ()) = futures::join!(available(&mut announced), async {

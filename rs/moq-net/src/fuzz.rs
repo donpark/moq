@@ -376,7 +376,7 @@ pub fn requests_route(
 	prefix: impl Into<crate::Path>,
 	route: crate::origin::Route,
 ) -> Result<crate::origin::Requests, crate::Error> {
-	origin.requests_route(prefix, route)
+	origin.requests_route(prefix, route, None)
 }
 
 /// Replace a peer claim's route in place, as a session does on a route update.

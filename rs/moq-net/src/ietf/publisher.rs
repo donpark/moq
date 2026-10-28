@@ -4182,7 +4182,8 @@ impl Publisher {
 			match event {
 				crate::announce::Event::Start(update)
 				| crate::announce::Event::Update(update)
-				| crate::announce::Event::Restart(update) => {
+				| crate::announce::Event::Restart(update)
+				| crate::announce::Event::Takeover { announce: update, .. } => {
 					initial.insert(update.prefix.clone(), update);
 				}
 				crate::announce::Event::End(update) => {
@@ -4292,6 +4293,11 @@ impl Publisher {
 								(update, true, false)
 							}
 							crate::announce::Event::Restart(update) => (update, true, true),
+							// moq-transport has no takeover: another instance, in place or not.
+							crate::announce::Event::Takeover { announce, predecessor } => {
+								let restart = predecessor == announce.prefix;
+								(announce, true, restart)
+							}
 							crate::announce::Event::End(update) => (update, false, false),
 						})));
 					}
@@ -8843,7 +8849,7 @@ mod serve_tests {
 			let mut h = serve(version);
 			let claim = h
 				._origin
-				.requests_route("live", crate::origin::Route::default())
+				.requests_route("live", crate::origin::Route::default(), None)
 				.unwrap();
 			let auth = crate::auth::Link::new(false);
 			auth.handle().authorize(&nothing());
@@ -8866,7 +8872,7 @@ mod serve_tests {
 			let mut h = serve(version);
 			let claim = h
 				._origin
-				.requests_route("live", crate::origin::Route::default())
+				.requests_route("live", crate::origin::Route::default(), None)
 				.unwrap();
 			let auth = crate::auth::Link::new(false);
 			h.publisher = h.publisher.clone().with_auth(auth.clone());
@@ -9185,7 +9191,10 @@ mod serve_tests {
 		let version = Version::Draft22;
 		for path in [".", "./child", ".session", ".session/extension"] {
 			let h = serve(version);
-			let claim = h._origin.requests_route("", crate::origin::Route::default()).unwrap();
+			let claim = h
+				._origin
+				.requests_route("", crate::origin::Route::default(), None)
+				.unwrap();
 			settle().await;
 			let stream = Stream::open(&mut crate::driver::Transport::new(h.session.clone()), version)
 				.await
@@ -12060,7 +12069,11 @@ mod serve_tests {
 		let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
 		let (claim, published) = match parked {
 			Parked::Resolving => (
-				Some(origin.requests_route("room", crate::origin::Route::default()).unwrap()),
+				Some(
+					origin
+						.requests_route("room", crate::origin::Route::default(), None)
+						.unwrap(),
+				),
 				None,
 			),
 			Parked::Acking | Parked::Ending => {
@@ -12240,7 +12253,9 @@ mod serve_tests {
 		let mut idle = None;
 		match setup {
 			Setup::Resolving => {
-				let route = origin.requests_route("room", crate::origin::Route::default()).unwrap();
+				let route = origin
+					.requests_route("room", crate::origin::Route::default(), None)
+					.unwrap();
 				let request = {
 					let requested = std::pin::pin!(route.requested_broadcast());
 					match futures::future::select(requested, serving.as_mut()).await {

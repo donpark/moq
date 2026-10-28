@@ -263,6 +263,30 @@ impl Subscriber {
 					&mut run.announced,
 				)?;
 			}
+			lite::AnnounceBroadcast::Takeover {
+				predecessor,
+				suffix,
+				epoch,
+				hops,
+				cost,
+			} => {
+				// Resolved like a start against the live predecessor, which it retires when
+				// it takes the predecessor's own suffix. An unknown or retired predecessor is
+				// a protocol violation.
+				let (previous, suffix, hops) = run.decoder.takeover(predecessor, suffix, hops)?;
+				let previous = prefix.join(&previous)?;
+				let path = prefix.join(&suffix)?;
+				self.takeover_announce(
+					previous,
+					path,
+					epoch,
+					hops,
+					cost,
+					run.link_cost,
+					run.responder_origin,
+					&mut run.announced,
+				)?;
+			}
 			lite::AnnounceBroadcast::Skipped | lite::AnnounceBroadcast::Synced => {}
 		}
 		Ok(())
@@ -315,7 +339,56 @@ impl Subscriber {
 		// outside our scope, so don't serve it. Reflections are already
 		// filtered above.
 		let route = self.announced_route(&path, hops, cost, link_cost, responder_origin, announced);
-		Ok(announced.offer(self, path, route))
+		Ok(announced.offer(self, path, route, None))
+	}
+
+	/// Handle an ANNOUNCE_TAKEOVER: a new advertisement at `path` continuing what the peer's
+	/// live advertisement at `previous`, at or above it, served beneath it.
+	///
+	/// At `previous` itself it replaces that advertisement like a restart; elsewhere it
+	/// starts one, and the predecessor stays. Either way the new route enters the origin
+	/// before anything leaves, taking over from the route the predecessor attached, if it
+	/// did, so what resolved through that one beneath `path` carries on.
+	#[expect(
+		clippy::too_many_arguments,
+		reason = "private plumbing; a single-use argument struct would only rename the parameters"
+	)]
+	fn takeover_announce(
+		&mut self,
+		previous: Path,
+		path: Path,
+		epoch: Option<crate::Epoch>,
+		hops: crate::Hops,
+		// See `start_announce`.
+		cost: crate::origin::Cost,
+		link_cost: u64,
+		responder_origin: Option<crate::Hop>,
+		announced: &mut Announced,
+	) -> Result<bool, Error> {
+		// The continued route lies beneath its predecessor.
+		if !path.has_prefix(&previous) {
+			return Err(Error::ProtocolViolation);
+		}
+		if path == previous {
+			announced.restart(&path, epoch);
+		} else {
+			// Like a start: one current advertisement per prefix.
+			if announced.contains(&path) {
+				return Err(Error::ProtocolViolation);
+			}
+			announced.reserve(path.clone(), epoch)?;
+		}
+
+		let Some(hops) = self.chain(&path, hops, responder_origin) else {
+			if path == previous {
+				announced.declined(path);
+			}
+			return Ok(false);
+		};
+
+		tracing::debug!(route = %self.log_path(&path), predecessor = %self.log_path(&previous), "takeover");
+		let route = self.announced_route(&path, hops, cost, link_cost, responder_origin, announced);
+		Ok(announced.offer(self, path, route, Some(&previous)))
 	}
 
 	/// The route to announce for a prefix this peer advertised, charging our
@@ -401,7 +474,7 @@ impl Subscriber {
 			return Ok(true);
 		}
 
-		Ok(announced.offer(self, path, metadata))
+		Ok(announced.offer(self, path, metadata, None))
 	}
 
 	/// Handle an ANNOUNCE_RESTART: another publisher instance replaces a live
@@ -432,7 +505,7 @@ impl Subscriber {
 		tracing::debug!(route = %self.log_path(&path), hops = hops.len(), "restart");
 		let route = self.announced_route(&path, hops, cost, link_cost, responder_origin, announced);
 		// Held to the limit like a start: a restart outside it is withheld, dropping the old instance.
-		Ok(announced.offer(self, path, route))
+		Ok(announced.offer(self, path, route, None))
 	}
 
 	/// The full chain of a new or replacing advertisement, or `None` when it is
@@ -6408,8 +6481,15 @@ impl Announced {
 
 	/// Put the peer's route into the origin, so paths under it resolve through this
 	/// session on demand, or hold it back when the session's limit does not cover it.
-	/// Returns whether it attached.
-	fn offer(&mut self, subscriber: &Subscriber, path: Path, route: crate::origin::Route) -> bool {
+	/// The route takes over from the one attached at `predecessor`, if any. Returns
+	/// whether it attached.
+	fn offer(
+		&mut self,
+		subscriber: &Subscriber,
+		path: Path,
+		route: crate::origin::Route,
+		predecessor: Option<&Path>,
+	) -> bool {
 		if !subscriber
 			.auth
 			.within_limit(crate::auth::Direction::Subscribe, path.as_str())
@@ -6419,7 +6499,11 @@ impl Announced {
 			return false;
 		}
 		// An error means the prefix is outside our origin's scope, so don't serve it.
-		match subscriber.origin.requests_route(&path, route.clone()) {
+		let predecessor = predecessor.and_then(|previous| match self.routes.get(previous)? {
+			Held::Attached(attached) => Some(&attached.dynamic),
+			_ => None,
+		});
+		match subscriber.origin.requests_route(&path, route.clone(), predecessor) {
 			Ok(dynamic) => {
 				self.attach(path, route, dynamic);
 				true
@@ -6562,7 +6646,7 @@ impl Announced {
 					if subscriber.going_away.is_set() {
 						route.cost = crate::origin::Cost::DRAIN;
 					}
-					self.offer(subscriber, path, route);
+					self.offer(subscriber, path, route, None);
 				}
 				_ => unreachable!("only attached and withheld routes change"),
 			}
