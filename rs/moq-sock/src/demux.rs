@@ -8,13 +8,15 @@
 //! io_uring listeners run the same rules.
 
 use std::{
-	collections::{HashMap, VecDeque},
+	collections::{HashMap, HashSet, VecDeque},
 	net::SocketAddr,
 	sync::{
 		Arc, Mutex,
-		atomic::{AtomicU64, AtomicUsize, Ordering},
+		atomic::{AtomicBool, AtomicU64, Ordering},
 	},
 };
+
+use arc_swap::ArcSwap;
 
 /// What a datagram carries, judged by its first byte and, for STUN, its attributes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,10 +146,20 @@ pub struct Flows(Arc<FlowsState>);
 
 #[derive(Debug, Default)]
 struct FlowsState {
-	/// Skips the lock on every datagram while nothing is pinned.
-	pinned: AtomicUsize,
-	/// How many [`Pin`]s hold each address.
+	/// Whether anything is pinned, so an unpinned listener skips the set entirely.
+	any: AtomicBool,
+	/// The pinned addresses, read without a lock on every datagram by every shard
+	/// and replaced whole on the rare pin or release.
+	pinned: ArcSwap<HashSet<SocketAddr>>,
+	/// How many [`Pin`]s hold each address, which only pinning and releasing touch.
 	pins: Mutex<HashMap<SocketAddr, usize>>,
+}
+
+impl FlowsState {
+	fn publish(&self, pins: &HashMap<SocketAddr, usize>) {
+		self.pinned.store(Arc::new(pins.keys().copied().collect()));
+		self.any.store(!pins.is_empty(), Ordering::Release);
+	}
 }
 
 impl Flows {
@@ -168,8 +180,11 @@ impl Flows {
 	pub fn pin(&self, remote: SocketAddr) -> Pin {
 		let remote = canonical(remote);
 		let mut pins = self.0.pins.lock().unwrap();
-		*pins.entry(remote).or_default() += 1;
-		self.0.pinned.store(pins.len(), Ordering::Release);
+		let count = pins.entry(remote).or_default();
+		*count += 1;
+		if *count == 1 {
+			self.0.publish(&pins);
+		}
 		Pin {
 			flows: self.clone(),
 			remote,
@@ -177,10 +192,7 @@ impl Flows {
 	}
 
 	fn is_pinned(&self, remote: SocketAddr) -> bool {
-		if self.0.pinned.load(Ordering::Acquire) == 0 {
-			return false;
-		}
-		self.0.pins.lock().unwrap().contains_key(&canonical(remote))
+		self.0.any.load(Ordering::Acquire) && self.0.pinned.load().contains(&canonical(remote))
 	}
 }
 
@@ -202,9 +214,9 @@ impl Drop for Pin {
 			*count -= 1;
 			if *count == 0 {
 				pins.remove(&self.remote);
+				self.flows.0.publish(&pins);
 			}
 		}
-		self.flows.0.pinned.store(pins.len(), Ordering::Release);
 	}
 }
 
@@ -364,10 +376,7 @@ mod tests {
 		assert_eq!(flows.route(addr(1), &[0x80]), Route::WebRtc);
 		assert_eq!(flows.route(addr(1), &[0x40]), Route::Quic);
 		assert_eq!(flows.route(addr(1), &[0xc0]), Route::Quic);
-		assert_eq!(
-			flows.route(addr(1), &binding(&[])),
-			Route::Discard(Discard::Stun)
-		);
+		assert_eq!(flows.route(addr(1), &binding(&[])), Route::Discard(Discard::Stun));
 		assert_eq!(flows.route(addr(1), &[5]), Route::Discard(Discard::Unknown));
 	}
 
