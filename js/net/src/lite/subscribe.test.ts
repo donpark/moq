@@ -1,11 +1,13 @@
 import { expect, test } from "bun:test";
-import { ProtocolViolation } from "../error.ts";
+import { ProtocolViolation, TimestampMismatch } from "../error.ts";
 import * as Path from "../path.ts";
 import { Reader, Writer } from "../stream.ts";
+import { Timescale, Timestamp } from "../time.ts";
 import {
 	decodeSubscribeResponse,
 	encodeSubscribeResponse,
 	inclusiveGroupEnd,
+	requestedRanges,
 	Subscribe,
 	SubscribeDrop,
 	SubscribeEnd,
@@ -13,6 +15,7 @@ import {
 	type SubscribeResponse,
 	SubscribeStart,
 	SubscribeUpdate,
+	toWireRanges,
 } from "./subscribe.ts";
 import { Version } from "./version.ts";
 
@@ -218,20 +221,33 @@ test("a lite-07 list decodes as the span covering it", async () => {
 		{ start: { relative: 3 }, end: { absolute: 5 } },
 		{ start: { absolute: 7 }, end: { absolute: 9 } },
 	]);
-	// A time anchor is not resolved here, so it serves from the oldest group or through the live edge.
-	expect((await update([1, 3, 40, 3, 90])).ranges).toEqual([{}]);
+	// A time anchor carries ticks of the track's timescale, which only the serving track knows.
+	const timed = await update([1, 3, 40, 3, 90]);
+	expect(timed.ranges).toEqual([{ start: { time: 40 }, end: { time: 90 } }]);
+	expect([timed.startGroup, timed.endGroup]).toEqual([undefined, undefined]);
+	expect(requestedRanges(timed, Timescale.MILLI)).toEqual([
+		{ start: { time: Timestamp.fromMillis(40) }, end: { time: Timestamp.fromMillis(90) } },
+	]);
+	expect(() => requestedRanges(timed, undefined)).toThrow(TimestampMismatch);
 
 	await expect(update([0])).rejects.toThrow(ProtocolViolation);
 	await expect(update([1, 4, 0, 0])).rejects.toThrow(ProtocolViolation);
 	await expect(update([1, 0, 1, 0, 0])).rejects.toThrow(ProtocolViolation);
 });
 
-test("lite-07 carries every range, relative anchors included, and older wires the span alone", async () => {
-	const ranges = [
-		{ start: { absolute: 2 }, end: { absolute: 5 } },
-		{ start: { relative: 1 } },
-		{ end: { relative: 0 } },
-	];
+test("lite-07 carries every range, relative and time anchors included, and older wires the span alone", async () => {
+	const ranges = toWireRanges(
+		[
+			{ start: { absolute: 2 }, end: { absolute: 5 } },
+			{ start: { relative: 1 } },
+			{ end: { relative: 0 } },
+			// In the track's timescale, rounded down.
+			{ start: { time: Timestamp.fromMicros(1_500_900) }, end: { time: Timestamp.fromMillis(3_000) } },
+		],
+		Timescale.MILLI,
+	);
+	expect(ranges[3]).toEqual({ start: { time: 1_500 }, end: { time: 3_000 } });
+	expect(() => toWireRanges([{ start: { time: Timestamp.fromMillis(1) } }], undefined)).toThrow(TimestampMismatch);
 	const message = new Subscribe({
 		id: 1n,
 		broadcast: Path.from("test"),

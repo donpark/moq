@@ -31,6 +31,7 @@ import { Group as GroupMessage } from "./group.ts";
 import { Probe } from "./probe.ts";
 import {
 	encodeSubscribeResponse,
+	hasWireTime,
 	requestedRanges,
 	type Subscribe,
 	SubscribeDrop,
@@ -847,11 +848,24 @@ export class Publisher {
 			return;
 		}
 
-		const track = front.track(msg.track).subscribe({
+		const consumer = front.track(msg.track);
+		let ranges: track.Range[];
+		try {
+			// A time anchor counts in the timescale this peer was told, so it waits for the info.
+			const timescale = hasWireTime(msg.ranges)
+				? liteTimescale(await untilAborted(consumer.info(), left.signal))
+				: undefined;
+			ranges = requestedRanges(msg, timescale);
+		} catch (err: unknown) {
+			stream.writer.reset(error(err));
+			return;
+		}
+		if (watch.revoked()) return;
+		const track = consumer.subscribe({
 			priority: msg.priority,
 			order: msg.order,
 			maxDelay: servingMaxDelay(this.version, msg.maxDelay),
-			ranges: requestedRanges(msg),
+			ranges,
 		});
 		serving(track);
 		const floor = cursorFloor(this.version, msg.startGroup, hooks.latestSequence(track));
@@ -940,7 +954,7 @@ export class Publisher {
 						priority: update.priority,
 						order: update.order,
 						maxDelay: servingMaxDelay(this.version, update.maxDelay),
-						ranges: requestedRanges(update),
+						ranges: requestedRanges(update, liteTimescale(info)),
 					});
 				},
 			});

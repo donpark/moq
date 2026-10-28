@@ -124,6 +124,12 @@ export class Ledger {
 		return this.#runs.minKey();
 	}
 
+	/** The exclusive end of the run accounting for `sequence`, undefined when none does. */
+	runEnd(sequence: number): number | undefined {
+		const run = this.#runs.getPairOrNextLower(sequence)?.[1];
+		return run !== undefined && sequence < run.end ? run.end : undefined;
+	}
+
 	/** Whether every sequence in `[start, end)` is accounted for. */
 	covers(start: number, end: number): boolean {
 		if (start >= end) return true;

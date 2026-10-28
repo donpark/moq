@@ -42,7 +42,18 @@ import {
 } from "./internal.ts";
 import { CACHE_EXPIRY, grace, Ledger } from "./ledger.ts";
 import { Timescale, type Timestamp } from "./time.ts";
-import { isWire, joinsLive, rangesOf, union, Window, wireSpan } from "./window.ts";
+import {
+	type Holdings,
+	hasTime,
+	isWire,
+	joinsLive,
+	later,
+	rangesOf,
+	UNHELD,
+	union,
+	Window,
+	wireSpan,
+} from "./window.ts";
 import { type Broadcast as BroadcastWire, registerTrackConsumer } from "./wire.ts";
 
 export type { Datagram } from "./datagram.ts";
@@ -216,25 +227,39 @@ export interface Groups {
 }
 
 /**
- * Where one end of a {@link Range} falls: a fixed group (`absolute`), or a count of groups back
- * from the latest one (`relative`, clamped to group 0, so `{ relative: 0 }` is the latest group).
+ * Where one end of a {@link Range} falls: a fixed group (`absolute`), a count of groups back from
+ * the latest one (`relative`, clamped to group 0, so `{ relative: 0 }` is the latest group), or a
+ * presentation time (`time`, the group containing it: the newest one starting at or before it).
  * Mirrors the Rust `Anchor`.
  *
  * Every anchor names a whole group: a subscription always starts at a group's first frame. A
- * relative anchor resolves at the hop that serves it, when it starts serving and again whenever
- * the subscriber replaces its ranges. Before any group exists it resolves at the first one, so
- * `{ start: { relative: 0 } }` starts there. Older moq-lite versions carry only absolute anchors,
- * the live start, and the oldest start, refusing any other relative anchor.
+ * relative or time anchor resolves at the hop that serves it, when it starts serving and again
+ * whenever the subscriber replaces its ranges. Before any group exists a relative anchor resolves
+ * at the first one, so `{ start: { relative: 0 } }` starts there.
+ *
+ * A time anchor resolves from where the groups the hop holds start. A start before every group
+ * held reaches back to the oldest one, and one resolved before any group has started waits for
+ * one that has, reading everything meanwhile as a waiting relative anchor does. An end settles once a group starting after it is known and every sequence
+ * below that one is accounted for; until then reads stop at the first held group that may still
+ * start, so at most that one group past the end is read before its first frame shows where it
+ * starts. A datagram is judged by its own timestamp. A time anchor on an untimed track is refused
+ * with {@link TimestampMismatch}.
+ *
+ * Older moq-lite versions carry only absolute anchors, the live start, and the oldest start,
+ * refusing any other.
  */
-export type Anchor = { absolute: number; relative?: never } | { relative: number; absolute?: never };
+export type Anchor =
+	| { absolute: number; relative?: never; time?: never }
+	| { relative: number; absolute?: never; time?: never }
+	| { time: Timestamp; absolute?: never; relative?: never };
 
 /**
  * A span of a track to deliver: from `start` up to `end`. Mirrors the Rust `Range`.
  *
  * An omitted start is the oldest group still around (Rust's `Range::oldest`), and an omitted end
  * keeps following the live edge. An absolute end is exclusive, so `{absolute: 2}..{absolute: 6}`
- * delivers groups 2 through 5; a relative end includes its group, so `{absolute: 0}..{relative: 0}`
- * delivers through the latest group.
+ * delivers groups 2 through 5; relative and time ends include their group, so
+ * `{absolute: 0}..{relative: 0}` delivers through the latest group.
  */
 export interface Range {
 	/** Where delivery starts, or the oldest group when omitted. */
@@ -645,6 +670,11 @@ let reofferSequences: (producer: Producer, sink: TrackState, sequences: readonly
 // Whether a group may still land on the producer's live feed; assigned in its static block.
 let mayLand: (producer: Producer, land: Land) => boolean;
 let sourceStart: (producer: Producer) => number | "pending" | undefined;
+// The producer's checked group starts, sorted by sequence; assigned in its static block.
+let startsOf: (producer: Producer) => readonly Start[];
+// The exclusive end of the run of sequences from `sequence` the producer's feed can no longer
+// deliver, undefined while it may; assigned in its static block.
+let goneAt: (producer: Producer, sequence: number) => number | undefined;
 // Actual object metadata outlives cached payloads, unlike empty group heads in model largest.
 let objectLargest: (producer: Producer) => Position | undefined;
 
@@ -805,6 +835,14 @@ export class Producer {
 	static {
 		hooks.writeDatagram = (producer, datagram, inflated) => producer.#insertDatagram(datagram, inflated);
 		sourceStart = (producer) => producer.#served && producer.#feedStart();
+		startsOf = (producer) => producer.#bounds;
+		goneAt = (producer, sequence) => {
+			// Without a declared start, the first arrival stands in for it, as the tail's does.
+			const floor = producer.#served?.start ?? producer.#arrivals.first() ?? 0;
+			if (sequence < floor) return floor;
+			const dropped = producer.#state.drops.peek().find((run) => run.start <= sequence && sequence < run.end);
+			return dropped?.end ?? producer.#arrivals.runEnd(sequence);
+		};
 		hooks.producerLargest = (producer) => producer.#state.largest;
 		hooks.joinProducer = (producer) => producer.#join();
 		hooks.endTrack = (producer, end) => producer.#endPending(end);
@@ -2159,18 +2197,62 @@ export class Subscriber {
 
 	// Resolve this reader's ranges again, as when they are replaced.
 	#resolve(): void {
-		this.#window = new Window(this.#state.update.peek()?.ranges ?? [{}], this.#latestGroup());
+		this.#window = new Window(this.#state.update.peek()?.ranges ?? [{}], this.#latestGroup(), this.#holdings());
 		this.#bound();
 	}
 
-	// Resolve a relative anchor still waiting on a first group, once one exists. Returns the
-	// refusal of ranges this copy's wire cannot carry, which every read reports.
+	// Where the groups this reader's track holds start, for resolving its time anchors: the
+	// producer's checked starts, and this reader's mirror of its cache. A reader following route
+	// copies leaves them to the copies, which hold the groups.
+	#holdings(): Holdings {
+		const state = this.#state;
+		const producer = state.producer;
+		if (this.#resume || !producer) return UNHELD;
+		return {
+			containing: (pts) => {
+				const starts = startsOf(producer);
+				if (starts.length === 0) return "unknown";
+				if (later(starts[0].start, pts)) return "before";
+				// Checked starts never rewind, so they ascend with the sequence.
+				let lo = 1;
+				let hi = starts.length;
+				while (lo < hi) {
+					const mid = (lo + hi) >>> 1;
+					if (later(starts[mid].start, pts)) hi = mid;
+					else lo = mid + 1;
+				}
+				return { group: starts[lo - 1].sequence };
+			},
+			nextStart: (from) => {
+				const starts = startsOf(producer);
+				return starts[timelineIndex(starts, from)];
+			},
+			nextHeld: (from) => {
+				const group = state.timeline[timelineIndex(state.timeline, from)];
+				if (!group) return undefined;
+				const started = hooks.groupTimestamp(group);
+				if (started) return { sequence: group.sequence, held: { started } };
+				return { sequence: group.sequence, held: hooks.groupStarted(group) ? "never" : "pending" };
+			},
+			gone: (sequence) => goneAt(producer, sequence),
+			complete: () => state.closed.peek() !== undefined || this.#complete(),
+		};
+	}
+
+	// Resolve what the groups now held settle: a relative anchor waiting on a first group once
+	// one exists, and a time end as groups start. Returns the refusal of ranges this copy cannot
+	// resolve, which every read reports.
 	#settle(): Error | undefined {
-		if (this.#state.dropsAnchors.peek() && !this.#window.ranges.every(isWire)) {
-			return new Error("a relative anchor other than the live start needs moq-lite-07");
+		const ranges = this.#window.ranges;
+		if (this.#state.dropsAnchors.peek() && !ranges.every(isWire)) {
+			return new Error("a relative or time anchor other than the live start needs moq-lite-07");
 		}
+		const info = this.#state.info.peek();
+		if (info && info.timescale == null && hasTime(ranges)) return new TimestampMismatch();
+		if (this.#resume || this.#window.settled) return undefined;
 		// The live feed had no group when the ranges resolved, so the newest one then was the first.
-		if (this.#window.pending && !this.#resume && this.#window.settle(this.#state.first)) this.#bound();
+		const latest = this.#window.pending ? this.#state.first : this.#latestGroup();
+		if (this.#window.settle(latest, this.#holdings())) this.#bound();
 		return undefined;
 	}
 
@@ -2257,7 +2339,7 @@ export class Subscriber {
 					(datagram) =>
 						datagram.sequence >= cursor.start &&
 						(cursor.end === undefined || datagram.sequence < cursor.end) &&
-						subscriber.#window.contains(datagram.sequence),
+						subscriber.#window.admitsDatagram(datagram.sequence, datagram.timestamp),
 				);
 			return (
 				(state.closed.peek() !== undefined || subscriber.#complete()) &&
@@ -2745,6 +2827,8 @@ export class Subscriber {
 			this.#state.groups.changed(fn),
 			this.#state.drops.changed(fn),
 			this.#state.startChanged.changed(fn),
+			// A group starting may settle a time end, or move the cap it holds reads back with.
+			...(this.#window.settled ? [] : [this.#state.timelineChanged.changed(fn)]),
 			this.#state.dropsAnchors.changed(fn),
 			this.#cursor.changed(fn),
 			// A widened budget re-offers the groups it skipped as stale.
@@ -2826,7 +2910,7 @@ export class Subscriber {
 		const inRange = (datagram: Datagram) =>
 			datagram.sequence >= start &&
 			(end === undefined || datagram.sequence < end) &&
-			this.#window.contains(datagram.sequence);
+			this.#window.admitsDatagram(datagram.sequence, datagram.timestamp);
 		if (this.#resume) {
 			for (;;) {
 				const recv = this.#resume.tryDatagram(this.#delivered);
@@ -2895,15 +2979,24 @@ export class Subscriber {
 		// One anchor for the whole pass, so walking a backlog off stays linear.
 		const drift = this.#drift();
 
-		for (;;) {
-			const group = groups[0];
+		for (let index = 0; ; ) {
+			const group = groups[index];
 			if (!group || (cursor.end !== undefined && group.sequence >= cursor.end)) break;
-			groups.shift();
-			// Out of range for now: an update taking it in offers it again from the cache.
 			if (!this.#window.contains(group.sequence)) {
+				// Kept while an anchor still resolves, which may take it in.
+				if (!this.#window.settled) {
+					index++;
+					continue;
+				}
+				// Out of range for now: an update taking it in offers it again from the cache.
+				groups.splice(index, 1);
 				group.close();
 				continue;
 			}
+			groups.splice(index, 1);
+			// Passed over below the one handed out, so never read in sequence order.
+			for (const passed of groups.splice(0, index)) passed.close();
+			index = 0;
 			this.#nextSequence = group.sequence + 1;
 			// Every frame this group could still hold is past the budget, so keep
 			// scanning: one pass walks a whole backlog off rather than replaying it.

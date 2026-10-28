@@ -597,6 +597,61 @@ test("a copy over a wire without ranges refuses a relative anchor it cannot carr
 	expect(live.tryRecvGroup()?.sequence).toBe(0);
 });
 
+test("a time range reads the groups containing its times, settling its end as groups start", () => {
+	const producer = new TrackProducer("test");
+	producer.accept({ timescale: Timescale.MILLI });
+	const start = (sequence: number, millis: number) => {
+		const group = producer.createGroup(sequence);
+		group.writeFrame(textFrame(`${sequence}`, Timestamp.fromMillis(millis)));
+		return group;
+	};
+	for (let sequence = 0; sequence < 3; sequence++) start(sequence, sequence * 1000).finish();
+	const reader = producer.subscribe({
+		maxDelay: null,
+		ranges: [{ start: { time: Timestamp.fromMillis(1500) }, end: { time: Timestamp.fromMillis(3500) } }],
+	});
+	const read = () => {
+		const got: number[] = [];
+		for (let group = reader.tryRecvGroup(); group; group = reader.tryRecvGroup()) got.push(group.sequence);
+		return got;
+	};
+	// Group 1 contains 1500, and group 3, the next to arrive, may still start inside the end.
+	expect(read()).toEqual([1, 2]);
+	const three = producer.createGroup(3);
+	expect(read()).toEqual([3]);
+	// Group 4 waits until group 3 shows where it starts.
+	const four = producer.createGroup(4);
+	expect(read()).toEqual([]);
+	three.writeFrame(textFrame("3", Timestamp.fromMillis(3000)));
+	expect(read()).toEqual([4]);
+	// Group 4 starts past the end, which settles before it, though it was already read on speculation.
+	producer.createGroup(5).writeFrame(textFrame("5", Timestamp.fromMillis(5000)));
+	expect(read()).toEqual([]);
+	expect(hooks.servingEnd(reader)).toBeUndefined();
+	four.writeFrame(textFrame("4", Timestamp.fromMillis(4000)));
+	expect(read()).toEqual([]);
+	expect(hooks.servingEnd(reader)).toBe(4);
+});
+
+test("a datagram is judged against a time range by its own timestamp", () => {
+	const producer = new TrackProducer("test");
+	producer.accept({ timescale: Timescale.MILLI });
+	const reader = producer.subscribe({ ranges: [{ start: { absolute: 0 }, end: { time: Timestamp.fromMillis(3500) } }] });
+	producer.insertDatagram(0, Timestamp.fromMillis(3600), enc.encode("late"));
+	producer.insertDatagram(1, Timestamp.fromMillis(3400), enc.encode("in"));
+	const recv = hooks.tryRecvDatagram(reader);
+	expect(recv.kind === "datagram" && dec.decode(recv.datagram.payload)).toBe("in");
+	expect(hooks.tryRecvDatagram(reader)).toEqual({ kind: "idle" });
+});
+
+test("an untimed track refuses a time anchor", () => {
+	const producer = new TrackProducer("test");
+	producer.accept({});
+	const reader = producer.subscribe({ ranges: [{ start: { time: Timestamp.fromMillis(0) } }] });
+	producer.createGroup(0).finish();
+	expect(() => reader.tryRecvGroup()).toThrow(TimestampMismatch);
+});
+
 // A resume floor above the live edge must not hide the latest group from a reader that
 // joins after it: on a quiet track that group may be the only one for a long time.
 test("an unfloored subscriber clears a resume floor above the live edge", () => {

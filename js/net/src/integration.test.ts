@@ -12,7 +12,7 @@ import {
 	type Established,
 } from "./connection/index.ts";
 import * as Epoch from "./epoch.ts";
-import { SessionCode, SessionError, StreamCode, StreamError, TooFarBehind } from "./error.ts";
+import { SessionCode, SessionError, StreamCode, StreamError, TimestampMismatch, TooFarBehind } from "./error.ts";
 import * as Ietf from "./ietf/index.ts";
 import { Parameters } from "./ietf/parameters.ts";
 import { Publisher as IetfPublisher } from "./ietf/publisher.ts";
@@ -470,6 +470,51 @@ test("integration: lite-07 serves sparse and relative ranges", async () => {
 		for (let group = await reader.nextGroup(); group; group = await reader.nextGroup()) got.push(group.sequence);
 		expect(got).toEqual([1, 2, 7, 8]);
 		reader.close();
+	} finally {
+		remote.close();
+		broadcast.close();
+		client.abort();
+		server.abort();
+	}
+});
+
+// A time range goes upstream in the track's timescale, the publisher resolves its start from
+// where its groups start, and the copy's reader resolves the end from the groups it receives.
+test("integration: lite-07 serves a time range", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_07_WIP);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MICRO });
+	for (let sequence = 0; sequence < 10; sequence++) {
+		const group = producer.appendGroup();
+		group.writeFrame(textFrame(`${sequence}`, Timestamp.fromMillis(sequence * 1000)));
+		group.finish();
+	}
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	try {
+		const reader = remote
+			.track("video")
+			.subscribe({
+				maxDelay: null,
+				order: "ascending",
+				ranges: [{ start: { time: Timestamp.fromMillis(2500) }, end: { time: Timestamp.fromMillis(5000) } }],
+			})
+			.ordered();
+		const got: number[] = [];
+		for (let i = 0; i < 4; i++) got.push((await reader.nextGroup())?.sequence ?? -1);
+		expect(got).toEqual([2, 3, 4, 5]);
+		reader.close();
+
+		// An untimed track refuses it.
+		broadcast.createTrack("untimed", {});
+		const untimed = remote.track("untimed").subscribe({ ranges: [{ start: { time: Timestamp.fromMillis(0) } }] });
+		await expect(untimed.recvGroup()).rejects.toThrow(TimestampMismatch);
 	} finally {
 		remote.close();
 		broadcast.close();

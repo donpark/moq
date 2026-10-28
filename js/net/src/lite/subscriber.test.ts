@@ -27,6 +27,7 @@ import { Probe } from "./probe.ts";
 import { StreamId } from "./stream.ts";
 import {
 	encodeSubscribeResponse,
+	Subscribe,
 	SubscribeDrop,
 	SubscribeEnd,
 	type SubscribeResponse,
@@ -2190,13 +2191,13 @@ test("a lite-07 publisher FIN ends a covered bounded subscription", async () => 
 	}
 });
 
-// The FIN may answer the bounded range before the publisher read an update that widened it,
-// so the track fails rather than ending clean short of the demand.
+// The FIN may answer the bounded range before the publisher read an update that widened it, so
+// the copy asks again for the demand rather than end clean short of it or fail its readers.
 test.each([
 	["an open widening after SUBSCRIBE_START", { start: { absolute: 0 } }, true, false],
 	["a bounded widening without SUBSCRIBE_START", { start: { absolute: 0 }, end: { absolute: 5 } }, false, false],
 	["a widening the publisher stopped reading", { start: { absolute: 0 }, end: { absolute: 5 } }, false, true],
-] as const)("a lite-07 FIN short of %s fails the track", async (_, range, start, stopped) => {
+] as const)("a lite-07 FIN short of %s subscribes again on the same track", async (_, range, start, stopped) => {
 	const clock = new Manual();
 	const installed = clock.install();
 	const version = Version.DRAFT_07;
@@ -2239,7 +2240,14 @@ test.each([
 		await drainReactions();
 
 		await clock.advance(Nano.fromMilli(GRACE));
-		expect(await track.closed).toBeInstanceOf(Error);
+		const reopened = await opened(2);
+		await reopened.reading;
+		const reader = new Reader(undefined, new Uint8Array(Buffer.concat(reopened.written)), version);
+		expect(await reader.u53()).toBe(StreamId.Subscribe);
+		const msg = await Subscribe.decode(reader, version);
+		expect(msg.id).toBe(1n);
+		expect(msg.ranges).toEqual([range]);
+		expect(track.closed.peek()).toBeUndefined();
 		expect(closes).toEqual([]);
 	} finally {
 		track.close();

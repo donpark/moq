@@ -1,7 +1,8 @@
 import type * as Epoch from "../epoch.ts";
-import { fromTransport, ProtocolViolation, StreamCode, StreamError, toStreamCode } from "../error.ts";
+import { fromTransport, ProtocolViolation, StreamCode, StreamError, TimestampMismatch, toStreamCode } from "../error.ts";
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
+import { type Timescale, Timestamp } from "../time.ts";
 import type { Anchor, Order, Position, Range } from "../track.ts";
 import { decodeEpoch, encodeEpoch } from "./epoch.ts";
 import * as Message from "./message.ts";
@@ -120,8 +121,48 @@ interface Span {
 	endFrame?: number;
 }
 
+/**
+ * One end of a lite-07 range as the wire carries it: a model {@link Anchor}, except that a time
+ * counts in the track's `Timescale` as the peer was told it.
+ */
+export type WireAnchor =
+	| { absolute: number; relative?: never; time?: never }
+	| { relative: number; absolute?: never; time?: never }
+	| { time: number; absolute?: never; relative?: never };
+
+/** A lite-07 range as the wire carries it; see {@link WireAnchor}. */
+export interface WireRange {
+	start?: WireAnchor;
+	end?: WireAnchor;
+}
+
+/**
+ * The wire form of `ranges`, with time anchors in `timescale`, the track's as the publisher
+ * declared it. Throws {@link TimestampMismatch} for a time anchor on an untimed track.
+ */
+export function toWireRanges(ranges: readonly Range[], timescale: Timescale | undefined): WireRange[] {
+	const anchor = (anchor: Anchor | undefined): WireAnchor | undefined => {
+		if (anchor?.time === undefined) return anchor as WireAnchor | undefined;
+		if (timescale === undefined) throw new TimestampMismatch();
+		return { time: Math.floor(anchor.time.as(timescale)) };
+	};
+	return ranges.map((range) => {
+		const out: WireRange = {};
+		const start = anchor(range.start);
+		const end = anchor(range.end);
+		if (start) out.start = start;
+		if (end) out.end = end;
+		return out;
+	});
+}
+
+/** Whether any range starts or ends at a presentation time, which needs the track's timescale. */
+export function hasWireTime(ranges: readonly WireRange[] | undefined): boolean {
+	return ranges?.some((range) => range.start?.time !== undefined || range.end?.time !== undefined) ?? false;
+}
+
 /** Encode one lite-07 range end, `undefined` for none: an absolute end names a group's first frame. */
-async function encodeAnchor(w: Writer, anchor: Anchor | undefined) {
+async function encodeAnchor(w: Writer, anchor: WireAnchor | undefined) {
 	if (anchor?.absolute !== undefined) {
 		await w.u53(1);
 		await w.u53(anchor.absolute);
@@ -129,6 +170,9 @@ async function encodeAnchor(w: Writer, anchor: Anchor | undefined) {
 	} else if (anchor?.relative !== undefined) {
 		await w.u53(2);
 		await w.u53(anchor.relative);
+	} else if (anchor?.time !== undefined) {
+		await w.u53(3);
+		await w.u53(anchor.time);
 	} else {
 		await w.u53(0);
 	}
@@ -139,7 +183,7 @@ async function encodeAnchor(w: Writer, anchor: Anchor | undefined) {
  * and the frame bounds; lite-07 carries a list of ranges, which is `ranges` when given and
  * otherwise this span as its only one.
  */
-async function encodeSpan(w: Writer, version: Version, span: Span, ranges?: readonly Range[]) {
+async function encodeSpan(w: Writer, version: Version, span: Span, ranges?: readonly WireRange[]) {
 	if (ranges !== undefined && hasRanges(version)) {
 		if (ranges.length === 0) throw new Error(EMPTY_RANGE);
 		await w.u53(ranges.length);
@@ -181,10 +225,25 @@ async function encodeSpan(w: Writer, version: Version, span: Span, ranges?: read
 
 /**
  * The model ranges a decoded SUBSCRIBE or SUBSCRIBE_UPDATE asks for: its lite-07 list, or the one
- * span an older wire carries, whole groups either way.
+ * span an older wire carries, whole groups either way. A time anchor counts in `timescale`, the
+ * track's as the peer was told it, and is refused with {@link TimestampMismatch} without one.
  */
-export function requestedRanges(msg: Span & { ranges?: Range[] }): Range[] {
-	if (msg.ranges) return msg.ranges;
+export function requestedRanges(msg: Span & { ranges?: WireRange[] }, timescale: Timescale | undefined): Range[] {
+	if (msg.ranges) {
+		const anchor = (anchor: WireAnchor | undefined): Anchor | undefined => {
+			if (anchor?.time === undefined) return anchor as Anchor | undefined;
+			if (timescale === undefined) throw new TimestampMismatch();
+			return { time: new Timestamp(anchor.time, timescale) };
+		};
+		return msg.ranges.map((range) => {
+			const out: Range = {};
+			const start = anchor(range.start);
+			const end = anchor(range.end);
+			if (start) out.start = start;
+			if (end) out.end = end;
+			return out;
+		});
+	}
 	const range: Range = {};
 	if (msg.startGroup !== undefined) range.start = { absolute: msg.startGroup };
 	if (msg.endGroup !== undefined) range.end = { absolute: msg.endGroup + 1 };
@@ -199,12 +258,10 @@ function before(a: Point, b: Point): boolean {
 }
 
 /**
- * Decode one lite-07 range end: its absolute position, if any, and the model anchor, `undefined`
- * for none. An absolute end past frame 0 includes its group. A time anchor is also `undefined`:
- * this publisher does not resolve one, so it serves from the oldest group its budget allows, or
- * through the live edge, and the subscriber keeps what it asked for.
+ * Decode one lite-07 range end: its absolute position, if any, and the wire anchor, `undefined`
+ * for none. An absolute end past frame 0 includes its group.
  */
-async function decodeAnchor(r: Reader, end: boolean): Promise<{ point?: Point; anchor?: Anchor }> {
+async function decodeAnchor(r: Reader, end: boolean): Promise<{ point?: Point; anchor?: WireAnchor }> {
 	const kind = await r.u53();
 	switch (kind) {
 		case 0:
@@ -216,8 +273,7 @@ async function decodeAnchor(r: Reader, end: boolean): Promise<{ point?: Point; a
 		case 2:
 			return { anchor: { relative: await r.u53() } };
 		case 3:
-			await r.u53();
-			return {};
+			return { anchor: { time: await r.u53() } };
 		default:
 			throw new ProtocolViolation(`unknown range anchor: ${kind}`);
 	}
@@ -227,7 +283,7 @@ async function decodeAnchor(r: Reader, end: boolean): Promise<{ point?: Point; a
  * The inverse of {@link encodeSpan}. A lite-07 list decodes as its ranges and as the one span
  * covering every range in it, which the subscriber narrows again.
  */
-async function decodeSpan(r: Reader, version: Version): Promise<Span & { ranges?: Range[] }> {
+async function decodeSpan(r: Reader, version: Version): Promise<Span & { ranges?: WireRange[] }> {
 	if (!hasRanges(version)) {
 		const startGroup = await decodeStartGroup(r, version);
 		const endGroup = (await r.u53()) || undefined;
@@ -242,11 +298,11 @@ async function decodeSpan(r: Reader, version: Version): Promise<Span & { ranges?
 	let end: Point | undefined;
 	let floor = true;
 	let live = false;
-	const ranges: Range[] = [];
+	const ranges: WireRange[] = [];
 	for (let i = 0; i < count; i++) {
 		const from = await decodeAnchor(r, false);
 		const to = await decodeAnchor(r, true);
-		const range: Range = {};
+		const range: WireRange = {};
 		if (from.anchor) range.start = from.anchor;
 		if (to.anchor) range.end = to.anchor;
 		ranges.push(range);
@@ -342,7 +398,7 @@ export class SubscribeUpdate {
 	/** See {@link Subscribe.endFrame}. */
 	endFrame?: number;
 	/** See {@link Subscribe.ranges}. */
-	ranges?: Range[];
+	ranges?: WireRange[];
 
 	constructor(props: {
 		priority: number;
@@ -353,7 +409,7 @@ export class SubscribeUpdate {
 		endGroup?: number;
 		startFrame?: number;
 		endFrame?: number;
-		ranges?: Range[];
+		ranges?: WireRange[];
 	}) {
 		if (props.wantedGroup !== undefined && (!Number.isSafeInteger(props.wantedGroup) || props.wantedGroup < 0))
 			throw new RangeError("wanted group must be a safe non-negative integer");
@@ -459,7 +515,7 @@ export class Subscribe {
 	 * Every range. Lite-07 encodes these in place of the span when given, and older versions
 	 * the span alone; decoding a lite-07 list fills them alongside the span covering them all.
 	 */
-	ranges?: Range[];
+	ranges?: WireRange[];
 
 	constructor(props: {
 		id: bigint;
@@ -473,7 +529,7 @@ export class Subscribe {
 		endGroup?: number;
 		startFrame?: number;
 		endFrame?: number;
-		ranges?: Range[];
+		ranges?: WireRange[];
 	}) {
 		this.id = props.id;
 		this.broadcast = props.broadcast;
