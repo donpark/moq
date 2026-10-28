@@ -928,8 +928,8 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				&& traf
 					.trun
 					.iter()
-					.flat_map(|trun| trun.entries.iter())
-					.any(|entry| track.defaults.resolve(&traf.tfhd, entry).is_sync())
+					.flat_map(|trun| trun.samples.iter())
+					.any(|entry| track.defaults.resolve(&traf.tfhd, &entry).is_sync())
 		})
 	}
 
@@ -1172,9 +1172,12 @@ fn fragment(
 		for trun_mut in &mut traf_mut.trun {
 			// Reserve the data_offset field; the real value is filled in below.
 			trun_mut.data_offset = Some(0);
-			for entry in &mut trun_mut.entries {
-				if entry.duration == Some(0) {
-					entry.duration = None;
+			// Only explicit entries carry a duration; an inherited run takes the tfhd's, cleared above.
+			if let mp4_atom::TrunSamples::Explicit(entries) = &mut trun_mut.samples {
+				for entry in entries {
+					if entry.duration == Some(0) {
+						entry.duration = None;
+					}
 				}
 			}
 		}
@@ -1194,9 +1197,9 @@ fn fragment(
 
 			// Advance past this trun's sample data
 			let trun_data_size: u64 = trun_mut
-				.entries
+				.samples
 				.iter()
-				.map(|entry| u64::from(defaults.resolve(&traf_mut.tfhd, entry).size))
+				.map(|entry| u64::from(defaults.resolve(&traf_mut.tfhd, &entry).size))
 				.sum();
 			cumulative_offset += trun_data_size;
 		}
@@ -1255,7 +1258,7 @@ fn kept(traf: &mp4_atom::Traf, run: &Run) -> Result<mp4_atom::Traf> {
 		}),
 		trun: vec![mp4_atom::Trun {
 			data_offset: None,
-			entries,
+			samples: entries.into(),
 		}],
 		..Default::default()
 	})

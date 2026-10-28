@@ -712,7 +712,7 @@ fn encode_at(info: FragmentInfo, base_dts: u64, frames: &[Frame]) -> Result<Byte
 			}),
 			trun: vec![mp4_atom::Trun {
 				data_offset: Some(data_offset),
-				entries: entries.clone(),
+				samples: entries.clone().into(),
 			}],
 			..Default::default()
 		}],
@@ -1304,7 +1304,7 @@ fn gcd(mut a: u128, mut b: u128) -> u128 {
 #[cfg(test)]
 pub(crate) fn timeline(fragment: &Bytes) -> (u64, Vec<i32>) {
 	let traf = first_traf(fragment);
-	let cts = traf.trun[0].entries.iter().map(|e| e.cts.unwrap_or_default()).collect();
+	let cts = traf.trun[0].samples.iter().map(|e| e.cts.unwrap_or_default()).collect();
 	(traf.tfdt.as_ref().unwrap().base_media_decode_time, cts)
 }
 
@@ -1312,7 +1312,7 @@ pub(crate) fn timeline(fragment: &Bytes) -> (u64, Vec<i32>) {
 #[cfg(test)]
 pub(crate) fn sample_durations(fragment: &Bytes) -> Vec<Option<u32>> {
 	first_traf(fragment).trun[0]
-		.entries
+		.samples
 		.iter()
 		.map(|e| e.duration)
 		.collect()
@@ -1563,7 +1563,7 @@ mod tests {
 				}),
 				trun: vec![mp4_atom::Trun {
 					data_offset: None,
-					entries: vec![
+					samples: vec![
 						mp4_atom::TrunEntry {
 							size: Some(2),
 							duration: Some(33_333),
@@ -1574,7 +1574,8 @@ mod tests {
 							duration: Some(33_333),
 							..Default::default()
 						},
-					],
+					]
+					.into(),
 				}],
 				..Default::default()
 			}],
@@ -1758,7 +1759,7 @@ mod tests {
 
 		// On the wire every sample is a sync sample, whatever the keyframe bit said.
 		let flags: Vec<u32> = first_traf(&fragment).trun[0]
-			.entries
+			.samples
 			.iter()
 			.map(|entry| entry.flags.unwrap())
 			.collect();
@@ -1987,11 +1988,12 @@ mod tests {
 				}),
 				trun: vec![mp4_atom::Trun {
 					data_offset: None,
-					entries: vec![mp4_atom::TrunEntry {
+					samples: vec![mp4_atom::TrunEntry {
 						size: None,
 						duration: None,
 						..Default::default()
-					}],
+					}]
+					.into(),
 				}],
 				..Default::default()
 			}],
