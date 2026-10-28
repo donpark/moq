@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.18](https://github.com/moq-dev/moq/compare/moq-hls-v0.5.17...moq-hls-v0.5.18) - 2026-10-28
+
+### Fixed
+
+- *(hls)* hold import resources and redirects to the playlist origin (backport #6374)
+
 ## [0.5.17](https://github.com/moq-dev/moq/compare/moq-hls-v0.5.16...moq-hls-v0.5.17) - 2026-10-22
 
 ### Other
