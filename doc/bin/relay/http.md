@@ -60,6 +60,12 @@ Traffic and session counters accumulate for the node's lifetime, including
 broadcasts and sessions that have ended. The stats publishing prefix (normally
 `.stats`) is excluded to avoid counting the feed's own traffic.
 
+`moq_relay_control_tx_bytes_total` and `moq_relay_control_rx_bytes_total`
+count control-message bytes by `tier` and `class` (`session`, `announce`, `track_info`, `subscribe`, `fetch`,
+`probe`, `auth`, `goaway`, `other`) to spot control-heavy sessions. They
+include message size prefixes but leave out media payload and transport
+overhead such as QUIC framing, ACKs, and retransmissions.
+
 With `--runtime-io-uring`, each QUIC worker thread also reports its own
 `moq_relay_uring_*` counters under a `worker` label: datagrams and syscalls
 (the ratios are the GRO/GSO batching and the syscall amortization the runtime

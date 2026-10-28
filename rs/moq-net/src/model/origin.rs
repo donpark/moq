@@ -1529,6 +1529,11 @@ impl Producer {
 		self
 	}
 
+	/// The stats context this handle attributes traffic to.
+	pub(crate) fn stats(&self) -> &stats::Session {
+		&self.stats
+	}
+
 	/// Mark this handle (and any handle derived from it) as a cluster peer's:
 	/// every route it announces reports [`Source::Peer`], and
 	/// [`Consumer::local`] hides it.
@@ -4139,6 +4144,11 @@ impl Consumer {
 	pub fn with_stats(mut self, session: stats::Session) -> Self {
 		self.stats = session;
 		self
+	}
+
+	/// The stats context this handle attributes traffic to.
+	pub(crate) fn stats(&self) -> &stats::Session {
+		&self.stats
 	}
 
 	/// A clone of this consumer with its stats context cleared, so an internal

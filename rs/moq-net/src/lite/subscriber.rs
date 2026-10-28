@@ -633,7 +633,8 @@ impl<S: crate::transport::poll::Session> UniAccept<S> {
 					self.children.push(UniServe {
 						subscriber: self.subscriber.clone(),
 						state: UniState::Start {
-							reader: Reader::new(stream, self.subscriber.version),
+							reader: Reader::new(stream, self.subscriber.version)
+								.with_stats(self.subscriber.origin.stats()),
 						},
 					});
 				}
@@ -1143,6 +1144,7 @@ impl<S: crate::transport::poll::Session> ProbeStream<S> {
 						return Poll::Ready(Ok(()));
 					}
 					let mut stream = ready!(Stream::poll_open(&mut self.session, self.subscriber.version, &mut cx))?;
+					stream = stream.with_stats(self.subscriber.origin.stats());
 					stream.writer.buffer(&lite::ControlType::Probe)?;
 					self.state = ProbeState::Send { stream };
 				}
@@ -1230,6 +1232,8 @@ impl<S: crate::transport::poll::Session> AnnouncePrefix<S> {
 						self.subscriber.version,
 						&mut cx
 					))?;
+
+					stream = stream.with_stats(self.subscriber.origin.stats());
 
 					stream.writer.buffer(&lite::ControlType::Announce)?;
 					// Lite04/05: ask the peer to filter out announces that already passed
@@ -3200,6 +3204,9 @@ impl<S: crate::transport::poll::Session> SubStream<S> {
 	}
 }
 
+// One per track copy, which holds a live stream while anyone reads it, so boxing it
+// would add an allocation per upstream subscription without saving memory.
+#[allow(clippy::large_enum_variant)]
 enum Sub<S: crate::transport::poll::Session> {
 	None,
 	Active(SubStream<S>),
@@ -3702,6 +3709,7 @@ impl<S: crate::transport::poll::Session> Establish<S> {
 						self.serve.subscriber.version,
 						&mut cx
 					))?;
+					stream = stream.with_stats(self.serve.subscriber.origin.stats());
 
 					let bounds = WireBounds::new(self.subscription.start, self.subscription.end);
 					let msg = lite::Subscribe {
@@ -3928,6 +3936,7 @@ impl<S: crate::transport::poll::Session> TrackInfoFetch<S> {
 				TrackInfoState::Open => {
 					serve.subscriber.check_going_away()?;
 					let mut stream = ready!(Stream::poll_open(&mut self.session, serve.subscriber.version, &mut cx))?;
+					stream = stream.with_stats(serve.subscriber.origin.stats());
 					stream.writer.buffer(&lite::ControlType::Track)?;
 					stream.writer.buffer(&lite::Track {
 						broadcast: serve.path.as_path(),
@@ -4453,7 +4462,7 @@ impl<S: crate::transport::poll::Session> kio::Task for FetchServeRun<S> {
 						self.serve.subscriber.version,
 						&mut cx
 					)) {
-						Ok(stream) => stream,
+						Ok(stream) => stream.with_stats(self.serve.subscriber.origin.stats()),
 						Err(err) => {
 							tracing::warn!(track = %self.serve.name, %err, "fetch stream open failed");
 							request.take().expect("request pending").reject(err);

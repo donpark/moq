@@ -56,6 +56,8 @@ pub struct MockConnectOptions {
 	pub stats: MockStats,
 	/// Count server driver polls into this counter when supplied.
 	pub server_polls: Option<Arc<AtomicUsize>>,
+	/// The server's per-connection stats context.
+	pub server_stats: moq_net::stats::Session,
 }
 
 impl MockConnectOptions {
@@ -70,6 +72,7 @@ impl MockConnectOptions {
 			latency: std::time::Duration::ZERO,
 			stats: MockStats::default(),
 			server_polls: None,
+			server_stats: Default::default(),
 		}
 	}
 }
@@ -110,7 +113,9 @@ pub async fn connect_mock(opts: MockConnectOptions) -> MockPair {
 		client = client.with_subscriber(subscribe);
 	}
 
-	let mut server = Server::new().with_versions(opts.version.into());
+	let mut server = Server::new()
+		.with_versions(opts.version.into())
+		.with_stats(opts.server_stats);
 	if let Some(publish) = &opts.server_publish {
 		server = server.with_publisher(publish);
 	}

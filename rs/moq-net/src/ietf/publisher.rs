@@ -365,6 +365,11 @@ impl<S> Publisher<S>
 where
 	S: crate::transport::poll::Boxable,
 {
+	/// Where this session's control traffic is counted.
+	pub(super) fn stats(&self) -> &crate::stats::Session {
+		self.origin.stats()
+	}
+
 	pub fn new(
 		runtime: crate::time::Clock,
 		session: S,
@@ -2012,7 +2017,13 @@ where
 
 		kio::wait(|waiter| {
 			if let Poll::Ready(res) = waiter.poll_future(open.as_mut()) {
-				return Poll::Ready(res.map(Some));
+				return Poll::Ready(res.map(|stream| {
+					Some(super::request_stream::with_stats(
+						stream,
+						self.origin.stats(),
+						self.version,
+					))
+				}));
 			}
 			if timeout.poll(waiter).is_ready() {
 				return Poll::Ready(Ok(None));
@@ -2031,8 +2042,7 @@ where
 	async fn read_response(&self, request: &mut Stream<S, Version>) -> Result<Option<(u64, bytes::Bytes)>, Error> {
 		let mut read = std::pin::pin!(async {
 			let type_id: u64 = request.reader.decode().await?;
-			let size: u16 = request.reader.decode().await?;
-			let data = request.reader.read_exact(size as usize).await?;
+			let data = request.reader.read_message(type_id).await?;
 			Ok::<_, Error>((type_id, data))
 		});
 		let mut timeout = crate::runtime::Deadline::after(&self.runtime, ADVERTISE_TIMEOUT);

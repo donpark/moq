@@ -54,6 +54,10 @@ impl Setup {
 }
 
 impl Encode<Version> for Setup {
+	fn control(&self, _: Version) -> Option<crate::stats::Control> {
+		Some(crate::stats::Control::Session)
+	}
+
 	fn encode<W: bytes::BufMut>(&self, w: &mut W, v: Version) -> Result<(), EncodeError> {
 		Self::check_version(v);
 		SETUP_V17.encode(w, v)?;
@@ -69,6 +73,10 @@ impl Encode<Version> for Setup {
 }
 
 impl Decode<Version> for Setup {
+	fn control(&self, _: Version) -> Option<crate::stats::Control> {
+		Some(crate::stats::Control::Session)
+	}
+
 	fn decode<R: bytes::Buf>(r: &mut R, v: Version) -> Result<Self, DecodeError> {
 		Self::check_version(v);
 		let kind = u64::decode(r, v)?;
@@ -140,6 +148,10 @@ impl Client {
 }
 
 impl Decode<Version> for Client {
+	fn control(&self, _: Version) -> Option<crate::stats::Control> {
+		Some(crate::stats::Control::Session)
+	}
+
 	/// Decode a client setup message (draft-14 through draft-16 only).
 	fn decode<R: bytes::Buf>(r: &mut R, v: Version) -> Result<Self, DecodeError> {
 		let kind = u8::decode(r, v)?;
@@ -185,6 +197,10 @@ impl Decode<Version> for Client {
 }
 
 impl Encode<Version> for Client {
+	fn control(&self, _: Version) -> Option<crate::stats::Control> {
+		Some(crate::stats::Control::Session)
+	}
+
 	/// Encode a client setup message (draft-14 through draft-16 only).
 	fn encode<W: bytes::BufMut>(&self, w: &mut W, v: Version) -> Result<(), EncodeError> {
 		CLIENT_SETUP.encode(w, v)?;
@@ -235,6 +251,10 @@ impl Server {
 }
 
 impl Encode<Version> for Server {
+	fn control(&self, _: Version) -> Option<crate::stats::Control> {
+		Some(crate::stats::Control::Session)
+	}
+
 	/// Encode a server setup message (draft-14 through draft-16 only).
 	fn encode<W: bytes::BufMut>(&self, w: &mut W, v: Version) -> Result<(), EncodeError> {
 		SERVER_SETUP.encode(w, v)?;
@@ -259,6 +279,10 @@ impl Encode<Version> for Server {
 }
 
 impl Decode<Version> for Server {
+	fn control(&self, _: Version) -> Option<crate::stats::Control> {
+		Some(crate::stats::Control::Session)
+	}
+
 	/// Decode a server setup message (draft-14 through draft-16 only).
 	fn decode<R: bytes::Buf>(r: &mut R, v: Version) -> Result<Self, DecodeError> {
 		let kind = u8::decode(r, v)?;

@@ -483,6 +483,32 @@ fn render_metrics(
 		);
 	}
 
+	let control = snap.control();
+	for (name, help, field) in [
+		(
+			"moq_relay_control_tx_bytes_total",
+			"Control-message bytes encoded for sending, including codec prefixes; excludes transport overhead.",
+			(|b: &moq_net::stats::Bytes| b.tx) as fn(&moq_net::stats::Bytes) -> u64,
+		),
+		(
+			"moq_relay_control_rx_bytes_total",
+			"Control-message bytes decoded, including codec prefixes; excludes transport overhead.",
+			(|b: &moq_net::stats::Bytes| b.rx) as fn(&moq_net::stats::Bytes) -> u64,
+		),
+	] {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} counter");
+		for (tier, class, bytes) in &control {
+			let _ = writeln!(
+				out,
+				"{name}{{tier=\"{}\",class=\"{}\"}} {}",
+				tier.as_str(),
+				class.as_str(),
+				field(bytes)
+			);
+		}
+	}
+
 	render_accepts(&mut out, listeners);
 	render_uring(&mut out, uring);
 
