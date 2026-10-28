@@ -18,6 +18,9 @@ class Counting extends Format {
 
 const PAYLOAD = new Uint8Array([0xde, 0xad]);
 
+// Let the consumer's group tasks run until they park: on a read, or on a full max buffer.
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 function write(group: { writeFrame(frame: { payload: Uint8Array; timestamp: Time.Timestamp }): void }, ts: number) {
 	group.writeFrame({ payload: encodeFrame(PAYLOAD, ts as Micro), timestamp: Time.Timestamp.now() });
 }
@@ -28,16 +31,14 @@ function maxHeld(maxBuffer: number): number {
 	return Math.ceil(maxBuffer / (64 + PAYLOAD.byteLength)) + 1;
 }
 
-// Read every item. With `bounded`, check after each that the consumer holds no more than the max
-// buffer allows, which only holds while no skip drops decoded frames unread.
+// Read every item. With `bounded`, check after each, once decoding has caught up, that the consumer
+// holds no more than the max buffer allows, which only holds while no skip drops decoded frames unread.
 async function readAll(consumer: Consumer, format: Counting, bounded?: number): Promise<Read[]> {
 	const reads: Read[] = [];
 	let delivered = 0;
 	for (;;) {
-		const read = await Promise.race([
-			consumer.next(),
-			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("consumer hung")), 5_000)),
-		]);
+		const read = await consumer.next();
+		await flush();
 		if (read === undefined) return reads;
 		reads.push(read);
 		if (read.kind === "frame") delivered++;
@@ -105,7 +106,7 @@ test("Consumer holds many groups within the max buffer and reaches the live edge
 		track.finish();
 
 		// The groups' overhead and first frames fill the max buffer, and the rest wait unpulled.
-		await new Promise((resolve) => setTimeout(resolve, 50));
+		await flush();
 		expect(format.decoded).toBeLessThanOrEqual(maxHeld(maxBuffer));
 		expect(format.decoded).toBeGreaterThan(1);
 
@@ -113,6 +114,33 @@ test("Consumer holds many groups within the max buffer and reaches the live edge
 		const ts = timestamps(reads);
 		expect(ts.at(0)).toBe(0);
 		expect(ts.at(-1)).toBe(500_000);
+	} finally {
+		consumer.close();
+		track.close();
+		warn.mockRestore();
+	}
+});
+
+test("Consumer skips a stalled group once group overhead alone fills the max buffer", async () => {
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	const format = new Counting("data");
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format,
+		maxDelay: Milli(5_000),
+		// Two groups' overhead, so nothing past the stalled head would decode without its successor leading.
+		maxBuffer: 512,
+	});
+	try {
+		const stalled = track.createGroup(0);
+		write(stalled, 0);
+		const next = track.createGroup(1);
+		write(next, 10_000);
+		next.finish();
+
+		expect(await consumer.next()).toMatchObject({ kind: "frame", frame: { timestamp: 0 } });
+		expect(await consumer.next()).toMatchObject({ kind: "gap" });
+		expect(await consumer.next()).toMatchObject({ kind: "frame", frame: { timestamp: 10_000 } });
 	} finally {
 		consumer.close();
 		track.close();

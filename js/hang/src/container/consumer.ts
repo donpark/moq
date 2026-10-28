@@ -25,9 +25,10 @@ export interface ConsumerProps {
 	 * included (default: {@link DEFAULT_MAX_BUFFER}). Mirrors Rust's `Consumer::set_max_buffer`.
 	 *
 	 * Once it is full the consumer stops decoding ahead and stops pulling new groups, so the undecoded
-	 * rest stays in the transport's cache, which bounds it. The group being read still decodes one wire
-	 * frame at a time, so reading never waits on its own lookahead. If that group stalls while later
-	 * groups fill the cap, it is skipped like a slow group: no more of what it waits behind can be held.
+	 * rest stays in the transport's cache, which bounds it. The group being read, and the one after it,
+	 * still decode a wire frame whenever they hold nothing, so reading never waits on its own lookahead.
+	 * If the group being read stalls while later groups fill the cap, it is skipped like a slow group:
+	 * no more of what it waits behind can be held.
 	 */
 	maxBuffer?: number;
 	/**
@@ -208,12 +209,9 @@ export class Consumer {
 		// Start fetching groups in the background
 		try {
 			for (;;) {
-				// Past the max buffer, later groups wait in the transport's cache, unless the group being
-				// read has not arrived yet and might be the next one.
-				await this.#waitRoom(() => {
-					const head = this.#groups.at(0);
-					return head === undefined || this.#active === undefined || head.consumer.sequence > this.#active;
-				});
+				// Past the max buffer, later groups wait in the transport's cache. A missing group at the
+				// cursor then expires like one past the budget: see next().
+				await this.#waitRoom(() => false);
 				if (this.#signals.abort.aborted) break;
 
 				const consumer = await this.#track.recvGroup();
@@ -263,15 +261,12 @@ export class Consumer {
 			let index = 0;
 
 			for (;;) {
-				// Only the head may decode past a full max buffer, and only once it has nothing left to read,
-				// so reading never waits on its own lookahead. A dropped group goes on to find its close.
-				await this.#waitRoom(
-					() => group.released === true || (group === this.#groups[0] && group.frames.length === 0),
-				);
-				if (this.#signals.abort.aborted) return;
-
+				if (!(await this.#admit(group))) return;
 				const next = await group.consumer.readFrame();
 				if (!next) break;
+				// The read may have waited while a skip dropped this group or other groups filled the max
+				// buffer, so admit what it decodes again: the max buffer bounds reads in flight too.
+				if (!(await this.#admit(group))) return;
 				group.empty = false;
 				const arrival = Nano.toMilli(Nano(now()));
 
@@ -382,7 +377,8 @@ export class Consumer {
 		} finally {
 			group.done = true;
 
-			if (group.consumer.sequence === this.#active) {
+			// A dropped group no longer holds the cursor.
+			if (!group.released && group.consumer.sequence === this.#active) {
 				this.#recordPresented(group);
 
 				// Advance to the next buffered group's actual sequence, but ONLY if it continues this
@@ -554,6 +550,19 @@ export class Consumer {
 		if (group.released) return;
 		group.released = true;
 		this.#refund(group, group.charged);
+	}
+
+	// Wait until `group` may decode another wire frame: the max buffer has room, or the group leads with
+	// nothing buffered. The head leads so reading never waits on its own lookahead, and the group past it
+	// so a stalled head always has a successor to skip to. False once the group is dropped or the
+	// consumer closes, so its task stops rather than charge what no one will refund.
+	async #admit(group: Group): Promise<boolean> {
+		await this.#waitRoom(
+			() =>
+				group.released === true ||
+				(group.frames.length === 0 && (group === this.#groups[0] || group === this.#groups[1])),
+		);
+		return group.released !== true && !this.#signals.abort.aborted;
 	}
 
 	// Wait until the max buffer has room, or `exempt` holds, re-checked whenever it may have changed.

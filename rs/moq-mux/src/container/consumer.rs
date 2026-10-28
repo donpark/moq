@@ -108,9 +108,10 @@ pub(crate) enum Item {
 /// Decoded frames waiting to be read are charged to a byte cap, [`set_max_buffer`](Self::set_max_buffer),
 /// along with each buffered frame's and group's own overhead. Once it is full the consumer stops
 /// decoding ahead and stops pulling new groups, so the undecoded rest stays in the transport's cache,
-/// which bounds it. The group the cursor is on still decodes one wire frame at a time, so reading never
-/// waits on its own lookahead. If that group stalls while later groups fill the cap, it is skipped like
-/// a slow group: the consumer can hold no more of what it would wait behind.
+/// which bounds it. The group the cursor is on, and the first one past it, still decode a wire frame
+/// whenever they hold nothing, so reading never waits on its own lookahead. If the cursor's group stalls
+/// while later groups fill the cap, it is skipped like a slow group: the consumer can hold no more of
+/// what it would wait behind.
 pub struct Consumer<F: Container> {
 	// Dropped once an error ends the reader, releasing the publisher's demand.
 	track: Option<moq_net::track::Subscriber>,
@@ -1033,12 +1034,13 @@ impl<F: Container> GroupBuffer<F> {
 	}
 
 	/// Poll for the minimum timestamp in this group, or `None` if it ended without one. A `lead` group
-	/// buffers its first frame past a full max buffer.
+	/// buffers past a full max buffer only while it holds nothing, endpoint markers included.
 	fn poll_min_timestamp(&mut self, waiter: &kio::Waiter, format: &F, lead: bool) -> Poll<Option<Timestamp>> {
 		// A wire frame can decode to no media frames, so keep going until one is buffered.
 		let mut looked = Poll::Ready(());
 		while self.buffered.is_empty() {
-			match self.look_once(waiter, format, !lead) {
+			let capped = !lead || !self.markers.is_empty();
+			match self.look_once(waiter, format, capped) {
 				Poll::Ready(true) => continue,
 				Poll::Ready(false) => break,
 				Poll::Pending => {
@@ -4154,5 +4156,34 @@ mod tests {
 		let timestamps = timestamps(&reads);
 		assert_eq!(timestamps.last(), Some(&ts(500_000)));
 		assert!(timestamps.len() < 501, "nothing was skipped: {}", timestamps.len());
+	}
+
+	/// A successor holding only endpoint markers stops buffering at the max buffer like any other
+	/// lookahead, rather than reading past it in search of a media frame.
+	#[test]
+	fn an_endpoint_only_successor_stays_within_the_max_buffer() {
+		const MAX_BUFFER: usize = 1024;
+		let waiter = kio::Waiter::noop();
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let subscriber =
+			track.subscribe(moq_net::track::Subscription::default().with_max_delay(Duration::from_secs(30)));
+		let mut consumer = Consumer::new(subscriber, Container::Legacy(crate::container::Kind::Video));
+		consumer.set_max_buffer(MAX_BUFFER);
+
+		let _stalled = open_group(&mut track, 0, ts(0));
+		let mut markers = track.create_group(moq_net::group::Info { sequence: 1 }).unwrap();
+		for _ in 0..2_000 {
+			write_marker(&mut markers, ts(10_000));
+		}
+
+		let first = consumer.poll_read(&waiter);
+		assert!(matches!(first, Poll::Ready(Ok(Some(Read::Frame { .. })))), "{first:?}");
+		assert!(consumer.poll_read(&waiter).is_pending());
+		let used = consumer.buffered_bytes();
+		let slack = 2 * std::mem::size_of::<GroupBuffer<Container>>() + MARKER_COST;
+		assert!(
+			used <= MAX_BUFFER + slack,
+			"holding {used} bytes past a {MAX_BUFFER} byte max buffer"
+		);
 	}
 }
