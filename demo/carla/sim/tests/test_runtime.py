@@ -371,7 +371,7 @@ def test_session_announces_with_the_run_epoch_after_populating_tracks() -> None:
     carries the run's epoch so a restarted worker reads as a restart."""
     calls: list[object] = []
     broadcast = SimpleNamespace(
-        publish_track=lambda name: calls.append(name) or SimpleNamespace(demand=SimpleNamespace),
+        publish_track=lambda name, info=None: calls.append(name) or SimpleNamespace(demand=SimpleNamespace),
         announce=lambda route: calls.append(route),
     )
     route = SimpleNamespace(epoch="0190b2a4-0000-7000-8000-000000000000")
