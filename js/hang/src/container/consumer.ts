@@ -265,7 +265,9 @@ export class Consumer {
 			for (;;) {
 				// Only the head may decode past a full max buffer, and only once it has nothing left to read,
 				// so reading never waits on its own lookahead. A dropped group goes on to find its close.
-				await this.#waitRoom(() => group.released === true || (group === this.#groups[0] && group.frames.length === 0));
+				await this.#waitRoom(
+					() => group.released === true || (group === this.#groups[0] && group.frames.length === 0),
+				);
 				if (this.#signals.abort.aborted) return;
 
 				const next = await group.consumer.readFrame();

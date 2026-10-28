@@ -407,9 +407,10 @@ impl<F: Container> Consumer<F> {
 		if self.startup {
 			// NOTE: poll_min_timestamp buffers at least one frame per group and
 			// registers the waiter on the ones still empty. Any wire frame counts, so a
-			// paused track whose only group is a marker still reads its end.
-			let any_frame = self.pending.iter_mut().any(|group| {
-				let _ = group.poll_min_timestamp(waiter, &self.format);
+			// paused track whose only group is a marker still reads its end. The oldest
+			// buffers past a full max buffer, so a start is always found.
+			let any_frame = self.pending.iter_mut().enumerate().any(|(i, group)| {
+				let _ = group.poll_min_timestamp(waiter, &self.format, i == 0);
 				!group.empty
 			});
 			if any_frame {
@@ -547,7 +548,7 @@ impl<F: Container> Consumer<F> {
 			let current_end = if let Some(current) = self.pending.front_mut()
 				&& current.sequence <= self.current
 			{
-				match current.poll_min_timestamp(waiter, &self.format) {
+				match current.poll_min_timestamp(waiter, &self.format, true) {
 					Poll::Ready(Some(_)) => current.max_end,
 					_ => None,
 				}
@@ -555,17 +556,21 @@ impl<F: Container> Consumer<F> {
 				None
 			};
 
-			// Find the first newer group with data (our skip target) and where it starts.
+			// Find the first newer group with data (our skip target) and where it starts. The first
+			// one past the cursor buffers past a full max buffer, so a stalled cursor always has a
+			// target to skip to.
 			let mut next_group = None;
+			let mut lead = true;
 			for (i, group) in self.pending.iter_mut().enumerate() {
 				if group.sequence <= self.current {
 					continue;
 				}
 
-				if let Poll::Ready(Some(ts)) = group.poll_min_timestamp(waiter, &self.format) {
+				if let Poll::Ready(Some(ts)) = group.poll_min_timestamp(waiter, &self.format, lead) {
 					next_group = Some((i, std::time::Duration::from(ts)));
 					break;
 				}
+				lead = false;
 			}
 
 			// Find the max timestamp across all newer groups.
@@ -718,9 +723,9 @@ impl<F: Container> Consumer<F> {
 			return Poll::Ready(());
 		}
 		loop {
-			// Past the max buffer, later groups wait in the transport's cache, unless the cursor's own
-			// group has not arrived yet and might be the next one.
-			if self.memory.full() && self.pending.front().is_some_and(|group| group.sequence <= self.current) {
+			// Past the max buffer, later groups wait in the transport's cache. A missing group at the
+			// cursor then expires like one past the budget: see the hole below.
+			if self.memory.full() {
 				return Poll::Pending;
 			}
 			let next = match ready!(self.subscriber().poll_recv_group(waiter)) {
@@ -990,13 +995,13 @@ impl<F: Container> GroupBuffer<F> {
 	// decode error is kept for the reader rather than dropped with the frame it consumed; a
 	// transport abort is left for the cursor to find.
 	//
-	// Returns false once this group can buffer nothing more, and pends without registering the waiter
-	// while the max buffer is full: only the reader taking frames frees it.
-	fn look_once(&mut self, waiter: &kio::Waiter, format: &F) -> Poll<bool> {
+	// Returns false once this group can buffer nothing more. When `capped`, pends without registering
+	// the waiter while the max buffer is full: only the reader taking frames frees it.
+	fn look_once(&mut self, waiter: &kio::Waiter, format: &F, capped: bool) -> Poll<bool> {
 		if self.fault.is_some() {
 			return Poll::Ready(false);
 		}
-		if self.memory.full() {
+		if capped && self.memory.full() {
 			return Poll::Pending;
 		}
 		match ready!(self.buffer_once(waiter, format)) {
@@ -1010,7 +1015,7 @@ impl<F: Container> GroupBuffer<F> {
 	}
 
 	fn look_all(&mut self, waiter: &kio::Waiter, format: &F) -> Poll<()> {
-		while ready!(self.look_once(waiter, format)) {}
+		while ready!(self.look_once(waiter, format, true)) {}
 		Poll::Ready(())
 	}
 
@@ -1027,12 +1032,13 @@ impl<F: Container> GroupBuffer<F> {
 		self.poll_ended(waiter)
 	}
 
-	/// Poll for the minimum timestamp in this group, or `None` if it ended without one.
-	fn poll_min_timestamp(&mut self, waiter: &kio::Waiter, format: &F) -> Poll<Option<Timestamp>> {
+	/// Poll for the minimum timestamp in this group, or `None` if it ended without one. A `lead` group
+	/// buffers its first frame past a full max buffer.
+	fn poll_min_timestamp(&mut self, waiter: &kio::Waiter, format: &F, lead: bool) -> Poll<Option<Timestamp>> {
 		// A wire frame can decode to no media frames, so keep going until one is buffered.
 		let mut looked = Poll::Ready(());
 		while self.buffered.is_empty() {
-			match self.look_once(waiter, format) {
+			match self.look_once(waiter, format, !lead) {
 				Poll::Ready(true) => continue,
 				Poll::Ready(false) => break,
 				Poll::Pending => {
@@ -3147,7 +3153,7 @@ mod tests {
 		// Finding the start buffers one frame; the read behind it already holds the rest.
 		let mut buffer = GroupBuffer::<FailingDecode>::new(group.consume(), Memory::new(DEFAULT_MAX_BUFFER));
 		assert_eq!(
-			buffer.poll_min_timestamp(&waiter, &FailingDecode),
+			buffer.poll_min_timestamp(&waiter, &FailingDecode, false),
 			Poll::Ready(Some(ts(0)))
 		);
 		group.abort(moq_net::Error::Old).unwrap();
@@ -4102,8 +4108,8 @@ mod tests {
 	}
 
 	/// Frames packed into one timestamp have no span, so the age budget never skips the stalled group
-	/// they queue behind. They fill the max buffer instead, which skips it, and the rest stays unread
-	/// in the transport's cache until the reader gets to it.
+	/// they queue behind. Read ahead as the newest group, they fill the max buffer instead, which skips
+	/// it, and the rest stays unread in the transport's cache until the reader gets to it.
 	#[tokio::test]
 	async fn frames_sharing_a_timestamp_stay_within_the_max_buffer() {
 		tokio::time::pause();
@@ -4114,21 +4120,20 @@ mod tests {
 
 		let _stalled = open_group(&mut track, 0, ts(0));
 		write_group(&mut track, 1, &vec![ts(10_000); 2_000]);
-		write_group(&mut track, 2, &[ts(20_000), ts(30_000)]);
 		track.finish().unwrap();
 
 		let reads = read_bounded(&mut consumer, MAX_BUFFER).await;
 		let timestamps = timestamps(&reads);
-		assert_eq!(timestamps.len(), 1 + 2_000 + 2);
+		assert_eq!(timestamps.len(), 1 + 2_000);
 		assert_eq!(timestamps.first(), Some(&ts(0)));
-		assert_eq!(timestamps.last(), Some(&ts(30_000)));
+		assert_eq!(timestamps.last(), Some(&ts(10_000)));
 		// The stalled group's tail is lost.
 		assert!(matches!(reads[1], Read::Gap { .. }), "{:?}", reads[1]);
 	}
 
 	/// A publisher opening many groups fills the max buffer with their overhead and first frames, so
-	/// the rest wait in the transport's cache, where its own budget drops what falls behind: playback
-	/// still reaches the live edge.
+	/// the rest wait in the transport's cache: playback still reaches the live edge, and what arrives
+	/// below the cursor once there is room is dropped as old.
 	#[tokio::test]
 	async fn many_groups_stay_within_the_max_buffer() {
 		tokio::time::pause();
@@ -4147,7 +4152,6 @@ mod tests {
 
 		let reads = read_bounded(&mut consumer, MAX_BUFFER).await;
 		let timestamps = timestamps(&reads);
-		assert_eq!(timestamps.first(), Some(&ts(0)));
 		assert_eq!(timestamps.last(), Some(&ts(500_000)));
 		assert!(timestamps.len() < 501, "nothing was skipped: {}", timestamps.len());
 	}

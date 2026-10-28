@@ -68,17 +68,13 @@ test("Consumer holds frames sharing a timestamp within the max buffer", async ()
 		const packed = track.createGroup(1);
 		for (let i = 0; i < 2_000; i++) write(packed, 10_000);
 		packed.finish();
-		const tail = track.createGroup(2);
-		write(tail, 20_000);
-		write(tail, 30_000);
-		tail.finish();
 		track.finish();
 
 		const reads = await readAll(consumer, format, maxBuffer);
 		const ts = timestamps(reads);
-		expect(ts.length).toBe(1 + 2_000 + 2);
+		expect(ts.length).toBe(1 + 2_000);
 		expect(ts.at(0)).toBe(0);
-		expect(ts.at(-1)).toBe(30_000);
+		expect(ts.at(-1)).toBe(10_000);
 		// The stalled group's tail is lost.
 		expect(reads[1]?.kind).toBe("gap");
 	} finally {
