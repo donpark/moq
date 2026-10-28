@@ -125,10 +125,9 @@ impl Producer {
 
 	/// Poll for consumer presence to differ from `last`, with the new value once it does.
 	/// Errors once the channel closes.
+	#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
 	pub(crate) fn poll_wanted_changed(&self, waiter: &kio::Waiter, last: bool) -> Poll<Result<bool>> {
-		self.state
-			.poll_wanted_changed(waiter, last)
-			.map_err(|_| Error::Dropped)
+		self.state.poll_wanted_changed(waiter, last).map_err(|_| Error::Dropped)
 	}
 }
 

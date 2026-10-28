@@ -67,7 +67,10 @@ fn value_modification_does_not_wake_consumer() {
 
 	// Dropping the last consumer is what should wake it.
 	drop(consumer);
-	assert!(waker.count() >= 1, "dropping the last consumer did not wake wanted_changed()");
+	assert!(
+		waker.count() >= 1,
+		"dropping the last consumer did not wake wanted_changed()"
+	);
 	assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Ready(Ok(false))));
 }
 

@@ -1678,7 +1678,9 @@ impl Publisher {
 	async fn released(&self, credit: &kio::Producer<()>) {
 		let mut session = self.session.clone();
 		kio::wait(|waiter| {
-			if session.poll_closed(&mut waiter.context()).is_ready() || credit.poll_wanted_changed(waiter, true).is_ready() {
+			if session.poll_closed(&mut waiter.context()).is_ready()
+				|| credit.poll_wanted_changed(waiter, true).is_ready()
+			{
 				return Poll::Ready(());
 			}
 			Poll::Pending

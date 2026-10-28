@@ -299,7 +299,10 @@ mod consumer_tests {
 			0
 		);
 		assert_eq!(moq_bandwidth_consumer_close(id.into()), 0);
-		assert!(!producer.demand().wanted(), "closing releases demand before the callback runs");
+		assert!(
+			!producer.demand().wanted(),
+			"closing releases demand before the callback runs"
+		);
 		assert!(receiver.recv().await.unwrap() < 0);
 	}
 }

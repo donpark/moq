@@ -2576,7 +2576,7 @@ async fn dynamic_track_serves_fetch_miss_and_priority() {
 		(5, 0, 6)
 	);
 	assert_eq!(request.priority(), 11);
-	assert_eq!(request.next(), Some(5));
+	assert_eq!(request.wanted(), Some(5));
 
 	let group = request.accept(5).unwrap();
 	group

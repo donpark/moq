@@ -1484,8 +1484,8 @@ mod tests {
 		tokio::time::timeout(std::time::Duration::from_secs(5), async {
 			while abandoned.wanted_changed().await.is_some() {}
 		})
-			.await
-			.expect("the abandoned fetch kept its source fetch");
+		.await
+		.expect("the abandoned fetch kept its source fetch");
 
 		// The handler dropped the output request with the caller, so this is a
 		// fresh request rather than a join of the one still encoding.

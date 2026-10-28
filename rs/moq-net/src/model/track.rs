@@ -18040,7 +18040,11 @@ mod test {
 			panic!("below the start is a miss");
 		};
 		let (flag, waiter) = Flag::waiter();
-		assert_eq!(fill.poll_wanted_changed(&waiter), Poll::Ready(Some(0)), "the first poll reports");
+		assert_eq!(
+			fill.poll_wanted_changed(&waiter),
+			Poll::Ready(Some(0)),
+			"the first poll reports"
+		);
 		assert!(fill.poll_wanted_changed(&waiter).is_pending());
 
 		subscriber.update(ascending(8..)).unwrap();
@@ -18161,7 +18165,10 @@ mod test {
 		subscriber.update(ascending(1..)).unwrap();
 		assert!(subscriber.poll_recv_group(&waiter).is_pending());
 		assert!(readers.poll_unwanted(&waiter).is_ready(), "nobody reads group 0 now");
-		assert!(fill.poll_withdrawn(&waiter).is_pending(), "the fill still owes 1 and up");
+		assert!(
+			fill.poll_withdrawn(&waiter).is_pending(),
+			"the fill still owes 1 and up"
+		);
 	}
 
 	/// A time start before every group held asks no fill below the oldest, since which of

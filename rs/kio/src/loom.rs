@@ -142,7 +142,11 @@ fn first_consumer_wakes_wanted_changed() {
 		// The consumer rides back on the join handle so it outlives the `wanted_changed()` poll.
 		let maker = thread::spawn(move || second.consume());
 
-		assert_eq!(block_on(producer.wanted_changed(false)), Ok(true), "the new consumer was missed");
+		assert_eq!(
+			block_on(producer.wanted_changed(false)),
+			Ok(true),
+			"the new consumer was missed"
+		);
 		drop(maker.join().unwrap());
 	});
 }
@@ -157,7 +161,11 @@ fn last_consumer_wakes_wanted_changed() {
 
 		let dropper = thread::spawn(move || drop(consumer));
 
-		assert_eq!(block_on(producer.wanted_changed(true)), Ok(false), "the last drop was missed");
+		assert_eq!(
+			block_on(producer.wanted_changed(true)),
+			Ok(false),
+			"the last drop was missed"
+		);
 		dropper.join().unwrap();
 	});
 }
@@ -172,7 +180,11 @@ fn consumer_churn_resolves_unwanted() {
 
 		let churn = thread::spawn(move || drop(second.consume()));
 
-		assert_eq!(block_on(producer.wanted_changed(true)), Ok(false), "wanted_changed() stalled on churn");
+		assert_eq!(
+			block_on(producer.wanted_changed(true)),
+			Ok(false),
+			"wanted_changed() stalled on churn"
+		);
 		churn.join().unwrap();
 	});
 }

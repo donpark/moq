@@ -2448,7 +2448,10 @@ mod tests {
 		assert!(first.demand().wanted(), "a remaining clone is demand");
 		drop(clone);
 		forward.poll(&out, &waiter, || Some(first.consume()));
-		assert!(!first.demand().wanted(), "the last drop releases the live session's consumer");
+		assert!(
+			!first.demand().wanted(),
+			"the last drop releases the live session's consumer"
+		);
 		let reader = handle.consume();
 		assert_eq!(reader.peek(), None, "an unused estimate is cleared");
 		forward.poll(&out, &waiter, || Some(first.consume()));
@@ -2461,7 +2464,10 @@ mod tests {
 		second.set(Some(moq_net::bandwidth::Rate::from_bps(456))).unwrap();
 		let mut forward = RecvBandwidth::default();
 		forward.poll(&out, &waiter, || Some(second.consume()));
-		assert!(second.demand().wanted(), "the same reader demands the replacement session");
+		assert!(
+			second.demand().wanted(),
+			"the same reader demands the replacement session"
+		);
 		assert_eq!(reader.peek(), Some(moq_net::bandwidth::Rate::from_bps(456)));
 		drop(reader);
 		forward.poll(&out, &waiter, || Some(second.consume()));

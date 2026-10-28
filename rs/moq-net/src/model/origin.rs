@@ -12991,7 +12991,10 @@ mod tests {
 		for _ in 0..10 {
 			moq_clock::sim::yield_now().await;
 		}
-		assert!(!incompatible.demand().is_wanted(), "the refused copy is still subscribed");
+		assert!(
+			!incompatible.demand().is_wanted(),
+			"the refused copy is still subscribed"
+		);
 
 		// The refusal happened: the incumbent leaving surfaces it.
 		drop(track);
