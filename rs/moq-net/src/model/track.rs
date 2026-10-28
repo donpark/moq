@@ -7307,7 +7307,13 @@ impl Subscriber {
 		match &mut self.inner {
 			Inner::Plain(cursor) => {
 				cursor.sync();
-				cursor.filter.window.resolved().iter().map(|r| r.map(|r| r.start)).collect()
+				cursor
+					.filter
+					.window
+					.resolved()
+					.iter()
+					.map(|r| r.map(|r| r.start))
+					.collect()
 			}
 			Inner::Resume(resume, _) => resume.starts(),
 		}

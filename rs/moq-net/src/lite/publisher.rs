@@ -6130,7 +6130,10 @@ mod serve_group_test {
 		assert!(futures::poll!(run.as_mut()).is_pending());
 
 		let writes = log.writes.lock().unwrap().clone();
-		match lite::SubscribeResponse::decode_slice(&writes, Version::Lite07).unwrap().0 {
+		match lite::SubscribeResponse::decode_slice(&writes, Version::Lite07)
+			.unwrap()
+			.0
+		{
 			lite::SubscribeResponse::Start(start) => assert_eq!(start.starts, [Some(3), Some(1), None]),
 			other => panic!("expected SUBSCRIBE_START, got {other:?}"),
 		}
@@ -7305,7 +7308,10 @@ mod serve_group_test {
 		*open = true;
 		drop(open);
 		run.await.unwrap();
-		assert_eq!(*log.writes.lock().unwrap(), [0, 5, 0, 1, 0, 1, 1, 2, 3, 0, 0, 0x34, 1, 1, 2]);
+		assert_eq!(
+			*log.writes.lock().unwrap(),
+			[0, 5, 0, 1, 0, 1, 1, 2, 3, 0, 0, 0x34, 1, 1, 2]
+		);
 	}
 }
 
