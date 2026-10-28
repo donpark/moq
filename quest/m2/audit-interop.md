@@ -145,7 +145,8 @@ and moqtopus and xquic-draft-18 over WebTransport (raw QUIC only).
 
 From the 2026-10-25 run: the runner's moq-dev-js `announce-subscribe` case times
 out against imquic on both 0.4.4 and the [moq-dev/moq#6769](https://github.com/moq-dev/moq/pull/6769)
-backport, so it predates that fix. Classify it.
+backport, so it predates that fix. It still times out on 0.4.6 and 0.4.7
+(2026-10-28, 3 runs each). Classify it.
 
 ## Related
 
