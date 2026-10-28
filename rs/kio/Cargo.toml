@@ -61,7 +61,6 @@ loom = { workspace = true }
 
 [dev-dependencies]
 # Bench-only: the FuturesUnordered comparison in benches/tasks.rs.
-criterion = { workspace = true }
 futures = "0.3"
 # Enable the simulator so the clock's tests run in the merge gate. The browser
 # leaves the runtime to `--features runtime`, so it tests the clock both ways.
@@ -78,6 +77,11 @@ wasm-bindgen-test = "=0.3.79"
 # Test the installed manual clock, which needs tokio's runtime and so is native only.
 kio = { path = ".", features = ["manual", "sim", "serde"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+# The benches run natively; rayon under criterion refuses to build for wasm, where
+# the browser runner compiles the clock's tests.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { workspace = true }
 
 [[bench]]
 name = "tasks"
