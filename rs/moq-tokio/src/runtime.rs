@@ -9,19 +9,27 @@ use std::sync::OnceLock;
 
 /// Enter the fallback runtime until the guard drops, unless the caller is already in one.
 pub(crate) fn enter() -> Option<tokio::runtime::EnterGuard<'static>> {
-	if tokio::runtime::Handle::try_current().is_ok() {
-		return None;
+	match tokio::runtime::Handle::try_current() {
+		Ok(_) => None,
+		Err(_) => Some(fallback().enter()),
 	}
+}
 
+/// The caller's runtime, else the fallback, for a handle that outlives this call.
+#[cfg(feature = "driver")]
+pub(crate) fn handle() -> tokio::runtime::Handle {
+	tokio::runtime::Handle::try_current().unwrap_or_else(|_| fallback().handle().clone())
+}
+
+fn fallback() -> &'static tokio::runtime::Runtime {
 	static FALLBACK: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-	let runtime = FALLBACK.get_or_init(|| {
+	FALLBACK.get_or_init(|| {
 		tokio::runtime::Builder::new_multi_thread()
 			.enable_all()
 			.thread_name("moq-tokio")
 			.build()
 			.expect("failed to start the fallback tokio runtime")
-	});
-	Some(runtime.enter())
+	})
 }
 
 /// Run `future` with [`enter`] held for each poll, since a poll may spawn or make timers.
