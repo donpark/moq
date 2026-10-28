@@ -204,3 +204,31 @@ test("Consumer admits reads completing together one at a time against the max bu
 		track.close();
 	}
 });
+
+for (const maxBuffer of [0, 256]) {
+	test(`Consumer moves past a stalled group with a ${maxBuffer} byte max buffer`, async () => {
+		const warn = spyOn(console, "warn").mockImplementation(() => {});
+		const track = new Track.Producer("test");
+		const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+			format: new Format("data"),
+			maxDelay: Milli(5_000),
+			// No more than one group's overhead: the successor is pulled anyway, so the head can be skipped.
+			maxBuffer,
+		});
+		try {
+			const stalled = track.createGroup(0);
+			write(stalled, 0);
+			const next = track.createGroup(1);
+			write(next, 10_000);
+			next.finish();
+
+			expect(await consumer.next()).toMatchObject({ kind: "frame", frame: { timestamp: 0 } });
+			expect(await consumer.next()).toMatchObject({ kind: "gap" });
+			expect(await consumer.next()).toMatchObject({ kind: "frame", frame: { timestamp: 10_000 } });
+		} finally {
+			consumer.close();
+			track.close();
+			warn.mockRestore();
+		}
+	});
+}

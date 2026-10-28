@@ -24,8 +24,8 @@ export interface ConsumerProps {
 	 * Cap the bytes of decoded frames held ahead of the reader, each frame's and group's own overhead
 	 * included (default: {@link DEFAULT_MAX_BUFFER}). Mirrors Rust's `Consumer::set_max_buffer`.
 	 *
-	 * Once it is full the consumer stops decoding ahead and stops pulling new groups, so the undecoded
-	 * rest stays in the transport's cache, which bounds it. The group being read still decodes a wire
+	 * Once it is full the consumer stops decoding ahead and stops pulling new groups past one successor
+	 * to the group being read, so the undecoded rest stays in the transport's cache, which bounds it. The group being read still decodes a wire
 	 * frame whenever it holds nothing, so reading never waits on its own lookahead. If it stalls while the
 	 * cap is full, the consumer moves on to the next group like a skip past a slow group, read or not: no
 	 * more of what it waits behind can be held.
@@ -209,9 +209,10 @@ export class Consumer {
 		// Start fetching groups in the background
 		try {
 			for (;;) {
-				// Past the max buffer, later groups wait in the transport's cache. A missing group at the
-				// cursor then expires like one past the budget: see next().
-				while (this.#full() && !this.#signals.abort.aborted) await this.#park();
+				// Past the max buffer, later groups wait in the transport's cache, once the head has a successor
+				// to move on to: however small the cap, a stalled head can always be skipped. A missing group
+				// at the cursor then expires like one past the budget: see next().
+				while (this.#full() && this.#groups.length >= 2 && !this.#signals.abort.aborted) await this.#park();
 				if (this.#signals.abort.aborted) break;
 
 				const consumer = await this.#track.recvGroup();
@@ -266,15 +267,15 @@ export class Consumer {
 			let index = 0;
 
 			for (;;) {
+				// Wait for a frame without taking it, so a group parked on the max buffer holds nothing.
+				await group.consumer.readable();
 				while (!this.#stopped(group) && !this.#admits(group)) await this.#park();
 				if (this.#stopped(group)) return;
-				const next = await group.consumer.readFrame();
+				// Nothing yields between the check above and the charge below, or every task woken together
+				// would spend the same room. A buffered frame is taken synchronously; only an end or a
+				// failure, which carries no frame, is left for readFrame to report.
+				const next = group.consumer.tryReadFrame() ?? (await group.consumer.readFrame());
 				if (!next) break;
-				// The read may have waited while a skip dropped this group or other groups filled the max
-				// buffer, so admit what it decodes again: the max buffer bounds reads in flight too. Nothing
-				// yields between this check and the charge below, or every task woken together would spend
-				// the same room.
-				while (!this.#stopped(group) && !this.#admits(group)) await this.#park();
 				if (this.#stopped(group)) return;
 				group.empty = false;
 				const arrival = Nano.toMilli(Nano(now()));

@@ -107,8 +107,8 @@ pub(crate) enum Item {
 ///
 /// Decoded frames waiting to be read are charged to a byte cap, [`set_max_buffer`](Self::set_max_buffer),
 /// along with each buffered frame's and group's own overhead. Once it is full the consumer stops
-/// decoding ahead and stops pulling new groups, so the undecoded rest stays in the transport's cache,
-/// which bounds it. The group the cursor is on still decodes a wire frame whenever it holds nothing, so
+/// decoding ahead and stops pulling new groups past one successor to the cursor's group, so the
+/// undecoded rest stays in the transport's cache, which bounds it. The group the cursor is on still decodes a wire frame whenever it holds nothing, so
 /// reading never waits on its own lookahead. If that group stalls while the cap is full, the cursor
 /// moves on to the next group like a skip past a slow group, read or not: the consumer can hold no
 /// more of what it would wait behind.
@@ -396,7 +396,7 @@ impl<F: Container> Consumer<F> {
 		loop {
 			match self.poll_event_once(waiter) {
 				// A skip refunded room for groups the max buffer held back, so pull them.
-				Poll::Pending if std::mem::take(&mut self.gated) && !self.memory.full() => continue,
+				Poll::Pending if std::mem::take(&mut self.gated) && !self.pull_gated() => continue,
 				res => return res,
 			}
 		}
@@ -746,7 +746,7 @@ impl<F: Container> Consumer<F> {
 		loop {
 			// Past the max buffer, later groups wait in the transport's cache. A missing group at the
 			// cursor then expires like one past the budget: see the hole below.
-			if self.memory.full() {
+			if self.pull_gated() {
 				self.gated = true;
 				return Poll::Pending;
 			}
@@ -780,6 +780,12 @@ impl<F: Container> Consumer<F> {
 			}
 			self.pending.insert(idx, reader);
 		}
+	}
+
+	// Whether the max buffer holds back the next group: it is full, and the cursor's group already has a
+	// successor to move on to, so however small the cap, a stalled group can always be skipped.
+	fn pull_gated(&self) -> bool {
+		self.memory.full() && self.pending.len() >= 2
 	}
 
 	// Drop the pending groups `pick` selects without delivering them. A drop must not hide what
@@ -4252,5 +4258,28 @@ mod tests {
 			}
 		}
 		assert_eq!(reads, vec![Some(ts(0)), None, Some(ts(20_000))]);
+	}
+
+	/// No cap is too small to read through: the cursor's group and one successor are always pulled, so
+	/// a stalled group can be moved past even when one group's overhead fills the max buffer.
+	#[test]
+	fn a_zero_max_buffer_still_moves_past_a_stalled_group() {
+		let waiter = kio::Waiter::noop();
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let mut consumer = container_max_delay_only(track.subscribe(None), Duration::from_secs(5));
+		consumer.set_max_buffer(0);
+
+		let _stalled = open_group(&mut track, 0, ts(0));
+		write_group(&mut track, 1, &[ts(10_000)]);
+
+		let mut reads = Vec::new();
+		while let Poll::Ready(read) = consumer.poll_read(&waiter) {
+			match read.unwrap() {
+				Some(Read::Frame { frame, .. }) => reads.push(Some(frame.timestamp)),
+				Some(Read::Gap { .. }) => reads.push(None),
+				other => panic!("unexpected read: {other:?}"),
+			}
+		}
+		assert_eq!(reads, vec![Some(ts(0)), None, Some(ts(10_000))]);
 	}
 }
