@@ -693,11 +693,7 @@ async fn quiet_catalog_survives_cache_expiry(version: Version, takeover: bool) {
 			assert!(
 				matches!(
 					event,
-					Some(
-						announce::Event::Update(_)
-							| announce::Event::Restart(_)
-							| announce::Event::Takeover { announce: _, .. }
-					)
+					Some(announce::Event::Update(_) | announce::Event::Restart(_) | announce::Event::Takeover { .. })
 				),
 				"{version}: {event:?}"
 			);

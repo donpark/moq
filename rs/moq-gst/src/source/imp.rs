@@ -4035,7 +4035,7 @@ mod session_tests {
 			matches!(
 				event,
 				moq_net::announce::Event::Restart(_)
-					| moq_net::announce::Event::Takeover { announce: _, .. }
+					| moq_net::announce::Event::Takeover { .. }
 					| moq_net::announce::Event::Start(_)
 			)
 		});

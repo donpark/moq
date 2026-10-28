@@ -65,7 +65,7 @@ async fn next_broadcast(
 		{
 			moq_net::announce::Event::Start(_)
 			| moq_net::announce::Event::Restart(_)
-			| moq_net::announce::Event::Takeover { announce: _, .. } => break,
+			| moq_net::announce::Event::Takeover { .. } => break,
 			moq_net::announce::Event::End(_) | moq_net::announce::Event::Update(_) => {}
 		}
 	}

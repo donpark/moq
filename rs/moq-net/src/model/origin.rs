@@ -1748,10 +1748,11 @@ impl TableCursor {
 	}
 
 	/// Where this cursor presents the predecessor `takeover` continues, when it presents
-	/// exactly that incarnation and every route it sees at the predecessor's prefix
-	/// serves it: a path beneath could resolve through any of them, so another one
-	/// there would make the continuity claim false for what it served.
-	fn continued(&self, takeover: &Takeover, routes: &RouteTable) -> Option<Path> {
+	/// exactly that incarnation and every route it sees at the predecessor's prefix,
+	/// other than the successor `id` itself, serves it: a path beneath could resolve
+	/// through any of them, so another one there would make the continuity claim false
+	/// for what it served.
+	fn continued(&self, id: u64, takeover: &Takeover, routes: &RouteTable) -> Option<Path> {
 		let claim = prefix_claim(&takeover.prefix).ok()?;
 		let presented = self.presented(&takeover.prefix, &claim)?;
 		let current = self.current.get(&presented)?;
@@ -1760,7 +1761,7 @@ impl TableCursor {
 		}
 		routes
 			.at(&takeover.prefix)
-			.filter(|entry| self.visible(entry))
+			.filter(|entry| entry.id != id && self.visible(entry))
 			.all(|entry| takeover.instance.is(entry))
 			.then_some(presented)
 	}
@@ -1798,7 +1799,7 @@ impl TableCursor {
 			.takeover
 			.as_ref()
 			.filter(|takeover| takeover.at == now)
-			.and_then(|takeover| self.continued(takeover, routes));
+			.and_then(|takeover| self.continued(entry.id, takeover, routes));
 		let started = match previous {
 			Some(previous) if previous.instance == instance && previous.captures == captures => previous.started,
 			_ => now,
