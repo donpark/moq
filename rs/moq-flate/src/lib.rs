@@ -31,9 +31,9 @@
 //! This is plain raw DEFLATE with a `Z_SYNC_FLUSH` after each frame, so any peer using the same
 //! primitive (zlib's sync flush, the browser's `deflate-raw`) interoperates on the wire. There is no
 //! length prefix: the caller is expected to frame each slice (moq-net already does). A small slice
-//! can still inflate to far more than its own size, so a [`Decoder`] holds its whole window to the
-//! group budget ([`MAX_CACHE_BYTES`](moq_net::group::MAX_CACHE_BYTES)): a compressed group never
-//! costs a reader more than a plain one, and the encoders refuse or roll before a group would.
+//! can still inflate to far more than its own size, so a [`Decoder`] holds its whole window to
+//! [`MAX_CACHE_BYTES`](moq_net::group::MAX_CACHE_BYTES), the most one frame or compressed moq-net
+//! group holds, and the encoders refuse or roll before a group would pass it.
 //!
 //! A sync flush always ends in the 4-byte empty-block marker `00 00 ff ff`. That marker is fixed, so
 //! [`Encoder::frame`] drops it from each slice and [`Decoder::frame`] re-appends it before inflating,
@@ -194,9 +194,9 @@ impl Default for Encoder {
 /// Decodes a stream's frame slices back into the original payloads. Hold one per stream; feed slices
 /// in frame order (each frame builds on the earlier ones).
 ///
-/// A peer could send tiny slices that inflate hugely, so the window's total output is held to the
-/// group budget, [`MAX_CACHE_BYTES`](moq_net::group::MAX_CACHE_BYTES): the most a plain group can
-/// carry. A compressed group then costs a reader no more than a plain one, however small its slices.
+/// A peer could send tiny slices that inflate hugely, so the window's total output is held to
+/// [`MAX_CACHE_BYTES`](moq_net::group::MAX_CACHE_BYTES), the most a compressed moq-net group
+/// holds, however small its slices.
 pub struct Decoder {
 	inner: Box<Decompress>,
 	/// The most bytes the whole window may inflate to. A field so a test can shrink it.

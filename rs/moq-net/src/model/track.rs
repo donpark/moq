@@ -2126,6 +2126,7 @@ impl TrackState {
 		let average = pool.average().unwrap_or(0);
 		let mut paid = 0u64;
 		let mut scanned = 0usize;
+		let mut fresh = Vec::new();
 		for _ in 0..self.evict.len() {
 			if self.debt == 0 || paid >= cap || scanned >= EVICT_SCAN {
 				break;
@@ -2155,9 +2156,11 @@ impl TrackState {
 			scanned += 1;
 			// Protected: accessed more recently than the average (a fresh insert,
 			// an active reader, or a FETCH hit, which also covers a backfill still
-			// being filled). Rotate to the back.
+			// being filled). Rotate to the back, but shed its front below if the debt
+			// outlives the scan.
 			if slot.cache_accessed() > average {
 				self.evict.push_back((sequence, stamp));
+				fresh.push(sequence);
 				continue;
 			}
 			// The full footprint including overhead, so even empty groups repay
@@ -2171,6 +2174,23 @@ impl TrackState {
 			self.debt -= size;
 			paid = paid.saturating_add(size);
 			self.uncache(sequence).unwrap().abort(Error::Evicted);
+		}
+		// No cold group left to pay with: shed the front of the groups that could not go
+		// whole, the ones being read and then the live edge, so neither grows without bound.
+		// A reader that needs a shed frame refills it.
+		fresh.extend(self.latest_group.filter(|latest| self.protects(*latest)));
+		for sequence in fresh {
+			if self.debt == 0 || paid >= cap {
+				break;
+			}
+			let Some(slot) = self.lookup.get(&sequence) else {
+				continue;
+			};
+			for group in slot.copies() {
+				let freed = group.shed(self.debt, cap - paid.min(cap));
+				self.debt -= freed.min(self.debt);
+				paid = paid.saturating_add(freed);
+			}
 		}
 		paid
 	}
@@ -2683,6 +2703,21 @@ impl TrackState {
 		}
 		let info = self.info.clone().unwrap();
 
+		// Frames the cached copy shed under pressure: a reader is waiting on them, and they
+		// go back into that copy rather than a copy of their own.
+		if let Some(target) = self
+			.lookup
+			.get(&sequence)
+			.and_then(|slot| slot.copies().find(|group| group.refills(frames)))
+			.cloned()
+		{
+			let mut group = group::Producer::new(group::Info { sequence }, info, self.cache.clone());
+			group.bound(frames)?;
+			self.cap(&group.handle())?;
+			group.refill(target)?;
+			self.detach(&group.handle());
+			return Ok(group);
+		}
 		if self.covering_range(sequence, frames).is_some() {
 			return Err(Error::Duplicate);
 		}
@@ -5149,6 +5184,37 @@ impl kio::Task for Resolving {
 
 	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<Self::Output> {
 		self.poll_ok(waiter)
+	}
+}
+
+/// A reader's ask for frames its group shed under pressure, kept wanted while it reads them.
+pub(super) struct Refill(Box<fill::Join>);
+
+impl Refill {
+	/// Ask the track's fills for `frames` of group `sequence`, joining a fill that covers
+	/// them: `None` with no handler to serve them, or once the track is gone.
+	pub(super) fn ask(cache: &cache::Track, sequence: u64, frames: ops::Range<u64>) -> Option<Self> {
+		let fills = cache.track()?.read().fills.clone();
+		let request = FetchOptions {
+			options: group::Fetch {
+				frame_start: frames.start,
+				..Default::default()
+			},
+			// Exactly the hole: the frames past it are still cached.
+			end: Some(frames.end),
+		};
+		queue(&fills, sequence, &request).map(Self)
+	}
+
+	/// What became of it; `first` while the reader still waits on the frame it asked from.
+	pub(super) fn poll(&self, waiter: &kio::Waiter, sequence: u64, first: bool) -> group::Asked {
+		if self.0.poll_answered(waiter).is_pending() {
+			return group::Asked::Waiting;
+		}
+		match self.0.outcome().read().is_accepted(sequence) {
+			true => group::Asked::Accepted { first },
+			false => group::Asked::Refused,
+		}
 	}
 }
 
@@ -16655,8 +16721,12 @@ mod test {
 		producer.append_group().unwrap().finish().unwrap();
 		producer.append_group().unwrap().finish().unwrap();
 
+		// Still being written, so it sheds its frame rather than going whole.
 		assert!(
-			producer.consume().peek_group(0).is_none(),
+			producer
+				.consume()
+				.peek_group(0)
+				.is_none_or(|group| !group.holds_frames()),
 			"pre-accept backfill growth is reclaimed after accept"
 		);
 		assert!(pool.used() <= 13_000, "usage converges: {}", pool.used());
@@ -20718,8 +20788,9 @@ mod test {
 	fn canonical_content_preserves_individually_valid_disjoint_ranges() {
 		let producer = track_producer("test", Info::timed());
 		let mut live = producer.create_group(group::Info { sequence: 0 }).unwrap();
-		live.start_at(group::MAX_GROUP_FRAMES as u64).unwrap();
-		for _ in 0..group::MAX_GROUP_FRAMES {
+		const FRAMES: usize = 8192;
+		live.start_at(FRAMES as u64).unwrap();
+		for _ in 0..FRAMES {
 			live.write_frame(Timestamp::ZERO, bytes::Bytes::new()).unwrap();
 		}
 		let mut head = producer
@@ -20731,8 +20802,187 @@ mod test {
 			.unwrap();
 		head.write_frame(Timestamp::ZERO, bytes::Bytes::new()).unwrap();
 		head.finish().unwrap();
-		assert_eq!(live.handle().content().unwrap().cost().0, group::MAX_GROUP_FRAMES + 1);
-		assert_eq!(live.frame_count(), 2 * group::MAX_GROUP_FRAMES);
+		assert_eq!(live.handle().content().unwrap().cost().0, FRAMES + 1);
+		assert_eq!(live.frame_count(), 2 * FRAMES);
 		assert_eq!(head.frame_count(), 1);
+	}
+
+	/// A track caching into a pool of `capacity` bytes.
+	fn small_pool(capacity: u64) -> (Producer, cache::Pool) {
+		let pool = cache::Pool::new(cache::Config::default().with_capacity(capacity));
+		(track_producer_pooled("test", pool.clone()), pool)
+	}
+
+	/// Serve every queued fill from `archive`, every frame group 0 ever held, writing until
+	/// the fill's private end refuses the next, and return the frame ranges written.
+	fn serve_refills(requests: &Requests, archive: &[bytes::Bytes]) -> Vec<ops::Range<u64>> {
+		let mut served = Vec::new();
+		while let Poll::Ready(fill) = requests.poll_requested_fill(&kio::Waiter::noop()) {
+			let fill = fill.unwrap();
+			let mut group = fill.accept(0, None).unwrap();
+			let start = fill.frame_start(0);
+			let mut end = start;
+			for payload in &archive[start as usize..] {
+				match group.write_frame(Timestamp::ZERO, payload.clone()) {
+					Ok(()) => end += 1,
+					Err(Error::Closed) => break,
+					Err(err) => panic!("refill write: {err}"),
+				}
+			}
+			group.finish().unwrap();
+			served.push(start..end);
+		}
+		served
+	}
+
+	/// Frame `index` of the groups below: 16 KiB naming its index, so a 4 MiB pool holds
+	/// about 256 and settles its debt every 16 frames.
+	fn numbered(index: u32) -> bytes::Bytes {
+		bytes::Bytes::from(index.to_le_bytes().repeat(4096))
+	}
+
+	/// The pool the groups below cache into: about 256 frames.
+	const POOL: u64 = 4 * 1024 * 1024;
+
+	/// One live group grows past any fixed cap through a pool far smaller than it: its
+	/// front sheds, memory stays near the pool, a reader that keeps up reads every frame,
+	/// and with nothing to refill from, a late reader is `Evicted`.
+	#[test]
+	#[cfg(feature = "async")]
+	fn a_live_group_sheds_its_front_under_pressure() {
+		let (producer, pool) = small_pool(POOL);
+		let mut live = producer.create_group(group::Info { sequence: 0 }).unwrap();
+		let mut reader = live.consume();
+		let mut late = live.consume();
+		// 48 MiB, past the 32 MiB group budget there used to be.
+		for index in 0..3_000 {
+			live.write_frame(Timestamp::ZERO, numbered(index)).unwrap();
+			let frame = reader.read_frame().now_or_never().unwrap();
+			let frame = frame.unwrap_or_else(|err| panic!("frame {index}: {err}")).unwrap();
+			assert_eq!(frame.payload, numbered(index));
+			assert!(pool.used() < 2 * POOL, "frame {index}: {} bytes held", pool.used());
+		}
+		assert!(matches!(late.read_frame().now_or_never().unwrap(), Err(Error::Evicted)));
+		assert!(!live.is_aborted(), "shedding never ends the group");
+	}
+
+	/// A late reader refills the front pressure shed from the track's handler, in order, and
+	/// reaches the live tail without a gap, though the first hole is far larger than the pool
+	/// and its handler writes it all at once: each refill keeps the frame it was asked for,
+	/// so every ask starts past the last.
+	#[test]
+	#[cfg(feature = "async")]
+	fn a_late_reader_refills_the_shed_front() {
+		let (producer, pool) = small_pool(POOL);
+		let requests = producer.requests();
+		let mut live = producer.create_group(group::Info { sequence: 0 }).unwrap();
+		let mut late = live.consume();
+		let archive: Vec<_> = (0..2_000).map(numbered).collect();
+		for payload in &archive {
+			live.write_frame(Timestamp::ZERO, payload.clone()).unwrap();
+		}
+
+		let mut served = Vec::new();
+		let mut read = 0;
+		while read < archive.len() {
+			match late.read_frame().now_or_never() {
+				Some(frame) => {
+					assert_eq!(frame.unwrap().unwrap().payload, archive[read], "frame {read}");
+					read += 1;
+				}
+				None => {
+					let refills = serve_refills(&requests, &archive);
+					assert!(!refills.is_empty(), "stuck at frame {read}");
+					served.extend(refills);
+				}
+			}
+			assert!(pool.used() < 2 * POOL, "frame {read}: {} bytes held", pool.used());
+		}
+		assert_eq!(served[0].start, 0, "the front was shed");
+		assert!(served[0].end * 16 * 1024 > 4 * POOL, "the first hole outgrows the pool");
+		assert!(
+			served.windows(2).all(|pair| pair[0].start < pair[1].start),
+			"an ask never repeats: {served:?}"
+		);
+	}
+
+	/// A slow reader on a long live group in a small pool makes progress by refilling holes,
+	/// never by asking again for a frame it already had.
+	#[test]
+	#[cfg(feature = "async")]
+	fn a_slow_reader_refills_holes_without_refetching() {
+		let (producer, _pool) = small_pool(POOL);
+		let requests = producer.requests();
+		let mut live = producer.create_group(group::Info { sequence: 0 }).unwrap();
+		let mut slow = live.consume();
+		let mut archive = Vec::new();
+		let mut served = Vec::new();
+		let mut read = 0;
+		for index in 0..4_000 {
+			archive.push(numbered(index));
+			live.write_frame(Timestamp::ZERO, archive[index as usize].clone()).unwrap();
+			// One frame read for every four written.
+			if index % 4 != 0 {
+				continue;
+			}
+			loop {
+				if let Some(frame) = slow.read_frame().now_or_never() {
+					assert_eq!(frame.unwrap().unwrap().payload, archive[read]);
+					read += 1;
+					break;
+				}
+				let refills = serve_refills(&requests, &archive);
+				assert!(!refills.is_empty(), "stuck at frame {read}");
+				served.extend(refills);
+			}
+		}
+		assert_eq!(read, 1_000);
+		assert!(!served.is_empty(), "the reader fell behind the shed front");
+		assert!(
+			served.windows(2).all(|pair| pair[0].start < pair[1].start),
+			"an ask never repeats: {served:?}"
+		);
+	}
+
+	/// Readers waiting on the same shed frame share one refill.
+	#[test]
+	#[cfg(feature = "async")]
+	fn readers_at_one_hole_share_a_refill() {
+		let (producer, _pool) = small_pool(POOL);
+		let requests = producer.requests();
+		let mut live = producer.create_group(group::Info { sequence: 0 }).unwrap();
+		let (mut first, mut second) = (live.consume(), live.consume());
+		let archive: Vec<_> = (0..1_000).map(numbered).collect();
+		for payload in &archive {
+			live.write_frame(Timestamp::ZERO, payload.clone()).unwrap();
+		}
+		assert!(first.read_frame().now_or_never().is_none());
+		assert!(second.read_frame().now_or_never().is_none());
+		assert_eq!(serve_refills(&requests, &archive).len(), 1);
+		for reader in [&mut first, &mut second] {
+			let frame = reader.read_frame().now_or_never().unwrap().unwrap().unwrap();
+			assert_eq!(frame.payload, archive[0]);
+		}
+	}
+
+	/// A join onto a group whose first frame was shed asks for a new group on a track that
+	/// opts into refresh, rather than refilling a head the publisher may not have.
+	#[test]
+	fn a_join_past_a_shed_first_frame_wants_a_new_group() {
+		let pool = cache::Pool::new(cache::Config::default().with_capacity(256 * 1024));
+		let producer = Producer::new(
+			Arc::new(broadcast::Info {
+				pool,
+				..Default::default()
+			}),
+			"test",
+			Info::default().with_refresh(1_000_000),
+		);
+		let mut live = producer.append_group().unwrap();
+		for index in 0..1_000 {
+			live.write_frame(None, numbered(index)).unwrap();
+		}
+		let _subscriber = producer.subscribe(None);
+		assert_eq!(producer.demand().wanted(), Some(1));
 	}
 }

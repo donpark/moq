@@ -249,8 +249,8 @@ impl Stream {
 	///
 	/// A payload that cannot be written ends the track (see
 	/// [`moq_flate::stream::Producer::append`]) and retires the catalog entry with it. A payload
-	/// refused with [`moq_net::Error::GroupTooLarge`] or [`moq_net::Error::TimestampMismatch`] leaves
-	/// both intact, since nothing was written.
+	/// refused with [`moq_net::Error::FrameTooLarge`], [`moq_net::Error::GroupTooLarge`], or
+	/// [`moq_net::Error::TimestampMismatch`] leaves both intact, since nothing was written.
 	/// A catalog error publishing the measured bitrate is returned after the payload was written, so
 	/// the track stays open and a retry would duplicate it.
 	pub fn append(&mut self, payload: impl Into<Timed<Bytes>>) -> crate::Result<()> {
@@ -259,7 +259,11 @@ impl Stream {
 		let size = match self.inner.append(payload) {
 			Ok(size) => size,
 			// Refused before anything was written, so the log and its entry carry on.
-			Err(err @ moq_flate::Error::Net(moq_net::Error::GroupTooLarge | moq_net::Error::TimestampMismatch)) => {
+			Err(
+				err @ moq_flate::Error::Net(
+					moq_net::Error::FrameTooLarge | moq_net::Error::GroupTooLarge | moq_net::Error::TimestampMismatch,
+				),
+			) => {
 				return Err(err.into());
 			}
 			Err(err) => {
@@ -683,7 +687,7 @@ mod test {
 		assert_eq!(drain(consumer), expected);
 	}
 
-	/// A payload past the group budget is refused before anything is written, so the log stays
+	/// A payload past the frame budget is refused before anything is written, so the log stays
 	/// advertised and the next payload still lands.
 	#[test]
 	fn an_oversized_payload_keeps_the_track_and_the_entry() {
@@ -697,7 +701,7 @@ mod test {
 		assert!(matches!(
 			samples.append(oversized),
 			Err(crate::Error::Flate(moq_flate::Error::Net(
-				moq_net::Error::GroupTooLarge
+				moq_net::Error::FrameTooLarge
 			)))
 		));
 		assert!(catalog.snapshot().binary.tracks.contains_key("samples"));

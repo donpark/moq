@@ -53,7 +53,6 @@ impl<T> Pending<'_, T> {
 	/// Only call this once the write has actually succeeded.
 	pub fn commit(mut self) {
 		self.committed = true;
-		self.encoder.frames += 1;
 		self.encoder.bytes += self.charge;
 	}
 }
@@ -84,10 +83,9 @@ pub struct Encoder<T> {
 	/// consumer for the rest of the group, so encoding stops until the caller rolls a new one.
 	desynced: bool,
 
-	/// Frames and bytes committed to the current group, checked against moq-net's group budget
-	/// before each record is encoded. A compressed record is charged its plaintext (or its slice, if
-	/// larger), since a reader's DEFLATE window is held to the same budget.
-	frames: usize,
+	/// Bytes committed to the current compressed group, checked against the budget a reader's
+	/// DEFLATE window is held to ([`moq_net::group::MAX_CACHE_BYTES`]) before each record is
+	/// encoded. A record is charged its plaintext (or its slice, if larger).
 	bytes: u64,
 
 	_marker: PhantomData<fn(T)>,
@@ -100,7 +98,6 @@ impl<T> Encoder<T> {
 			flate: config.compression.is_deflate().then(moq_flate::Encoder::new),
 			compression: config.compression.is_deflate(),
 			desynced: false,
-			frames: 0,
 			bytes: 0,
 			_marker: PhantomData,
 		}
@@ -113,7 +110,6 @@ impl<T> Encoder<T> {
 	pub fn reset(&mut self) {
 		self.flate = self.compression.then(moq_flate::Encoder::new);
 		self.desynced = false;
-		self.frames = 0;
 		self.bytes = 0;
 	}
 
@@ -133,10 +129,11 @@ impl<T: Serialize> Encoder<T> {
 	/// [`commit`](Pending::commit)s. Errors with [`Error::Desync`] if a previous compressed record
 	/// was left uncommitted, since every frame after it would be undecodable.
 	///
-	/// Errors with [`moq_net::Error::GroupTooLarge`] if the record might not fit in what is left of
-	/// the group's budget ([`moq_net::group::MAX_CACHE_BYTES`] and
-	/// [`moq_net::group::MAX_GROUP_FRAMES`]), counting every record committed since the last
-	/// [`reset`](Self::reset). The refused record leaves the encoder untouched.
+	/// A plain record larger than one frame may be ([`moq_net::group::MAX_CACHE_BYTES`]) errors
+	/// with [`moq_net::Error::FrameTooLarge`]. A compressed one errors with
+	/// [`moq_net::Error::GroupTooLarge`] if it might not fit in what is left of that budget, which
+	/// a reader's DEFLATE window holds every record since the last [`reset`](Self::reset) to. The
+	/// refused record leaves the encoder untouched.
 	pub fn encode(&mut self, value: &T) -> Result<Pending<'_, T>> {
 		if self.desynced {
 			return Err(Error::Desync);
@@ -153,10 +150,12 @@ impl<T: Serialize> Encoder<T> {
 		} else {
 			size
 		};
-		if self.frames >= moq_net::group::MAX_GROUP_FRAMES
-			|| self.bytes.saturating_add(bound) > moq_net::group::MAX_CACHE_BYTES
-		{
-			return Err(moq_net::Error::GroupTooLarge.into());
+		match self.compression {
+			true if self.bytes.saturating_add(bound) > moq_net::group::MAX_CACHE_BYTES => {
+				return Err(moq_net::Error::GroupTooLarge.into());
+			}
+			false if size > moq_net::group::MAX_CACHE_BYTES => return Err(moq_net::Error::FrameTooLarge.into()),
+			_ => {}
 		}
 
 		let payload = match self.flate.as_mut() {

@@ -28,7 +28,6 @@ impl Producer {
 				track,
 				group: None,
 				flate: config.compression.is_deflate().then(crate::Encoder::new),
-				frames: 0,
 				bytes: 0,
 			})),
 		}
@@ -51,12 +50,12 @@ impl Producer {
 
 	/// Append one payload to the log.
 	///
-	/// A payload that might not fit in what is left of the group's budget is refused with
-	/// [`moq_net::Error::GroupTooLarge`] before anything is written, leaving the log intact. The
-	/// budget covers the whole log, so once it is spent every append is refused; a publisher with
-	/// more to say opens a new track. A timestamp whose presence doesn't match the track's timescale
-	/// is refused with [`moq_net::Error::TimestampMismatch`] the same way, so a corrected append
-	/// carries on.
+	/// A plain payload larger than a frame may be is refused with [`moq_net::Error::FrameTooLarge`]
+	/// before anything is written, leaving the log intact. A compressed log has a budget covering
+	/// the whole log, since every consumer's decoder holds every payload: a payload that might not
+	/// fit is refused with [`moq_net::Error::GroupTooLarge`] the same way, and once it is spent every
+	/// append is. A timestamp whose presence doesn't match the track's timescale is refused with
+	/// [`moq_net::Error::TimestampMismatch`] the same way, so a corrected append carries on.
 	///
 	/// Any other payload that cannot be written ends the track: a log missing a record is not the
 	/// lossless log this mode promises, so the failure is surfaced rather than papered over with a
@@ -93,10 +92,9 @@ struct Inner {
 	/// The DEFLATE encoder, one window for the whole group, `Some` while compressing.
 	flate: Option<crate::Encoder>,
 
-	/// Frames and bytes charged to the group, checked against moq-net's group budget before each
-	/// payload is encoded. A compressed payload is charged its inflated size (or its slice, if
-	/// larger), the budget every consumer's [`Decoder`](crate::Decoder) holds its window to.
-	frames: usize,
+	/// Bytes charged to a compressed group, checked before each payload is encoded against the
+	/// budget every consumer's [`Decoder`](crate::Decoder) holds its window to. A payload is charged
+	/// its inflated size (or its slice, if larger).
 	bytes: u64,
 }
 
@@ -127,10 +125,12 @@ impl Inner {
 		} else {
 			plain
 		};
-		if self.frames >= moq_net::group::MAX_GROUP_FRAMES
-			|| self.bytes.saturating_add(bound) > moq_net::group::MAX_CACHE_BYTES
-		{
-			return Err(moq_net::Error::GroupTooLarge.into());
+		match self.flate.is_some() {
+			true if self.bytes.saturating_add(bound) > moq_net::group::MAX_CACHE_BYTES => {
+				return Err(moq_net::Error::GroupTooLarge.into());
+			}
+			false if plain > moq_net::group::MAX_CACHE_BYTES => return Err(moq_net::Error::FrameTooLarge.into()),
+			_ => {}
 		}
 
 		// Open the group before compressing: a failure here must not leave the window ahead of a
@@ -147,7 +147,6 @@ impl Inner {
 		let size = payload.len();
 		let group = self.group.as_mut().expect("a group is open");
 		let Err(err) = group.write_frame(timestamp, payload) else {
-			self.frames += 1;
 			self.bytes += plain.max(size as u64);
 			return Ok(size);
 		};

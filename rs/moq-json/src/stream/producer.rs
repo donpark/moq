@@ -67,12 +67,12 @@ impl<T: Serialize> Producer<T> {
 
 	/// Append one record to the log.
 	///
-	/// A record that might not fit in what is left of the group's budget is refused with
-	/// [`moq_net::Error::GroupTooLarge`] before anything is written, leaving the log intact. The
-	/// budget covers the whole log, so once it is spent every append is refused; a publisher with
-	/// more to say opens a new track. A timestamp whose presence doesn't match the track's timescale
-	/// is refused with [`moq_net::Error::TimestampMismatch`] the same way, so a corrected append
-	/// carries on.
+	/// A plain record larger than a frame may be is refused with [`moq_net::Error::FrameTooLarge`]
+	/// before anything is written, leaving the log intact. A compressed log has a budget covering
+	/// the whole log, since a reader's DEFLATE window holds every record: a record that might not
+	/// fit is refused with [`moq_net::Error::GroupTooLarge`] the same way, and once it is spent every
+	/// append is. A timestamp whose presence doesn't match the track's timescale is refused with
+	/// [`moq_net::Error::TimestampMismatch`] the same way, so a corrected append carries on.
 	///
 	/// Any other failure ends the track. A log missing a record is not the lossless log a stream
 	/// promises, and that holds whether the group rejected the record or it never encoded at all, so
@@ -130,7 +130,9 @@ impl<T: Serialize> Inner<T> {
 		let record = match encoder.encode(payload.value) {
 			Ok(record) => record,
 			// Refused before encoding, so nothing is missing from the log and nothing desynced.
-			Err(err @ crate::Error::Net(moq_net::Error::GroupTooLarge)) => return Err(err),
+			Err(err @ crate::Error::Net(moq_net::Error::GroupTooLarge | moq_net::Error::FrameTooLarge)) => {
+				return Err(err);
+			}
 			Err(err) => {
 				// A record that can't be encoded is as lost as one the group rejects: the log is
 				// missing it either way, and carrying on would present that gap as a complete log.

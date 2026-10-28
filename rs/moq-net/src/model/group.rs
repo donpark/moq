@@ -24,7 +24,7 @@ use bytes::Bytes;
 pub(crate) use content::StorageBench;
 pub(super) use content::{Content, Contents, Key as ContentKey};
 use content::{Input, Spec};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::mem::MaybeUninit;
 use std::ops::RangeBounds;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,18 +33,14 @@ use std::task::{Poll, ready};
 
 use crate::{Error, IntoBytes, Result, StreamError, Timestamp};
 
-/// Maximum total size of frames held by one cached group copy.
+/// Maximum size of one frame: a larger declared size is [`Error::FrameTooLarge`] before
+/// allocating.
 ///
-/// A write that would exceed this aborts the group with [`Error::GroupTooLarge`].
-/// Doubles as the per-frame size cap: a larger declared size is [`Error::FrameTooLarge`]
-/// before allocating, so one maximum-size frame can fill a group.
+/// A plain group has no cap of its own: the cache pool sheds its front under pressure, and
+/// a reader refills what it missed. A compressed group still holds at most this many
+/// stored bytes, since a plain reader inflates from its first frame; a write past that
+/// aborts it with [`Error::GroupTooLarge`].
 pub const MAX_CACHE_BYTES: u64 = 32 * 1024 * 1024; // 32 MB
-
-/// Maximum number of frames held by one cached group copy.
-///
-/// 8192 is the largest legal cached copy; the 8193rd write returns [`Error::GroupTooLarge`]
-/// and aborts the group.
-pub const MAX_GROUP_FRAMES: usize = 8192;
 
 /// Heap one cached group costs beyond its frame payloads, excluding the track-side
 /// bookkeeping in [`track::CACHE_OVERHEAD`].
@@ -184,6 +180,30 @@ impl Entry {
 	}
 }
 
+/// A committed frame held below the log's first.
+struct Below {
+	entry: Entry,
+	// A reader took it, or it left the log, so pressure sheds it before the log's frames.
+	read: AtomicBool,
+	// The frame a refill was asked for: spared until read, so its reader always progresses.
+	pinned: bool,
+}
+
+/// Heap one [`Below`] frame costs beyond its payload, doubled like
+/// [`track::CACHE_OVERHEAD`] because a `BTreeMap` node runs half empty in the worst case.
+const BELOW_OVERHEAD: u64 = 2 * (size_of::<usize>() + size_of::<Below>()) as u64;
+
+/// What became of the refill a reader asked for the frames shed at its position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Asked {
+	/// Not answered yet.
+	Waiting,
+	/// Its source sends them; `first` when the reader still waits on the frame it asked from.
+	Accepted { first: bool },
+	/// Nothing serves them.
+	Refused,
+}
+
 /// The frames carried by one transport copy; `end` is exclusive, not the group's end.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Bounds {
@@ -200,8 +220,14 @@ pub(super) struct GroupState {
 	// [`Producer::start_at`]). Its end is one past the last frame fully written. Cursors
 	// read it without this state's lock. A compressed group stores DEFLATE slices here.
 	log: kio::log::Writer<Entry>,
-	// Frames adopted from `offset` up to the log's first (see [`Handle::adopt_head`]).
-	front: VecDeque<Entry>,
+	// Frames held below the log's first, by index: adopted from another copy's head (see
+	// [`Handle::adopt_head`]), or refilled after pressure shed them (see [`Self::shed`]).
+	// Anything in `offset..log.base()` missing from here was shed, and a reader refills it.
+	below: BTreeMap<usize, Below>,
+	// Refill copies still writing into `below`, which a reader at a hole waits out.
+	refills: usize,
+	// On a refill copy, the group it writes its frames into instead of holding them.
+	refill: Option<Box<Handle>>,
 	// IETF relay state, boxed so a group that never carries any pays one pointer.
 	relay: Option<Box<Relay>>,
 	// Compressed-track state, boxed so a plain group pays one pointer.
@@ -584,6 +610,8 @@ enum Source {
 		timestamp: Option<Timestamp>,
 		fields: Option<Arc<super::object::Fields>>,
 	},
+	/// Pressure shed the frame: refill it, through the hole's exclusive end.
+	Hole(usize),
 }
 
 /// The IETF header state that cannot be inferred from a plain frame list.
@@ -652,13 +680,182 @@ impl GroupState {
 
 	/// The committed frame at `index`, while this copy holds it.
 	fn entry(&self, index: usize) -> Option<&Entry> {
-		let index = index as u64;
-		if index < self.log.base() {
-			return self
-				.front
-				.get(usize::try_from(index.checked_sub(self.offset as u64)?).ok()?);
+		if (index as u64) < self.log.base() {
+			return self.below.get(&index).map(|below| &below.entry);
 		}
-		self.log.get(index)
+		self.log.get(index as u64)
+	}
+
+	/// Every committed frame held, in order, with its index.
+	fn held(&self) -> impl Iterator<Item = (usize, &Entry)> {
+		let below = self.below.iter().map(|(index, below)| (*index, &below.entry));
+		let log = (self.log.base() as usize..self.committed()).filter_map(|index| Some((index, self.entry(index)?)));
+		below.chain(log)
+	}
+
+	/// The first frame of the run held up to the last committed one.
+	fn held_start(&self) -> usize {
+		let mut start = self.log.base() as usize;
+		for index in self.below.range(..start).rev().map(|(index, _)| *index) {
+			if index + 1 != start {
+				break;
+			}
+			start = index;
+		}
+		start.max(self.offset)
+	}
+
+	/// The end of the run pressure shed at `index`, which a reader refills, if it was shed.
+	fn hole(&self, index: usize) -> Option<usize> {
+		let base = self.log.base() as usize;
+		if self.abort.is_some() || index < self.offset || index >= base || self.below.contains_key(&index) {
+			return None;
+		}
+		Some(self.below.range(index..).next().map_or(base, |(next, _)| *next))
+	}
+
+	/// Whether a reader at `index` is at a hole: `Ready(Some(end))` asks a refill of
+	/// `index..end`, `Pending` waits on the one `asked`, and [`Error::Evicted`] once none
+	/// serves it.
+	fn poll_hole(&self, index: usize, asked: Option<Asked>) -> Poll<Result<Option<usize>>> {
+		let Some(end) = self.hole(index) else {
+			return Poll::Ready(Ok(None));
+		};
+		match asked {
+			Some(Asked::Waiting) => Poll::Pending,
+			Some(Asked::Accepted { .. }) if self.refills > 0 => Poll::Pending,
+			// Its source finished without the frame it was asked for, or has none.
+			Some(Asked::Accepted { first: true } | Asked::Refused) => Poll::Ready(Err(Error::Evicted)),
+			// Shed again after it arrived: ask again from here.
+			None | Some(Asked::Accepted { first: false }) => Poll::Ready(Ok(Some(end))),
+		}
+	}
+
+	/// Record that a reader took the frames held below the log in `start..end`.
+	fn mark_read(&self, start: usize, end: usize) {
+		for below in self.below.range(start..end).map(|(_, below)| below) {
+			below.read.store(true, Ordering::Relaxed);
+		}
+	}
+
+	/// What holding `entry` charges beside the slot it sits in, and its fields' heap.
+	fn entry_bytes(&self, entry: &Entry) -> (u64, u64) {
+		let payload = entry.frame.payload.len() as u64;
+		let fields = entry.fields.as_ref().map_or(0, |fields| fields.heap());
+		(if self.content.is_none() { payload } else { 0 } + fields, fields)
+	}
+
+	/// Forget `entry`'s bytes, returning what that freed of the group's charge.
+	fn unhold(&mut self, entry: &Entry) -> u64 {
+		let (charged, fields) = self.entry_bytes(entry);
+		self.cache -= entry.frame.payload.len() as u64;
+		if let Some(relay) = &mut self.relay {
+			relay.bytes -= fields;
+		}
+		charged
+	}
+
+	/// Evict the log below `end`, releasing the frames' charge and any slots that frees,
+	/// and return the bytes freed.
+	fn evict_log(&mut self, end: usize) -> u64 {
+		let base = self.log.base() as usize;
+		let mut freed = 0;
+		for index in base..end.min(self.committed()) {
+			let entry = self.log.get(index as u64).expect("committed below the end").clone();
+			freed += self.unhold(&entry);
+		}
+		let heap = kio::log::Writer::<Entry>::HEAP;
+		let before = self.log.heap().max(heap);
+		self.log.evict(end as u64);
+		freed += (before - self.log.heap().max(heap)) as u64;
+		self.charge.sub(freed);
+		freed
+	}
+
+	/// Drop the frames held below the log that `shed` picks, lowest first or `last_first`,
+	/// toward `debt` and at most about `cap`, returning the bytes freed. A frame larger than
+	/// what is left of `debt` stays, and so does everything after it.
+	fn shed_below(&mut self, debt: u64, cap: u64, last_first: bool, shed: impl Fn(&Below) -> bool) -> u64 {
+		let mut freed = 0;
+		let mut picked: Vec<usize> = self
+			.below
+			.iter()
+			.filter(|(_, below)| shed(below))
+			.map(|(index, _)| *index)
+			.collect();
+		if last_first {
+			picked.reverse();
+		}
+		for index in picked {
+			let size = self.entry_bytes(&self.below[&index].entry).0 + BELOW_OVERHEAD;
+			if freed >= cap || size > debt - freed {
+				break;
+			}
+			let below = self.below.remove(&index).expect("picked above");
+			freed += self.unhold(&below.entry) + BELOW_OVERHEAD;
+		}
+		self.charge.sub(freed);
+		freed
+	}
+
+	/// Shed whole frames from the group's front toward `debt`, freeing at most about `cap`,
+	/// and return the bytes freed.
+	///
+	/// Frames a reader took go first, then the log's oldest segment, then refilled frames
+	/// nobody read yet, last first and sparing each refill's asked-for frame. So a refill
+	/// outlives the frames after it until its reader takes it, and never evicts what that
+	/// reader needs next before it gets there, without pinning anything else: a refill
+	/// larger than the pool keeps the part its reader reaches first. A victim larger than
+	/// what is left of `debt` stays, carrying the debt over, as a whole group does. A
+	/// compressed group sheds nothing: a plain reader inflates from its first frame.
+	fn shed(&mut self, debt: u64, cap: u64) -> u64 {
+		if self.flate.is_some() || self.abort.is_some() {
+			return 0;
+		}
+		let mut freed = self.shed_below(debt, cap, false, |below| below.read.load(Ordering::Relaxed));
+		while freed < cap
+			&& let Some(end) = self.log.segment_end()
+		{
+			let (base, end) = (self.log.base() as usize, end as usize);
+			// An open group keeps its newest frame for the reader about to take it, below the
+			// log once its segment goes.
+			let keep = (self.fin.is_none() && end == self.committed()).then(|| end - 1);
+			let shed_end = keep.unwrap_or(end);
+			if shed_end == base {
+				break;
+			}
+			let size: u64 = (base..shed_end)
+				.filter_map(|index| self.entry(index))
+				.map(|entry| self.entry_bytes(entry).0)
+				.sum();
+			if size > debt - freed {
+				return freed;
+			}
+			let kept = keep.and_then(|index| Some((index, self.entry(index)?.clone())));
+			freed += self.evict_log(end);
+			if let Some((index, entry)) = kept {
+				let (bytes, _) = self.entry_bytes(&entry);
+				self.cache += entry.frame.payload.len() as u64;
+				if let Some(fields) = &entry.fields {
+					self.relay().bytes += fields.heap();
+				}
+				self.charge.add(bytes + BELOW_OVERHEAD);
+				freed = freed.saturating_sub(bytes + BELOW_OVERHEAD);
+				// Older than every frame left in the log, so it goes before them.
+				let below = Below {
+					entry,
+					read: AtomicBool::new(true),
+					pinned: false,
+				};
+				self.below.insert(index, below);
+			}
+		}
+		if freed < cap && freed < debt {
+			freed += self.shed_below(debt - freed, cap - freed, true, |below| {
+				!below.pinned && !below.read.load(Ordering::Relaxed)
+			});
+		}
+		freed
 	}
 
 	/// The committed frames held in `start..end`, in order.
@@ -668,7 +865,7 @@ impl GroupState {
 
 	/// Whether this copy holds no committed frame.
 	fn is_empty(&self) -> bool {
-		self.front.is_empty() && self.log.base() == self.log.end()
+		self.below.is_empty() && self.log.base() == self.log.end()
 	}
 
 	/// Append a completed frame, returning the slot growth it charged.
@@ -717,8 +914,8 @@ impl GroupState {
 			return stats::Content::default();
 		}
 
-		let mut bytes = self
-			.entries(start, end)
+		let mut bytes = (start..end.min(self.committed()))
+			.filter_map(|index| self.entry(index))
 			.map(|entry| entry.frame.payload.len() as u64)
 			.sum();
 		let committed = self.committed();
@@ -774,7 +971,10 @@ impl GroupState {
 	///
 	/// A compressed group hands a plain reader each frame whole once it completes, as the
 	/// slices to inflate, and a `raw` one the stored slice, streaming one still arriving.
-	fn poll_frame_source(&self, index: usize, raw: bool) -> Poll<Result<Option<Source>>> {
+	///
+	/// A frame pressure shed is a [`Source::Hole`] for the reader to refill, unless it
+	/// `asked` for one already (see [`Self::poll_hole`]).
+	fn poll_frame_source(&self, index: usize, raw: bool, asked: Option<Asked>) -> Poll<Result<Option<Source>>> {
 		if index < self.offset {
 			return Poll::Ready(Err(Error::Lagged));
 		}
@@ -782,6 +982,7 @@ impl GroupState {
 			// A frame read is a cache access: stamp it so expiry and the eviction
 			// walk spare a group a consumer is actively draining.
 			self.charge.refresh();
+			self.mark_read(index, index + 1);
 			if let Some(flate) = self.flate.as_ref().filter(|_| !raw) {
 				return Poll::Ready(Ok(Some(Source::Inflate {
 					job: self.inflate(flate, index)?,
@@ -811,6 +1012,9 @@ impl GroupState {
 				},
 				frame::Source::Partial(p.buf.clone()),
 			))));
+		}
+		if let Some(end) = ready!(self.poll_hole(index, asked))? {
+			return Poll::Ready(Ok(Some(Source::Hole(end))));
 		}
 		ready!(self.poll_terminal(index))?;
 		Poll::Ready(Ok(None))
@@ -883,10 +1087,12 @@ impl GroupState {
 		};
 	}
 
-	/// Whether adding `extra_frames` totaling `extra_bytes` would exceed the group budget.
-	fn would_overflow(&self, extra_frames: usize, extra_bytes: u64) -> bool {
-		self.next_index.saturating_sub(self.offset).saturating_add(extra_frames) > MAX_GROUP_FRAMES
-			|| self
+	/// Whether adding `extra_bytes` would exceed a compressed group's budget. A plain group
+	/// has none: pressure sheds its front instead (see [`Self::shed`]), but a plain reader
+	/// of a compressed group inflates from its first frame, so that group holds every one.
+	fn would_overflow(&self, extra_bytes: u64) -> bool {
+		self.flate.is_some()
+			&& self
 				.cache
 				.saturating_add(self.relay.as_ref().map_or(0, |relay| relay.bytes))
 				.saturating_add(extra_bytes)
@@ -985,11 +1191,13 @@ impl GroupState {
 		if self.is_empty() || self.sparse() {
 			return None;
 		}
+		// Only the run up to the tail: frames refilled below a hole lend nothing.
+		let start = self.held_start();
 		Some(Head {
 			content: self.content.clone(),
-			start: self.offset,
-			first_object: self.first_object(),
-			entries: self.entries(self.offset, self.committed()).cloned().collect(),
+			start,
+			first_object: start == self.offset && self.first_object(),
+			entries: self.entries(start, self.committed()).cloned().collect(),
 			compressed: self.flate.is_some(),
 		})
 	}
@@ -1011,7 +1219,7 @@ impl GroupState {
 		if let Some(flate) = &mut self.flate {
 			flate.release(self.abort.clone().unwrap_or(Error::Dropped), shared);
 		}
-		self.front = VecDeque::new();
+		self.below = BTreeMap::new();
 		self.log.evict(self.log.end());
 		self.partial = None;
 		if let Some(content) = self.content.take() {
@@ -1245,7 +1453,7 @@ impl Producer {
 			return Err(Error::MalformedTrack);
 		}
 		let bytes = fields.heap();
-		if state.would_overflow(0, bytes) {
+		if state.would_overflow(bytes) {
 			return Err(Error::GroupTooLarge);
 		}
 		state.charge.add(bytes);
@@ -1383,6 +1591,21 @@ impl Producer {
 		Ok(())
 	}
 
+	/// Write this copy's frames into the holes `target` shed as they commit, rather than
+	/// holding them here, before the copy is published.
+	pub(super) fn refill(&mut self, target: Handle) -> Result<()> {
+		modify(&target.state)?.refills += 1;
+		let mut state = match modify(&self.handle.state) {
+			Ok(state) => state,
+			Err(err) => {
+				target.refill_closed();
+				return Err(err);
+			}
+		};
+		state.refill = Some(Box::new(target));
+		Ok(())
+	}
+
 	/// A helper method to write a frame from a single byte buffer.
 	///
 	/// If you want to write multiple chunks, use [Self::create_frame] to get a frame producer.
@@ -1420,7 +1643,7 @@ impl Producer {
 			None => payload,
 		};
 		let size = payload.len() as u64;
-		if state.would_overflow(1, size) || state.inflated_overflow(inflated) {
+		if state.would_overflow(size) || state.inflated_overflow(inflated) {
 			return Err(self.abort_too_large(state));
 		}
 		let inflated = if state.flate.is_some() { inflated } else { 0 };
@@ -1452,6 +1675,7 @@ impl Producer {
 		}
 		drop(track);
 		self.handle.start(producer);
+		self.handle.forward();
 
 		// With the group lock released (lock order is track then group), settle
 		// eviction debt if enough has been written since the track last paid.
@@ -1518,7 +1742,7 @@ impl Producer {
 			true => deflated.iter().map(|slice| slice.len() as u64).sum(),
 			false => bytes,
 		};
-		if state.would_overflow(count, stored) || state.inflated_overflow(bytes) {
+		if state.would_overflow(stored) || state.inflated_overflow(bytes) {
 			return Err(self.abort_too_large(state));
 		}
 
@@ -1578,6 +1802,7 @@ impl Producer {
 		drop(track);
 		if count > 0 {
 			self.handle.start(producer);
+			self.handle.forward();
 		}
 
 		self.handle.cache.settle(now);
@@ -1670,7 +1895,7 @@ impl Producer {
 		// Only one frame is ever in flight, so the declared size is the most the cache
 		// can grow by before the next check.
 		let metadata_bytes = header.fields.as_ref().map_or(0, |fields| fields.heap());
-		if state.would_overflow(1, frame.size.saturating_add(metadata_bytes)) || state.inflated_overflow(inflated) {
+		if state.would_overflow(frame.size.saturating_add(metadata_bytes)) || state.inflated_overflow(inflated) {
 			return Err(self.abort_too_large(state));
 		}
 		if let (Some(flate), Some(inflated)) = (&mut state.flate, header.inflated) {
@@ -1790,7 +2015,7 @@ impl Producer {
 			flate.inflated += inflated;
 			let size = frame.payload.len() as u64;
 			// The frame already counts against the group's frames.
-			if state.would_overflow(0, size) {
+			if state.would_overflow(size) {
 				return Err(self.abort_too_large(state));
 			}
 			state.cache += size;
@@ -1826,6 +2051,7 @@ impl Producer {
 		);
 		self.advance_largest(&state);
 		drop(state);
+		self.handle.forward();
 
 		// With the group lock released (lock order is track then group), settle
 		// eviction debt and age idle content out, reusing the tick above.
@@ -1861,7 +2087,11 @@ impl Producer {
 		if let Some(flate) = &mut state.flate {
 			flate.finish(original_fin);
 		}
+		let refill = state.refill.take();
 		drop(state);
+		if let Some(target) = refill {
+			target.refill_closed();
+		}
 		// An empty group counts as content once it ends.
 		self.handle.start(None);
 		// A finished group can no longer raise the track's largest, which may end its stream.
@@ -1980,8 +2210,8 @@ impl Handle {
 		content.attach(&state.charge);
 		state.content = Some(content.clone());
 		let loaded = (|| -> Result<()> {
-			let entries: Vec<_> = state.entries(state.offset, state.committed()).cloned().collect();
-			for (index, entry) in (state.offset..).zip(entries) {
+			let entries: Vec<_> = state.held().map(|(index, entry)| (index, entry.clone())).collect();
+			for (index, entry) in entries {
 				let key = Content::key(index, entry.fields.as_deref(), state.wire().is_some());
 				let transferred = state.charge.transfer(entry.frame.payload.len() as u64);
 				let shared = content.row(
@@ -2066,6 +2296,91 @@ impl Handle {
 			+ state.partial.as_ref().map_or(0, |partial| partial.buf.view_size())
 	}
 
+	/// Whether a copy of `frames` would fill frames this group shed, so it refills them in
+	/// place rather than caching a copy of its own.
+	pub(super) fn refills(&self, frames: Bounds) -> bool {
+		let state = self.state.read();
+		let base = state.log.base() as usize;
+		let Ok(start) = usize::try_from(frames.start) else {
+			return false;
+		};
+		let end = frames.end.map_or(base, |end| usize::try_from(end).unwrap_or(usize::MAX).min(base));
+		let mut index = start.max(state.offset);
+		while index < end {
+			match state.hole(index) {
+				Some(_) => return true,
+				None => index += 1,
+			}
+		}
+		false
+	}
+
+	/// Shed whole frames from the front toward `debt`, freeing at most about `cap`, and
+	/// return the bytes freed: see [`GroupState::shed`]. Takes the group's lock, under the
+	/// track's.
+	pub(super) fn shed(&self, debt: u64, cap: u64) -> u64 {
+		let Ok(mut state) = self.state.write() else {
+			return 0;
+		};
+		state.shed(debt, cap)
+	}
+
+	/// Take a refill's `entries`, numbered from `start`, into the holes they fill, sparing
+	/// `pin`, the frame it was asked for, until a reader takes it.
+	fn adopt_refill(&self, start: usize, entries: Vec<Entry>, pin: usize) {
+		let Ok(mut state) = self.state.write() else {
+			return;
+		};
+		let mut charged = 0;
+		for (index, mut entry) in (start..).zip(entries) {
+			if state.hole(index).is_none() || state.canonicalize(index, &mut entry).is_err() {
+				continue;
+			}
+			let (bytes, fields) = state.entry_bytes(&entry);
+			state.cache += entry.frame.payload.len() as u64;
+			if fields > 0 {
+				state.relay().bytes += fields;
+			}
+			charged += bytes + BELOW_OVERHEAD;
+			let below = Below {
+				entry,
+				read: AtomicBool::new(false),
+				pinned: index == pin,
+			};
+			state.below.insert(index, below);
+		}
+		let now = state.charge.add(charged);
+		drop(state);
+		self.cache.settle(now);
+	}
+
+	/// A refill copy writing into this group closed, so a reader at a hole it left stops
+	/// waiting on it.
+	fn refill_closed(&self) {
+		if let Ok(mut state) = self.state.write() {
+			state.refills -= 1;
+		}
+	}
+
+	/// On a refill copy, move the frames it committed into the group it fills.
+	fn forward(&self) {
+		let Ok(mut state) = self.state.write() else {
+			return;
+		};
+		let Some(target) = state.refill.clone() else {
+			return;
+		};
+		let (start, end) = (state.log.base() as usize, state.committed());
+		if start >= end {
+			return;
+		}
+		let entries = state.entries(start, end).cloned().collect();
+		state.evict_log(end);
+		let pin = state.offset;
+		drop(state);
+		target.adopt_refill(start, entries, pin);
+	}
+
 	/// Adopt the frames of `head` below where this copy starts, so it holds the group
 	/// from `head`'s start, as if this route had delivered them.
 	///
@@ -2094,7 +2409,7 @@ impl Handle {
 		let inflated: u64 = entries.iter().map(|entry| entry.inflated).sum();
 		// The in-flight frame's remainder was admitted at its open and is charged as it
 		// streams in, without another check.
-		if state.would_overflow(count, payload + metadata + state.unwritten()) || state.inflated_overflow(inflated) {
+		if state.would_overflow(payload + metadata + state.unwritten()) || state.inflated_overflow(inflated) {
 			return;
 		}
 		let mut adopted = Vec::with_capacity(count);
@@ -2110,12 +2425,14 @@ impl Handle {
 		}
 
 		// Below the log's first frame, so these never enter it: readers find them here.
-		let before = state.front.capacity();
-		state.front.reserve(count);
-		let growth = ((state.front.capacity() - before) * size_of::<Entry>()) as u64;
-
-		for entry in adopted.into_iter().rev() {
-			state.front.push_front(entry);
+		let growth = count as u64 * BELOW_OVERHEAD;
+		for (index, entry) in (head.start..).zip(adopted) {
+			let below = Below {
+				entry,
+				read: AtomicBool::new(false),
+				pinned: false,
+			};
+			state.below.insert(index, below);
 		}
 		if metadata > 0 {
 			state.relay().bytes += metadata;
@@ -2230,8 +2547,12 @@ impl Handle {
 		}
 		guard.abort = Some(err);
 		self.alive.aborted.store(true, Ordering::Release);
+		let refill = guard.refill.take();
 		guard.release(salvage);
 		guard.close();
+		if let Some(target) = refill {
+			target.refill_closed();
+		}
 		self.cache.aborted(self.sequence, cut);
 	}
 
@@ -2440,8 +2761,10 @@ impl Handle {
 		if state.offset != 0 {
 			return false;
 		}
+		// Pressure shed its first frame, so a joiner would refill or fail: ask for a new
+		// group instead, as if past the ratio.
 		let Some(first) = state.entry(0) else {
-			return false;
+			return state.hole(0).is_some();
 		};
 		let first = first.frame.payload.len() as u64;
 		state.cache.saturating_sub(first) > first.saturating_mul(ratio.into())
@@ -2503,6 +2826,8 @@ impl Handle {
 				cache: self.cache.clone(),
 				access: self.alive.access.clone(),
 				refreshed: self.cache.pool().now(),
+				sequence: self.info.sequence,
+				refill: None,
 			},
 			// Untagged: a tagged track attaches the egress meter via `with_meter`
 			// when it hands the consumer to a subscriber/fetch.
@@ -2959,6 +3284,18 @@ struct Cursor {
 	cache: Arc<cache::Track>,
 	access: Arc<cache::Access>,
 	refreshed: u64,
+
+	// The group's sequence, which a refill asks its track's fills for.
+	sequence: u64,
+	// The refill this cursor asked for frames pressure shed, held while it reads them.
+	refill: Option<Refill>,
+}
+
+/// A cursor's ask for the frames shed at `start..end`, kept wanted while it reads them.
+struct Refill {
+	start: usize,
+	end: usize,
+	ask: track::Refill,
 }
 
 impl Clone for Cursor {
@@ -2976,6 +3313,9 @@ impl Clone for Cursor {
 			cache: self.cache.clone(),
 			access: self.access.clone(),
 			refreshed: self.refreshed,
+			sequence: self.sequence,
+			// A clone asks a refill of its own if it reaches a hole.
+			refill: None,
 		}
 	}
 }
@@ -3032,6 +3372,12 @@ impl Consumer {
 	}
 
 	/// The index of the first frame the group holds (see [`Producer::start_at`]).
+	/// Whether the group still holds a committed frame.
+	#[cfg(test)]
+	pub(super) fn holds_frames(&self) -> bool {
+		!self.cursor.state.read().is_empty()
+	}
+
 	pub(crate) fn first_frame(&self) -> u64 {
 		self.cursor.state.read().offset as u64
 	}
@@ -3542,6 +3888,28 @@ impl Cursor {
 		})
 	}
 
+	/// What became of the refill this cursor asked covering `index`, dropping one it read
+	/// past.
+	fn asked(&mut self, waiter: &kio::Waiter, index: usize) -> Option<Asked> {
+		let Some(refill) = self.refill.as_ref().filter(|refill| (refill.start..refill.end).contains(&index)) else {
+			self.refill = None;
+			return None;
+		};
+		Some(refill.ask.poll(waiter, self.sequence, index == refill.start))
+	}
+
+	/// Ask a refill of the frames shed at `index..end`, or [`Error::Evicted`] with nothing
+	/// to serve it.
+	fn ask(&mut self, index: usize, end: usize) -> Result<()> {
+		let ask = track::Refill::ask(&self.cache, self.sequence, index as u64..end as u64).ok_or(Error::Evicted)?;
+		self.refill = Some(Refill {
+			start: index,
+			end,
+			ask,
+		});
+		Ok(())
+	}
+
 	/// Whether the cursor has passed the `end_at` cap.
 	fn capped(&self) -> bool {
 		self.end.is_some_and(|end| self.index >= end)
@@ -3620,8 +3988,9 @@ impl Cursor {
 				self.refresh_if_stale();
 				read
 			}
-			None => match ready!(self.poll(waiter, |state| state.poll_frame_source(index, raw))?) {
+			None => match ready!(self.poll_source(waiter, index))? {
 				None => return Poll::Ready(Ok(None)),
+				Some(Source::Hole(_)) => unreachable!("asked by poll_source"),
 				Some(Source::Ready(info, source)) => (info, source),
 				// Inflated with the group's guard released.
 				Some(Source::Inflate {
@@ -3655,6 +4024,19 @@ impl Cursor {
 			Some(expiry) => frame.with_expiry(expiry.for_frame(self.index..end, true)),
 			None => frame,
 		})))
+	}
+
+	/// Resolve the frame at `index` under the group's guard, asking a refill for a frame
+	/// pressure shed and waiting on it.
+	fn poll_source(&mut self, waiter: &kio::Waiter, index: usize) -> Poll<Result<Option<Source>>> {
+		let raw = self.raw;
+		loop {
+			let asked = self.asked(waiter, index);
+			match ready!(self.poll(waiter, |state| state.poll_frame_source(index, raw, asked)))? {
+				Some(Source::Hole(end)) => self.ask(index, end)?,
+				source => return Poll::Ready(Ok(source)),
+			}
+		}
 	}
 
 	fn poll_read_frame<T>(
@@ -3694,33 +4076,46 @@ impl Cursor {
 		// Nothing committed at `index` in the log: refill under a single lock, registering
 		// the waiter if nothing is ready. Borrow the two fields disjointly so the closure
 		// can fill.
-		let prefetch = &mut self.prefetch;
 		let raw = self.raw;
-		let res = self.state.poll(waiter, |state| {
-			if index < state.offset {
-				return Poll::Ready(Err(Error::Lagged));
+		let res = loop {
+			let asked = self.asked(waiter, index);
+			let prefetch = &mut self.prefetch;
+			let polled = match self.state.poll(waiter, |state| {
+				if index < state.offset {
+					return Poll::Ready(Err(Error::Lagged));
+				}
+				// Frames committed since the log was read, or held below it. `fill` always
+				// resets the batch, so an empty one leaves `len == 0` and the checks below
+				// resolve a hole, or abort/fin/pending.
+				let job = prefetch.fill(state, index, budget, raw)?;
+				if prefetch.len > 0 {
+					// One stamp covers the whole batch: frames popped from the prefetch
+					// don't re-stamp until the next refill, which `CAP` bounds.
+					state.charge.refresh();
+					state.mark_read(index, index + prefetch.len);
+					return Poll::Ready(Ok(Ok(job)));
+				}
+				// Shed by pressure: refill it.
+				if let Some(end) = ready!(state.poll_hole(index, asked))? {
+					return Poll::Ready(Ok(Err(end)));
+				}
+				// Nothing completed at `index`: an in-flight tail waits, otherwise resolve
+				// the terminal state (whole-frame reads never stream the partial).
+				state.poll_terminal(index).map_ok(|()| Ok(None))
+			}) {
+				Poll::Ready(Ok(got)) => got,
+				Poll::Ready(Err(state)) => Err(state.abort.clone().unwrap_or(Error::Dropped)),
+				Poll::Pending => return Poll::Pending,
+			};
+			match polled? {
+				Err(end) => self.ask(index, end)?,
+				Ok(job) => break job,
 			}
-			// Frames committed since the log was read, or adopted below it. `fill` always
-			// resets the batch, so an empty one leaves `len == 0` and the terminal checks
-			// below resolve abort/fin/pending.
-			let job = prefetch.fill(state, index, budget, raw)?;
-			if prefetch.len > 0 {
-				// One stamp covers the whole batch: frames popped from the prefetch
-				// don't re-stamp until the next refill, which `CAP` bounds.
-				state.charge.refresh();
-				return Poll::Ready(Ok(job));
-			}
-			// Nothing completed at `index`: an in-flight tail waits, otherwise resolve
-			// the terminal state (whole-frame reads never stream the partial).
-			state.poll_terminal(index).map_ok(|()| None)
-		});
+		};
 
-		match ready!(res) {
-			// Inflated with the group's guard released. Only a group from frame 0 inflates.
-			Ok(Ok(Some(job))) => self.prefetch.inflate(&job, index, stats)?,
-			Ok(Ok(None)) => {}
-			Ok(Err(err)) => return Poll::Ready(Err(err)),
-			Err(state) => return Poll::Ready(Err(state.abort.clone().unwrap_or(Error::Dropped))),
+		// Inflated with the group's guard released. Only a group from frame 0 inflates.
+		if let Some(job) = res {
+			self.prefetch.inflate(&job, index, stats)?;
 		}
 
 		// The refill already updated the eviction rank under the group lock.
@@ -4385,13 +4780,12 @@ mod test {
 		assert_eq!(pool.used(), 0);
 	}
 
-	/// The in-flight frame's unwritten remainder counts against the group budget, so an
-	/// adoption cannot take the group past it once the frame finishes streaming.
+	/// The in-flight frame's unwritten remainder counts against a compressed group's budget,
+	/// so an adoption cannot take the group past it once the frame finishes streaming.
 	#[test]
 	fn an_open_frame_reserves_its_remainder_from_adoption() {
 		let pool = cache::Pool::unbounded();
-		let cache = cache::Track::new(pool, Default::default(), kio::Weak::new());
-		let mut tail = Producer::new(Info::from(0u64), track::Info::default(), cache);
+		let mut tail = compressed_group(&pool);
 		tail.start_at(1).unwrap();
 		let adopter = tail.handle();
 		let _frame = tail
@@ -4404,8 +4798,8 @@ mod test {
 			content: None,
 			start: 0,
 			first_object: true,
-			entries: vec![Entry::plain(Frame::new(None, Bytes::from_static(b"ab")).into(), 0)],
-			compressed: false,
+			entries: vec![Entry::plain(Frame::new(None, Bytes::from_static(b"ab")).into(), 2)],
+			compressed: true,
 		};
 		adopter.adopt_head(&head);
 		assert_eq!(
@@ -4591,56 +4985,44 @@ mod test {
 		assert_eq!(frame.size, 4);
 	}
 
+	/// A compressed group still holds every stored byte for its plain readers, so a frame
+	/// declared past that budget aborts it, and its readers see why.
 	#[test]
 	#[cfg(feature = "async")]
-	fn overflow_aborts_the_group() {
-		let mut producer = Info { sequence: 0 }.produce();
+	fn a_compressed_overflow_aborts_the_group() {
+		let pool = cache::Pool::unbounded();
+		let mut producer = compressed_group(&pool);
 		let mut consumer = producer.consume();
+		producer.write_frame(None, Bytes::from_static(b"x")).unwrap();
+		let frame = frame::Info {
+			size: MAX_CACHE_BYTES,
+			timestamp: None,
+		};
+		assert!(matches!(producer.create_frame(frame), Err(Error::GroupTooLarge)));
 
-		let big = Bytes::from(vec![0u8; MAX_CACHE_BYTES as usize]);
-		producer.write_frame(Timestamp::ZERO, big.clone()).unwrap();
+		let state = consumer.cursor.state.read();
+		assert!(matches!(state.abort, Some(Error::GroupTooLarge)));
+		assert!(state.is_empty());
+		drop(state);
 		assert!(matches!(
-			producer.write_frame(Timestamp::ZERO, big),
+			consumer.next_frame().now_or_never().unwrap(),
 			Err(Error::GroupTooLarge)
 		));
-
-		{
-			let state = producer.handle.state.read();
-			assert!(matches!(state.abort, Some(Error::GroupTooLarge)));
-			assert!(state.is_empty());
-			assert_eq!(state.offset, 0);
-		}
-
-		let result = consumer.next_frame().now_or_never().unwrap();
-		assert!(matches!(result, Err(Error::GroupTooLarge)));
 	}
 
+	/// A plain group has no frame or byte cap: an unbounded pool holds every frame.
 	#[test]
-	fn no_overflow_under_budget() {
+	fn a_plain_group_has_no_cap() {
 		let mut producer = Info { sequence: 0 }.produce();
-		// 8192 one-byte frames is the largest legal group; they all stay cached.
-		for _ in 0..MAX_GROUP_FRAMES {
+		for _ in 0..10_000 {
 			producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"x")).unwrap();
 		}
+		producer.write_frame(Timestamp::ZERO, vec![0u8; MAX_CACHE_BYTES as usize]).unwrap();
 		producer.finish().unwrap();
 
 		let state = producer.handle.state.read();
-		assert_eq!(state.offset, 0);
-		assert_eq!(state.entries(0, usize::MAX).count(), MAX_GROUP_FRAMES);
+		assert_eq!(state.entries(0, usize::MAX).count(), 10_001);
 		assert!(state.abort.is_none());
-	}
-
-	#[test]
-	fn writer_sees_group_too_large_on_the_8193rd_frame() {
-		let mut producer = Info { sequence: 0 }.produce();
-		for _ in 0..MAX_GROUP_FRAMES {
-			producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"x")).unwrap();
-		}
-		assert!(matches!(
-			producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"x")),
-			Err(Error::GroupTooLarge)
-		));
-		assert!(matches!(producer.handle.state.read().abort, Some(Error::GroupTooLarge)));
 	}
 
 	#[test]
@@ -4831,15 +5213,16 @@ mod test {
 	#[test]
 	#[cfg(feature = "async")]
 	fn finished_reports_a_group_too_large() {
-		let mut producer = Info { sequence: 0 }.produce();
+		let pool = cache::Pool::unbounded();
+		let mut producer = compressed_group(&pool);
 		let mut consumer = producer.consume();
 
-		let big = Bytes::from(vec![0u8; MAX_CACHE_BYTES as usize]);
-		producer.write_frame(Timestamp::ZERO, big.clone()).unwrap();
-		assert!(matches!(
-			producer.write_frame(Timestamp::ZERO, big),
-			Err(Error::GroupTooLarge)
-		));
+		producer.write_frame(None, Bytes::from_static(b"x")).unwrap();
+		let frame = frame::Info {
+			size: MAX_CACHE_BYTES,
+			timestamp: None,
+		};
+		assert!(matches!(producer.create_frame(frame), Err(Error::GroupTooLarge)));
 
 		assert!(matches!(
 			consumer.finished().now_or_never().unwrap(),

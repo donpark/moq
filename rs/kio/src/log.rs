@@ -267,6 +267,17 @@ impl<T: Send + Sync + 'static> Writer<T> {
 		self.heap + list
 	}
 
+	/// One past the last entry of the oldest segment still holding one: the least
+	/// [`Self::evict`] that frees memory. `None` when every entry was evicted.
+	pub fn segment_end(&self) -> Option<u64> {
+		if self.base() == self.end() {
+			return None;
+		}
+		// SAFETY: the writer's segments are live.
+		let oldest = unsafe { self.segments.first()?.as_ref() };
+		Some(oldest.start + oldest.filled.load(Ordering::Relaxed) as u64)
+	}
+
 	/// Allocate the slot the next entry goes into, if there is none, without publishing
 	/// anything.
 	pub fn reserve(&mut self) {
@@ -756,6 +767,29 @@ mod test {
 			assert_eq!(get(reader, 2), Ok(Some(2)));
 			assert_eq!(get(reader, 3), Ok(Some(3)));
 		}
+	}
+
+	/// `segment_end` names the least eviction that retires a segment, mid-segment too,
+	/// down to the tail's last entry and nothing once every entry is gone.
+	#[test]
+	fn segment_end_retires_the_oldest_segment() {
+		let mut writer = Writer::new(0);
+		assert_eq!(writer.segment_end(), None);
+		for i in 0..5u64 {
+			writer.push(i);
+		}
+		// Segments of 1, 2, and 4 slots, the last holding entries 3 and 4.
+		assert_eq!(writer.segment_end(), Some(1));
+		writer.evict(2);
+		assert_eq!(writer.segment_end(), Some(3), "a partly evicted segment still holds entry 2");
+		let heap = writer.heap();
+		writer.evict(3);
+		assert!(writer.heap() < heap, "evicting to it frees the segment");
+		assert_eq!(writer.segment_end(), Some(5), "the tail ends at its last entry");
+		writer.evict(5);
+		assert_eq!(writer.segment_end(), None);
+		writer.reserve();
+		assert_eq!(writer.segment_end(), None, "a reserved slot holds no entry");
 	}
 
 	/// Evicting past the end skips those indices: the next entry lands at the new base.

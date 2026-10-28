@@ -13,20 +13,18 @@
 //!
 //! # Budget
 //!
-//! That single group is what bounds the log. moq-net caps a group at
-//! [`MAX_CACHE_BYTES`](moq_net::group::MAX_CACHE_BYTES) (32 MiB) of payload and
-//! [`MAX_GROUP_FRAMES`](moq_net::group::MAX_GROUP_FRAMES) (8192) frames, and a consumer always
-//! starts at frame 0, so the cap is never met by dropping a prefix some readers missed: a partial
-//! log presented as a whole one is what this mode exists to prevent.
+//! A plain log accepts appends for its track's life; only a payload larger than one frame may be
+//! ([`MAX_CACHE_BYTES`](moq_net::group::MAX_CACHE_BYTES), 32 MiB) is refused, with
+//! [`moq_net::Error::FrameTooLarge`], before it is written.
 //!
-//! Instead an append that might not fit is refused with [`moq_net::Error::GroupTooLarge`] before
-//! it is encoded, and the log stays intact and writable. With compression the check counts the
-//! payload's raw size plus DEFLATE's worst-case overhead ([`Encoder::bound`](crate::Encoder::bound)),
-//! since the compressed size is only known once the window has moved, and each written payload is
-//! charged its inflated size: the [`Decoder`](crate::Decoder) holds its window to the same budget, so
-//! compression shrinks the wire but not how much a log can hold. The budget covers the whole log rather than a single payload, so
-//! once it is spent every append is refused: the live stream is bounded history by design, and a
-//! publisher with more to say opens a new track.
+//! A compressed log is bounded, since a reader's [`Decoder`](crate::Decoder) inflates every payload
+//! from frame 0 and holds its window to [`MAX_CACHE_BYTES`](moq_net::group::MAX_CACHE_BYTES). An
+//! append that might not fit is refused with [`moq_net::Error::GroupTooLarge`] before it is
+//! encoded, and the log stays intact and writable. The check counts the payload's raw size plus
+//! DEFLATE's worst-case overhead ([`Encoder::bound`](crate::Encoder::bound)), since the compressed
+//! size is only known once the window has moved, and each written payload is charged its inflated
+//! size, so compression shrinks the wire but not how much a log can hold. Once the budget is spent
+//! every append is refused, and a publisher with more to say opens a new track.
 
 use crate::Compression;
 #[cfg(test)]
@@ -285,15 +283,20 @@ mod test {
 	}
 
 	fn refused(result: crate::Result<usize>) -> bool {
-		matches!(result, Err(crate::Error::Net(moq_net::Error::GroupTooLarge)))
+		matches!(
+			result,
+			Err(crate::Error::Net(
+				moq_net::Error::GroupTooLarge | moq_net::Error::FrameTooLarge
+			))
+		)
 	}
 
-	/// A payload past the group budget is refused before anything is written, so the log carries
-	/// on: the next payload lands and decodes, which with compression proves the window never
-	/// moved.
+	/// A payload past the frame or compressed budget is refused before anything is written, so
+	/// the log carries on: the next payload lands and decodes, which with compression proves the
+	/// window never moved.
 	#[test]
 	fn an_oversized_payload_is_refused_and_the_log_continues() {
-		let past_budget = Bytes::from(vec![0u8; moq_net::group::MAX_CACHE_BYTES as usize]);
+		let past_budget = Bytes::from(vec![0u8; moq_net::group::MAX_CACHE_BYTES as usize + 1]);
 
 		for compression in [false, true] {
 			let (mut producer, track) = producer(compression);
@@ -341,25 +344,19 @@ mod test {
 		assert_eq!(drain(track, true), vec![half]);
 	}
 
-	/// The budget covers the whole log, so once its frames are spent every append is refused, and
-	/// the log written so far still finishes cleanly and reads back whole.
+	/// A compressed log's budget covers the whole log, so once it is spent every append is
+	/// refused, and the log written so far still finishes cleanly and reads back whole.
 	#[test]
-	fn a_spent_budget_refuses_every_append() {
-		let frames = moq_net::group::MAX_GROUP_FRAMES as u32;
-		for compression in [false, true] {
-			let (mut producer, track) = producer(compression);
-			for n in 0..frames {
-				producer.append(Bytes::copy_from_slice(&n.to_be_bytes())).unwrap();
-			}
-
-			assert!(refused(producer.append(&b"late"[..])), "compression={compression}");
-			assert!(refused(producer.append(&b"later"[..])), "compression={compression}");
-			producer.finish().unwrap();
-
-			let payloads = drain(track, compression);
-			assert_eq!(payloads.len(), frames as usize, "compression={compression}");
-			assert_eq!(payloads.last().unwrap()[..], (frames - 1).to_be_bytes());
+	fn a_spent_compressed_budget_refuses_every_append() {
+		let quarter = Bytes::from(vec![0u8; moq_net::group::MAX_CACHE_BYTES as usize / 4]);
+		let (mut producer, track) = producer(true);
+		for _ in 0..3 {
+			producer.append(quarter.clone()).unwrap();
 		}
+		assert!(refused(producer.append(quarter.clone())));
+		assert!(refused(producer.append(quarter.clone())));
+		producer.finish().unwrap();
+		assert_eq!(drain(track, true).len(), 3);
 	}
 
 	/// A reader already inside the group keeps its own handle, which `track::Producer::abort`

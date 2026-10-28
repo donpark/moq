@@ -310,8 +310,8 @@ impl<T: Serialize> Stream<T> {
 	///
 	/// A record that cannot be written ends the track (see [`moq_json::stream::Producer::append`])
 	/// and retires the catalog entry with it. A record refused with
-	/// [`moq_net::Error::GroupTooLarge`] or [`moq_net::Error::TimestampMismatch`] leaves both intact,
-	/// since nothing was written. A catalog error publishing the measured bitrate is returned after the record was written, so the track
+	/// [`moq_net::Error::FrameTooLarge`], [`moq_net::Error::GroupTooLarge`], or
+	/// [`moq_net::Error::TimestampMismatch`] leaves both intact, since nothing was written. A catalog error publishing the measured bitrate is returned after the record was written, so the track
 	/// stays open and a retry would duplicate it.
 	pub fn append<'a>(&mut self, value: impl Into<Timed<&'a T>>) -> crate::Result<()>
 	where
@@ -322,7 +322,11 @@ impl<T: Serialize> Stream<T> {
 		let size = match self.inner.append(value) {
 			Ok(size) => size,
 			// Refused before anything was written, so the log and its entry carry on.
-			Err(err @ moq_json::Error::Net(moq_net::Error::GroupTooLarge | moq_net::Error::TimestampMismatch)) => {
+			Err(
+				err @ moq_json::Error::Net(
+					moq_net::Error::FrameTooLarge | moq_net::Error::GroupTooLarge | moq_net::Error::TimestampMismatch,
+				),
+			) => {
 				return Err(err.into());
 			}
 			Err(err) => {
@@ -884,7 +888,7 @@ mod test {
 		assert!(matches!(track.poll_recv_group(&waiter), Poll::Ready(Err(_))));
 	}
 
-	/// A record past the group budget is refused before anything is written, so the log stays
+	/// A record past the frame budget is refused before anything is written, so the log stays
 	/// advertised and the next record still lands.
 	#[test]
 	fn an_oversized_record_keeps_the_track_and_the_entry() {
@@ -897,7 +901,7 @@ mod test {
 		let oversized = Value::String("x".repeat(moq_net::group::MAX_CACHE_BYTES as usize));
 		assert!(matches!(
 			chat.append(&oversized),
-			Err(crate::Error::Json(moq_json::Error::Net(moq_net::Error::GroupTooLarge)))
+			Err(crate::Error::Json(moq_json::Error::Net(moq_net::Error::FrameTooLarge)))
 		));
 		assert!(catalog.snapshot().json.tracks.contains_key("chat"));
 

@@ -8,10 +8,9 @@
 //! [`Config::compression`] set to [`crate::Compression::Deflate`], that one
 //! group is one DEFLATE window, so every record
 //! compresses against all the earlier ones. There is deliberately no group rolling (and so no
-//! catch-up machinery): the only reason to roll would be moq-net's per-group frame cap, which
-//! isn't worth working around here. A caller that wants to bound the record rate throttles at
-//! the source (e.g. the timeline's segment cadence); a consumer that finds a gap can fetch or
-//! extrapolate.
+//! catch-up machinery): a moq-net group has no size cap, and the cache sheds its front under
+//! pressure while a late reader refills what it missed. A caller that wants to bound the record
+//! rate throttles at the source (e.g. the timeline's segment cadence).
 //!
 //! A record that cannot be encoded or written therefore ends the track rather than continuing in a
 //! second group: a log missing a record is not lossless, and a gap dressed up as a complete log is
@@ -19,21 +18,17 @@
 //!
 //! # Budget
 //!
-//! That single group is what bounds the log. moq-net caps a group at
-//! [`MAX_CACHE_BYTES`](moq_net::group::MAX_CACHE_BYTES) (32 MiB) of payload and
-//! [`MAX_GROUP_FRAMES`](moq_net::group::MAX_GROUP_FRAMES) (8192) frames, and a consumer always
-//! starts at frame 0, so the cap is never met by dropping a prefix some readers missed. (With
-//! compression the retained suffix would be undecodable anyway, since its DEFLATE window depends
-//! on the dropped prefix.)
+//! A plain log accepts appends for its track's life; only a record larger than one frame may be
+//! ([`MAX_CACHE_BYTES`](moq_net::group::MAX_CACHE_BYTES), 32 MiB) is refused, with
+//! [`moq_net::Error::FrameTooLarge`], before it is written.
 //!
-//! Instead an append that might not fit is refused with [`moq_net::Error::GroupTooLarge`] before
-//! it is encoded, and the log stays intact and writable. With compression the check counts the
-//! record's raw size plus DEFLATE's worst-case overhead, since the compressed size is only known
-//! once the window has moved, and each written record is charged its raw size: a reader's DEFLATE
-//! window is held to the same budget, so compression shrinks the wire but not how much a log can
-//! hold. The budget covers the whole log rather than a single record, so once
-//! it is spent every append is refused: the live stream is bounded history by design, a publisher
-//! with more to say opens a new track, and deep history is served from a recording.
+//! A compressed log is bounded: a reader's DEFLATE window inflates every record from frame 0 and
+//! is held to [`MAX_CACHE_BYTES`](moq_net::group::MAX_CACHE_BYTES). An append that might not fit is
+//! refused with [`moq_net::Error::GroupTooLarge`] before it is encoded, and the log stays intact
+//! and writable. The check counts the record's raw size plus DEFLATE's worst-case overhead, since
+//! the compressed size is only known once the window has moved, and each written record is charged
+//! its raw size, so compression shrinks the wire but not how much a log can hold. Once the budget
+//! is spent every append is refused, and a publisher with more to say opens a new track.
 //!
 //! # Choosing a layer
 //!
@@ -430,11 +425,17 @@ mod test {
 	}
 
 	fn refused(result: crate::Result<usize>) -> bool {
-		matches!(result, Err(crate::Error::Net(moq_net::Error::GroupTooLarge)))
+		matches!(
+			result,
+			Err(crate::Error::Net(
+				moq_net::Error::GroupTooLarge | moq_net::Error::FrameTooLarge
+			))
+		)
 	}
 
-	/// A record past the group budget is refused before anything is written, so the log carries on:
-	/// the next record lands and decodes, which with compression proves the window never moved.
+	/// A record past the frame or compressed budget is refused before anything is written, so the
+	/// log carries on: the next record lands and decodes, which with compression proves the window
+	/// never moved.
 	#[test]
 	fn an_oversized_record_is_refused_and_the_log_continues() {
 		for compression in [false, true] {
@@ -467,37 +468,33 @@ mod test {
 		assert_eq!(drain(consume(track, true)), vec![half]);
 	}
 
-	/// The budget covers the whole log, so once its frames are spent every append is refused, and
-	/// the log written so far still finishes cleanly and reads back whole.
+	/// A plain log has no budget: it carries more records than a group once could.
 	#[test]
-	fn a_spent_budget_refuses_every_append() {
-		for compression in [false, true] {
-			let (mut producer, track) = producer(config(compression));
-			for n in 0..moq_net::group::MAX_GROUP_FRAMES {
-				producer.append(&json!({ "n": n })).unwrap();
-			}
-
-			assert!(
-				refused(producer.append(&json!({ "n": -1 }))),
-				"compression={compression}"
-			);
-			assert!(
-				refused(producer.append(&json!({ "n": -2 }))),
-				"compression={compression}"
-			);
-			producer.finish().unwrap();
-
-			let records = drain(consume(track, compression));
-			assert_eq!(
-				records.len(),
-				moq_net::group::MAX_GROUP_FRAMES,
-				"compression={compression}"
-			);
-			assert_eq!(
-				records.last(),
-				Some(&json!({ "n": moq_net::group::MAX_GROUP_FRAMES - 1 }))
-			);
+	fn a_plain_log_accepts_every_append() {
+		let (mut producer, track) = producer(config(false));
+		for n in 0..10_000 {
+			producer.append(&json!({ "n": n })).unwrap();
 		}
+		producer.finish().unwrap();
+
+		let records = drain(consume(track, false));
+		assert_eq!(records.len(), 10_000);
+		assert_eq!(records.last(), Some(&json!({ "n": 9_999 })));
+	}
+
+	/// A compressed log's budget covers the whole log, so once it is spent every append is
+	/// refused, and the log written so far still finishes cleanly and reads back whole.
+	#[test]
+	fn a_spent_compressed_budget_refuses_every_append() {
+		let (mut producer, track) = producer(compressed());
+		let quarter = Value::String("x".repeat(moq_net::group::MAX_CACHE_BYTES as usize / 4));
+		for _ in 0..3 {
+			producer.append(&quarter).unwrap();
+		}
+		assert!(refused(producer.append(&quarter)));
+		assert!(refused(producer.append(&quarter)));
+		producer.finish().unwrap();
+		assert_eq!(drain(consume(track, true)).len(), 3);
 	}
 
 	#[test]
