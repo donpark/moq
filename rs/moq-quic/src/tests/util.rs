@@ -734,7 +734,7 @@ impl ::std::ops::DerefMut for TestEndpoint {
 	}
 }
 
-/// Logs the test's own events, and the stack's per-packet trace when `RUST_LOG` asks for it
+/// Logs the test's own events, and the stack's per-packet trace when `RUST_LOG` asks for it.
 ///
 /// Formatting every trace event costs more than the simulation it describes, and the runs are
 /// deterministic, so a failure replays with `RUST_LOG=trace` to read it. The per-step side spans

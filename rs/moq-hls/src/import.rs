@@ -254,7 +254,7 @@ impl Fetcher {
 		if !same_origin(&self.entry, url) {
 			return Err(Error::ResourceRefused);
 		}
-		// Same origin, so the entry's scheme
+		// Same origin, so a file URL exactly when the entry is one.
 		let Some(client) = &self.client else {
 			let path = url.to_file_path().map_err(|_| Error::InvalidFileUrl)?;
 			let Some(range) = resource.range else {
