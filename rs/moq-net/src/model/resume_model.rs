@@ -199,6 +199,8 @@ struct Copy {
 	/// Answers the front's requests for the route until the route goes.
 	serving: moq_clock::sim::JoinHandle<()>,
 	_broadcast: broadcast::Producer,
+	/// Fetches of groups the copy lacks, which the route forwards to the publisher.
+	fills: track::Requests,
 	/// Frames written per group, with the writer while the group is open.
 	groups: BTreeMap<u64, (usize, Option<group::Producer>)>,
 	given_up: BTreeSet<u64>,
@@ -463,6 +465,7 @@ impl Model {
 			}
 		});
 		self.instances[epoch].routes[slot] = Some(Copy {
+			fills: track.requests(),
 			track,
 			serving,
 			_broadcast: broadcast,
@@ -501,6 +504,42 @@ impl Model {
 		}
 		let most = instance.written.entry(group).or_default();
 		*most = (*most).max(*written);
+	}
+
+	/// Answer each route's fetches as its publisher would: with what the instance carries
+	/// so far, which later writes continue, or not found when no route has it yet.
+	fn fill(&mut self) -> bool {
+		let mut filled = false;
+		for epoch in 0..EPOCHS {
+			for slot in 0..SLOTS {
+				while let Some(Poll::Ready(Ok(fill))) = self.instances[epoch].routes[slot]
+					.as_ref()
+					.map(|copy| copy.fills.poll_requested_fill(&kio::Waiter::noop()))
+				{
+					filled = true;
+					let (start, end) = (fill.start().group, fill.end());
+					for group in start..end.min(GROUPS) {
+						let instance = &mut self.instances[epoch];
+						let copy = instance.routes[slot].as_mut().expect("polled above");
+						let from = fill.frame_start(group) as usize;
+						let written = instance.written.get(&group).copied().unwrap_or(0);
+						if copy.given_up.contains(&group) {
+							fill.refuse_groups(group..group + 1, Error::Stream(GIVE_UP));
+						} else if written <= from || copy.groups.contains_key(&group) {
+							fill.refuse_groups(group..group + 1, Error::NotFound);
+						} else if let Ok(writer) = fill.accept(group, None) {
+							// The fill starts at the frame its readers want.
+							copy.groups.insert(group, (from, Some(writer)));
+							self.write(epoch, slot, group, written - from);
+						}
+					}
+					if end > GROUPS {
+						fill.refuse_groups(GROUPS.max(start)..end, Error::NotFound);
+					}
+				}
+			}
+		}
+		filled
 	}
 
 	fn end(&mut self, epoch: usize, slot: usize) {
@@ -713,7 +752,7 @@ impl Model {
 		let mut quiet = 0;
 		for _ in 0..10_000 {
 			moq_clock::sim::yield_now().await;
-			let mut woken = false;
+			let mut woken = self.fill();
 			for index in 0..READERS {
 				if self.readers[index]
 					.as_ref()
