@@ -102,6 +102,7 @@ catalog linger (#5305).
 - [TS workflow passes](/quest/m1/ts-reliability/validation-green.md) - the scheduled TS lanes pass on main again, with no lane loosened
 - [Export SI order](/quest/m1/ts-reliability/export-si-order.md) - a TS export sends SI and media after its PMT and a PCR interval, so a hop keeps first emissions
 - [A stitched switch returns to --delay](/quest/m1/ts-reliability/stitch-catch-up.md) - `--stitch` drops the old program's tail once the replacement acquires, so latency settles back to `--delay`
+- [Shared PID stats](/quest/m1/ts-reliability/shared-pid-stats.md) - `ts::stats` counts a shared PID once in the shared parser, so its timing counts survive program changes
 
 ## Related
 
