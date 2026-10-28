@@ -14,3 +14,25 @@ build. Nothing in the repository calls the hand-written ABI any more.
   hand-written ABI has only `moq_consume_video_enabled` (decided 2026-10-23).
 - Rewrite `doc/lib/c` around the generated API, including a sample that runs
   callbacks on the host's own loop through `moq_set_dispatcher`.
+
+Waits for the cut and the generator switch (found when first started,
+2026-10-28). Until the cut, [moq-c parity](/quest/m1/c/README.md) ships the
+hand-written 0.7 and proves it with this interop client and the current
+`doc/lib/c`, and `doc/` describes only what ships, so either half landing first
+drops the shipping crate's proof and documents an unpublished API. The switch
+re-cases every generated C type (`moq_session` becomes `MoqSession`), so a port
+before it is written twice; `c/moq/test/probe.c` takes that rename with the
+switch.
+
+The generated API covers everything the client does, publishing included: the
+C++ interop client already drives the same moq-ffi surface both ways.
+
+Open: `test/smoke/clients/c` checks the published `libmoq` archive with the
+hand-written ABI, and can move only once the generated archive publishes, after
+this quest. [Published generated C](/quest/m2/release/c-publish.md) is the
+natural owner.
+
+## Required
+
+- [Breaking release cut](/quest/m2/release/cut.md) - the hand-written 0.7 ships with this client and these docs as its proof
+- [Switch to rust2's UniFFI](/quest/m2/uniffi-fork.md) - the generated C type names settle before consumers are written against them
