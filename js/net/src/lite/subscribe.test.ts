@@ -207,10 +207,16 @@ test("a lite-07 list decodes as the span covering it", async () => {
 	// Groups 2 through 4 and 7 through frame 1 of group 9.
 	const sparse = await update([2, 1, 2, 0, 1, 5, 0, 1, 7, 0, 1, 9, 2]);
 	expect([sparse.startGroup, sparse.startFrame, sparse.endGroup, sparse.endFrame]).toEqual([2, 0, 9, 1]);
+	expect(sparse.rangeStarts).toEqual([2, 7]);
 
 	// A relative start resolves upstream of nothing here, so it widens to no floor.
 	const relative = await update([2, 2, 3, 1, 5, 0, 1, 7, 0, 1, 9, 0]);
 	expect([relative.startGroup, relative.endGroup, relative.endFrame]).toEqual([undefined, 8, undefined]);
+	expect(relative.rangeStarts).toEqual([undefined, 7]);
+
+	// No start resolves to group 0; an empty range resolves nothing.
+	const oldest = await update([2, 0, 1, 3, 0, 1, 5, 2, 1, 5, 2]);
+	expect(oldest.rangeStarts).toEqual([0, undefined]);
 
 	await expect(update([0])).rejects.toThrow(ProtocolViolation);
 	await expect(update([1, 4, 0, 0])).rejects.toThrow(ProtocolViolation);

@@ -119,8 +119,9 @@ interface Span {
 	endGroup?: number;
 	endFrame?: number;
 	/**
-	 * Lite-07's start group of each range in turn, `undefined` for one that does not name a
-	 * group. Decoded only, so SUBSCRIBE_START can answer for every range.
+	 * Lite-07's start group of each range in turn, 0 for no start, and `undefined` for an
+	 * empty range or a relative or time start. Decoded only, so SUBSCRIBE_START can answer
+	 * for every range.
 	 */
 	rangeStarts?: (number | undefined)[];
 }
@@ -168,15 +169,15 @@ function before(a: Point, b: Point): boolean {
 }
 
 /**
- * Decode one lite-07 range end, `undefined` for none. A relative or time anchor is also
- * `undefined`: this publisher resolves neither, so it serves from the oldest group its
+ * Decode one lite-07 range end: its position, `null` for none, or `undefined` for a relative
+ * or time anchor. This publisher resolves neither, so it serves from the oldest group its
  * budget allows, or through the live edge, and the subscriber keeps what it asked for.
  */
-async function decodeAnchor(r: Reader): Promise<Point | undefined> {
+async function decodeAnchor(r: Reader): Promise<Point | null | undefined> {
 	const kind = await r.u53();
 	switch (kind) {
 		case 0:
-			return undefined;
+			return null;
 		case 1:
 			return [await r.u53(), await r.u53()];
 		case 2:
@@ -212,10 +213,12 @@ async function decodeSpan(r: Reader, version: Version): Promise<Span> {
 	for (let i = 0; i < count; i++) {
 		const from = await decodeAnchor(r);
 		const to = await decodeAnchor(r);
-		rangeStarts.push(from?.[0]);
-		if (from === undefined) floor = false;
+		// No start reaches back to the oldest group, which is group 0.
+		const resolved = from === null ? ([0, 0] as Point) : from;
+		rangeStarts.push(resolved && (!to || before(resolved, to)) ? resolved[0] : undefined);
+		if (!from) floor = false;
 		else if (start === undefined || before(from, start)) start = from;
-		if (to === undefined) live = true;
+		if (!to) live = true;
 		else if (end === undefined || before(end, to)) end = to;
 	}
 	if (!floor) start = undefined;
