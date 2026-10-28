@@ -84,7 +84,7 @@ We should spend more time building an *actual* application and less time arguing
 
 moq-lite is the bare minimum needed for a real-time application aiming to replace WebRTC.
 Every feature from MoqTransport that is not necessary (or has not been implemented yet) has been removed for simplicity.
-This includes many great ideas (ex. group order) that may be added as they are needed.
+This includes many great ideas (ex. subgroups) that may be added as they are needed.
 This draft is the current state, not the end state.
 
 
@@ -117,8 +117,7 @@ When UDP is unavailable, moq-lite MAY also run over reliable byte-stream transpo
 The session is active immediately after the connection is established.
 Both endpoints SHOULD begin sending and receiving streams right away to avoid an extra round-trip.
 
-Optional capabilities and extensions are negotiated via a SETUP message (see [SETUP](#setup)).
-Each endpoint MUST open a unidirectional Setup Stream at the start of the session, send a single SETUP message advertising what it supports, and immediately close the stream (FIN); an endpoint with no optional capabilities sends a SETUP with an empty parameter list.
+Optional capabilities and extensions are negotiated by the SETUP message each endpoint sends on its [Setup Stream](#setup-stream).
 Neither endpoint waits for the peer's SETUP before opening other streams.
 An endpoint MUST buffer a stream whose behavior or encoding depends on a negotiated extension until the peer's SETUP arrives; everything else proceeds immediately.
 As a fallback, an endpoint that opens an extension stream the peer does not support simply sees that stream reset (see [STREAM_TYPE](#stream_type)).
@@ -278,7 +277,6 @@ There are two independent error code spaces, one for terminating the session and
 The same numeric value means different things in each, so an endpoint MUST select the code from the space matching what it is terminating.
 
 The shared codes match moq-transport draft-18 and later.
-Earlier drafts differ: 0x4 denotes UNKNOWN_OBJECT_STATUS in draft-16/17 and is unassigned in draft-14/15; TOO_FAR_BEHIND was added in draft-17 and MALFORMED_TRACK in draft-16.
 An endpoint bridging protocols MUST translate codes according to the negotiated version and error-code space; moq-lite's reserved, own, and application ranges have no corresponding moq-transport ranges.
 The codes moq-lite uses are listed in full below; an endpoint MUST NOT assign a moq-lite specific meaning to any code below 32.
 
@@ -304,31 +302,17 @@ Sent when terminating the session, via the transport's session close.
 | ------- | ------------- | ----------- |
 |  0x3   | PROTOCOL_VIOLATION | The peer violated this specification. |
 | ------- | ------------- | ----------- |
-|  0x4   | INVALID_REQUEST_ID | A moq-transport request ID was reused or violated that draft’s order or parity rules; moq-lite has no request IDs. |
-| ------- | ------------- | ----------- |
-|  0x6   | KEY_VALUE_FORMATTING_ERROR | A key-value pair was malformed, or repeated more than allowed. |
-| ------- | ------------- | ----------- |
 |  0x7   | TOO_MANY_REQUESTS | The peer held more announcements or subscriptions than the endpoint allows. |
-| ------- | ------------- | ----------- |
-|  0x8   | INVALID_PATH | A moq-transport PATH was sent where that draft forbids it, such as by a server; moq-lite has no PATH. |
 | ------- | ------------- | ----------- |
 |  0x10  | GOAWAY_TIMEOUT | The peer did not close within the GOAWAY drain deadline. |
 | ------- | ------------- | ----------- |
 |  0x11  | CONTROL_MESSAGE_TIMEOUT | The peer took too long to respond to a control message. |
 | ------- | ------------- | ----------- |
-|  0x13  | AUTH_TOKEN_CACHE_OVERFLOW | A token registration would exceed the advertised token cache size. |
-| ------- | ------------- | ----------- |
 |  0x15  | VERSION_NEGOTIATION_FAILED | No version could be negotiated. |
 | ------- | ------------- | ----------- |
 |  0x16  | MALFORMED_AUTH_TOKEN | The endpoint's token could not be parsed. |
 | ------- | ------------- | ----------- |
-|  0x17  | UNKNOWN_AUTH_TOKEN_ALIAS | A token named an alias that was never registered. |
-| ------- | ------------- | ----------- |
 |  0x18  | EXPIRED_AUTH_TOKEN | The endpoint's token expired. Unlike UNAUTHORIZED, refreshed credentials may succeed. |
-| ------- | ------------- | ----------- |
-|  0x19  | INVALID_AUTHORITY | A moq-transport AUTHORITY was sent where that draft forbids it, such as by a server; moq-lite has no AUTHORITY. |
-| ------- | ------------- | ----------- |
-|  0x1B  | TOO_MANY_REQUEST_UPDATES | The peer left more request updates unanswered than the endpoint allows. |
 | ------- | ------------- | ----------- |
 |  0x30  | NOT_SUPPORTED | The requested feature, token, or grant is unsupported. |
 | ------- | ------------- | ----------- |
@@ -378,9 +362,6 @@ Sent when resetting a stream (RESET_STREAM), or when refusing to receive one (ST
 Note that CANCELLED is 0x1, not 0x0: a stream reset with 0x0 is an INTERNAL_ERROR, not a routine cancellation.
 An endpoint terminating a stream because the session is ending SHOULD use SESSION_CLOSED rather than the session's own code, since the two spaces are disjoint.
 A relay terminating a stream because the upstream session serving it ended SHOULD use UNROUTABLE, since the downstream session is not ending.
-
-## Handshake
-See the [Session](#session) section for ALPN negotiation and session activation details.
 
 # Streams
 moq-lite uses a bidirectional stream for each transaction.
@@ -781,8 +762,6 @@ The opener sends a single SETUP message and immediately closes the stream (FIN).
 There is exactly one Setup Stream per direction; an endpoint that receives a second Setup Stream MUST close the session with a PROTOCOL_VIOLATION.
 An endpoint with no optional capabilities sends a SETUP with an empty parameter list rather than omitting the stream, giving the peer a deterministic signal that no capabilities are forthcoming.
 
-See the [Session](#session) section for how an endpoint avoids waiting on the peer's SETUP before exchanging other streams.
-
 ### Padding {#padding-stream}
 Either endpoint MAY open a Padding Stream (0x2), followed by arbitrary bytes until FIN.
 The receiver MUST read and discard those bytes incrementally, returning stream and connection flow-control credit as they arrive without retaining the body.
@@ -949,11 +928,8 @@ The Parameter Value is a variable-length integer level, where each level include
 - `1` **Report**: The publisher can measure and periodically report its estimated bitrate.
 - `2` **Increase**: The publisher can additionally pad the connection (or send redundant data) to probe for bandwidth above its current sending rate, up to the subscriber's target.
 
-A subscriber MUST consult the publisher's advertised level before relying on a Probe Stream:
-
-- At `None`, the subscriber SHOULD NOT open a Probe Stream; if it does, the publisher MUST reset it.
-- At `Report`, the subscriber MAY open a Probe Stream to monitor the estimated bitrate but MUST NOT expect the publisher to pad above its current sending rate. A subscriber that needs to probe for additional bandwidth MUST use an alternative (e.g. speculatively switching to a higher rendition).
-- At `Increase`, the subscriber MAY request a target bitrate and expect the publisher to actively probe up to it.
+The [Probe Stream](#probe) specifies the publisher's behavior at each level.
+A subscriber SHOULD NOT open a Probe Stream to a publisher at `None`, and below `Increase` probes for more bandwidth some other way, such as speculatively switching to a higher rendition.
 
 ### Path Parameter {#path-parameter}
 The Path Parameter carries the request target the client wishes to reach, equivalent to the path and query components of a moq-lite URI.
@@ -1637,8 +1613,7 @@ PROBE Message {
 ~~~
 
 **Bitrate**:
-When sent by the subscriber (stream opener): the target bitrate in bits per second that the publisher should pad up to.
-The publisher only honors a target above its current sending rate if it advertised the Increase capability (see [Probe Parameter](#probe-parameter)); otherwise the target is ignored and the publisher only reports.
+When sent by the subscriber (stream opener): the target bitrate in bits per second that the publisher should pad up to (see [Probe](#probe)).
 When sent by the publisher (responder): the current estimated bitrate in bits per second.
 A value of 0 means unknown.
 
@@ -1855,7 +1830,6 @@ The `Message Length` describes the payload size on the wire.
 - Added the reliable ordered RTCDataChannel binding, with one Qmux Record per binary message and no datagrams.
 
 - Added `Group Order` to SUBSCRIBE and SUBSCRIBE_UPDATE: descending (0x0, the previous fixed order) or ascending (0x1). A relay requests descending upstream unless every subscription it serves is ascending.
-- Listed the shared INVALID_REQUEST_ID (0x4) session code used by moq-transport drafts 14 through 16.
 - Listed the shared EXPIRED_AUTH_TOKEN (0x18) session code. A request that expires on its own resets with the UNAUTHORIZED stream code.
 
 - SUBSCRIBE_OK `Group` names where delivery starts when the subscription resolves, which need not be the first group sent. It is not a new floor. A subscriber does not wait for a group between the requested floor and it, but a publisher still delivers one that arrives later within Subscriber Max Age.
@@ -1895,8 +1869,8 @@ The `Message Length` describes the payload size on the wire.
 - Added announce compression: ANNOUNCE_START gains `Path Base` and `Path Keep` to copy the head of a live advertisement's suffix, and ANNOUNCE_START and ANNOUNCE_UPDATE gain `Hop Base` and `Hop Keep` to copy the tail of a live advertisement's Hop ID list.
 - Capped the Message Length of every message except FRAME at 65,535 bytes.
 - Added the TOO_MANY_REQUESTS (0x7) session code, closing a session whose peer goes past the endpoint's bound on subscriptions or announcements.
-- Added the AUTH_TOKEN_CACHE_OVERFLOW (0x13), MALFORMED_AUTH_TOKEN (0x16), UNKNOWN_AUTH_TOKEN_ALIAS (0x17), and TOO_MANY_REQUEST_UPDATES (0x1B) session codes, with moq-transport's meaning.
-- Added the INVALID_PATH (0x8) and INVALID_AUTHORITY (0x19) session codes, with moq-transport's meaning.
+- Added the MALFORMED_AUTH_TOKEN (0x16) session code, with moq-transport's meaning.
+- Removed KEY_VALUE_FORMATTING_ERROR (0x6) from the session codes: moq-lite has no key-value pairs, and a repeated SETUP parameter is a PROTOCOL_VIOLATION.
 - Limited AUTH_OK Expires to 2^53 - 1 milliseconds, with an out-of-range value closing the session with PROTOCOL_VIOLATION.
 - Invalid UTF-8 or an oversized AUTH_ERROR reason closes the session with PROTOCOL_VIOLATION.
 - An Auth Stream message that fails to decode, has trailing body bytes, or has an unexpected type, or a second AUTH from the opener, closes the session with PROTOCOL_VIOLATION.
@@ -2014,7 +1988,7 @@ A quick comparison of moq-lite and moq-transport-14:
 - Track Namespace is a string, not an array of any array of bytes.
 - Subscriptions default to the latest group, not the latest object.
 - No subgroups
-- No group/object ID gaps
+- No Object ID gaps
 - No object properties
 - No paused subscriptions (forward=0)
 
@@ -2056,8 +2030,6 @@ Some of these fields occur in multiple messages.
 - StartObject
 - Expires
 - ContentExists
-- Largest Group ID
-- Largest Object ID
 - Parameters
 - Subgroup ID
 - Object ID
@@ -2069,7 +2041,7 @@ Some of these fields occur in multiple messages.
 moq-lite inherits the transport security of the underlying connection: QUIC and WebTransport provide confidentiality and integrity via TLS 1.3, the Qmux TCP and WebSocket bindings run over TLS, and the RTCDataChannel binding inherits DTLS security. How that connection is authenticated is out of scope (see [Connection](#connection)). The considerations below are specific to moq-lite.
 
 ## Bandwidth Probing
-The `Increase` Probe level (see [Probe Parameter](#probe-parameter)) lets a subscriber ask the publisher to pad the connection up to a target bitrate. A publisher MUST NOT treat the target as authorization to send beyond what congestion control allows: padding is bounded by the congestion window, so probing cannot be used to amplify traffic toward the subscriber or a spoofed address. A publisher that only advertised `Report` MUST NOT pad above its current sending rate. Because all data flows on an established, congestion-controlled session to the connecting peer, moq-lite offers no off-path amplification vector.
+The `Increase` Probe level (see [Probe Parameter](#probe-parameter)) lets a subscriber ask the publisher to pad the connection up to a target bitrate. A publisher MUST NOT treat the target as authorization to send beyond what congestion control allows: padding is bounded by the congestion window, so probing cannot be used to amplify traffic toward the subscriber or a spoofed address. Because all data flows on an established, congestion-controlled session to the connecting peer, moq-lite offers no off-path amplification vector.
 
 ## Authorization
 An AUTH_OK tells the opener what the acceptor will allow; it does not replace the acceptor's own enforcement, which MUST still refuse what the grant does not cover.
