@@ -10,14 +10,7 @@ const condition = (run: { name: string; event: string; conclusion: string }) =>
 	watched.includes(run.name) &&
 	evaluate({ event: { workflow_run: run } }, (values: string[], value: string) => values.includes(value), JSON.parse);
 
-for (const event of [
-	"pull_request",
-	"pull_request_target",
-	"push",
-	"schedule",
-	"workflow_dispatch",
-	"workflow_run",
-]) {
+for (const event of ["pull_request", "pull_request_target", "push", "schedule", "workflow_dispatch", "workflow_run"]) {
 	test(`Discord alert policy for ${event}`, () => {
 		for (const conclusion of ["failure", "timed_out", "success", "cancelled", "skipped"]) {
 			const expected =
