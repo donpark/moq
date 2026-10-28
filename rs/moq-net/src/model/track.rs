@@ -6582,9 +6582,7 @@ impl Cursor {
 		let fills = self.state.read().fills.clone();
 		let misses = self.misses.get_or_insert_with(Box::default);
 		let mut given_up = Vec::new();
-		if misses.lowest().is_some() {
-			misses.retain(from, &below(window.missable(from), cap));
-		}
+		misses.retain((from, revision, cap), || below(window.missable(from), cap));
 		let asks = {
 			let state = self.state.read();
 			misses.judge(
@@ -12479,7 +12477,7 @@ mod test {
 		drop(state);
 
 		// The edge dies between resolving it and judging the candidate.
-		let slot = producer.modify().unwrap().lookup.remove(&edge).unwrap();
+		let slot = producer.modify().unwrap().remove_slot(edge).unwrap();
 		let _ = slot.group.abort(Error::Evicted);
 
 		let state = producer.state.read();

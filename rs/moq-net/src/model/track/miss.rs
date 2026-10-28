@@ -59,6 +59,8 @@ pub(super) struct Misses {
 	filled: BTreeSet<u64>,
 	/// Never asked again: named dropped to the reader.
 	given_up: RangeSet<u64>,
+	/// The window revision and cap what this holds was last clipped to.
+	clipped: Option<(u64, Option<u64>)>,
 }
 
 /// A run of misses the reader gives up, for the drop cursor to name.
@@ -241,13 +243,35 @@ impl Misses {
 		}
 	}
 
-	/// Forget what the reader no longer reads: below `from`, or outside `admitted`. Its fills
-	/// no longer owe it those groups, and one nobody waits on is withdrawn once its last join
-	/// goes.
-	pub fn retain(&mut self, from: u64, admitted: &RangeInclusiveSet<u64>) {
-		if self.wanted.is_empty() && self.filled.is_empty() && self.joins.is_empty() {
+	/// Forget what the reader no longer reads: below `from`, or outside `admitted`, its window
+	/// at `revision` below the exclusive `cap`. Its fills no longer owe it those groups, and one
+	/// nobody waits on is withdrawn once its last join goes.
+	///
+	/// Clips to the window only once it moves, since everything taken in since lies inside it,
+	/// so a poll under the same window costs only what falls below a raised floor.
+	pub fn retain(
+		&mut self,
+		(from, revision, cap): (u64, u64, Option<u64>),
+		admitted: impl FnOnce() -> RangeInclusiveSet<u64>,
+	) {
+		let clipped = self.clipped.replace((revision, cap));
+		// A join holds only what is still wanted or filled.
+		let Some(lowest) = self.lowest() else {
+			return;
+		};
+		if clipped == Some((revision, cap)) {
+			if lowest < from {
+				self.filled = self.filled.split_off(&from);
+				self.wanted.remove(0..from);
+				let below = RangeSet::from_iter([0..from]);
+				self.joins.retain_mut(|join| {
+					join.release(&below);
+					!join.is_empty()
+				});
+			}
 			return;
 		}
+		let admitted = &admitted();
 		let outside = |sequence: u64| sequence < from || !admitted.contains(&sequence);
 		self.filled.retain(|sequence| !outside(*sequence));
 		let mut kept = RangeSet::new();
