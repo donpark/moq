@@ -72,7 +72,11 @@ impl Header {
 			.copied()
 			.ok_or(Error::SampleRate)?;
 		let blocks = 1 + (data[6] & 3);
-		let header_len = if protection_absent == 1 { 7 } else { 7 + 2 * usize::from(blocks) };
+		let header_len = if protection_absent == 1 {
+			7
+		} else {
+			7 + 2 * usize::from(blocks)
+		};
 		if frame_len < header_len {
 			return Err(Error::FrameLength);
 		}
@@ -214,5 +218,17 @@ mod tests {
 			packet[1] = 0xf1 | layer << 1;
 			assert!(matches!(Header::parse(&packet), Err(Error::Syncword)));
 		}
+	}
+
+	#[test]
+	fn protected_multi_block_frames_keep_their_position_table_in_the_header() {
+		let mut packet = write_header(2, 44_100, 1, 11).unwrap().to_vec();
+		packet[1] &= !1;
+		packet[6] |= 3;
+		packet.extend_from_slice(&[0; 8]);
+		packet.extend_from_slice(&[1, 2, 3]);
+		let header = Header::parse(&packet).unwrap();
+		assert_eq!(header.blocks, 4);
+		assert_eq!(header.payload(&packet).unwrap(), [1, 2, 3]);
 	}
 }
