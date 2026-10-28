@@ -111,7 +111,7 @@ class SelectTest(unittest.TestCase):
             with self.subTest(path=path):
                 calls = self.selected(path, action="test")
                 self.assertTrue(any("/demo/carla/bridge#moq-carla-bridge" in call for call in calls), calls)
-        self.assertEqual(self.selected("demo/carla/web/src/main.ts"), [])
+        self.assertEqual(self.selected("demo/carla/web/src/player.ts"), [])
 
     def test_a_bench_selects_only_its_crate(self):
         bench = "rs/moq-stats/benches/producer_tick.rs"
