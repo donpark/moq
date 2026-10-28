@@ -8,7 +8,7 @@ control flow, to a sans-IO core (synchronous `handle_*` and `poll_transmit` /
 by a thin kio layer. It compares this with the kio `poll_*` version on:
 
 - implementation effort;
-- testability (deterministic replay without moq-clock);
+- testability (deterministic replay without kio::clock);
 - rust2's TypeScript translation and FFI export of the result;
 - compile time;
 - runtime cost.

@@ -40,9 +40,9 @@ url = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+kio = { path = "../kio", features = ["runtime", "sim"] }
 moq-auth = { path = ".", features = ["client", "serve"] }
 moq-auth-published = { package = "moq-auth", version = "=0.2.1", default-features = false }
-kio = { path = "../kio", features = ["runtime", "sim"] }
 moq-token = "0.7"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

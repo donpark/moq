@@ -23,7 +23,7 @@ ergonomic layer, and the gating proceeds regardless of the build measurement.
 - **Logic in `async fn` bodies:** an `async fn` that does more than call one
   `poll_*` becomes a `poll_*` first, or moves out of the library to the edges. List
   each one in the PR.
-- **Tests:** `#[moq_clock::test]` and `#[tokio::test]` bodies stay async, so test
+- **Tests:** `#[kio::test]` and `#[tokio::test]` bodies stay async, so test
   targets enable the feature.
 - **Cargo:** feature unification means one dependent enabling `async` enables it
   for the whole build. Make sure library-only builds, such as `cargo check -p

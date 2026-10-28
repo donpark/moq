@@ -44,8 +44,8 @@ eframe = { version = "0.36", default-features = false, features = ["default_font
 egui = "0.36"
 # Docked, rearrangeable panels. 0.21 is the newest release and pins egui 0.36.
 egui_dock = "0.21"
-moq-audio = { workspace = true, features = ["bus"] }
 kio = { workspace = true, features = ["runtime"] }
+moq-audio = { workspace = true, features = ["bus"] }
 moq-mux = { workspace = true }
 moq-net = { workspace = true }
 moq-scene = { workspace = true }
