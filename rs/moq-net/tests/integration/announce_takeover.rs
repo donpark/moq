@@ -147,6 +147,14 @@ async fn chain(version: &str, claim: &str) {
 	};
 	assert_eq!(drain(&mut at_relay).await, answered, "{version}: at the relay");
 	assert_eq!(drain(&mut at_edge).await, answered, "{version}: at the edge");
+
+	// A late snapshot starts what stands, replaying no takeover.
+	let mut late = edge.consume().announced();
+	let mut snapshot = vec![("start", "pool/p".to_string(), None)];
+	if claim != "pool/p" {
+		snapshot.insert(0, ("start", claim.to_string(), None));
+	}
+	assert_eq!(drain(&mut late).await, snapshot, "{version}: a late snapshot");
 }
 
 macro_rules! chain_tests {
@@ -215,6 +223,36 @@ async fn an_unrequested_publish_is_a_start() {
 		let _direct = worker.origin.publish("pool/q", origin::Route::default()).unwrap();
 		settle().await;
 		assert_eq!(drain(&mut announced).await, [("start", "pool/q".to_string(), None)]);
+	})
+	.await
+	.expect("timed out");
+}
+
+/// `W -> R` on lite-07 and `R -> E` on lite-06: the relay keeps its reader through the
+/// takeover and forwards it to the older edge as a start.
+#[moq_clock::test]
+async fn an_older_downstream_gets_a_start() {
+	moq_clock::timeout(TEST_TIMEOUT, async {
+		let worker = Worker::new(1, "pool", "w");
+		let relay = produce_origin(2);
+		let edge = produce_origin(3);
+		let _upstream = link("moq-lite-07-wip".parse().unwrap(), &worker.origin, &relay, 1).await;
+		let _downstream = link("moq-lite-06".parse().unwrap(), &relay, &edge, 1).await;
+		settle().await;
+
+		let mut at_relay = relay.consume().announced();
+		let mut at_edge = edge.consume().announced();
+		drain(&mut at_relay).await;
+		drain(&mut at_edge).await;
+
+		assert_eq!(watch(&relay, "pool/p").await, "w");
+		assert_eq!(
+			drain(&mut at_relay).await,
+			[("takeover", "pool/p".to_string(), Some("pool".to_string()))]
+		);
+		assert_eq!(drain(&mut at_edge).await, [("start", "pool/p".to_string(), None)]);
+		assert_eq!(watch(&edge, "pool/p").await, "w");
+		assert_eq!(worker.outputs.borrow().len(), 1, "the edge asked the worker again");
 	})
 	.await
 	.expect("timed out");
