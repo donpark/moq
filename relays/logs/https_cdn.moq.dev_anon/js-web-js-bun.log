@@ -3,27 +3,16 @@ https://cdn.moq.dev/anon negotiated ALPN: moq-lite-06
 announced: prefix=
 connected version=moq-lite-06
 announced: broadcast=anon/doom/game/e1m1 active=true
-announced: broadcast=aug-play/e2e-mobile/3e7a71d6-ec03-45f4-8dab-6d0b6721d2f6/camera.hang active=true
-announced: broadcast=aug-play/e2e-mobile/ce0f1a9c-fb62-4016-8e3f-bffd3a892172/camera.hang active=true
-announced: broadcast=aug-play/e2e-mobile/fddd35f6-e5d4-457e-84f2-1ce17b6d729a/camera.hang active=true
-announced: broadcast=aug-play/e2e-prejoin-mobile/1446e733-5c8d-45bd-80c6-0ff57321482b/camera.hang active=true
-announced: broadcast=aug-play/e2e-prejoin-mobile/f3255ad8-207c-4148-a8d3-d992439159ba/camera.hang active=true
-announced: broadcast=aug-play/e2e-room/10aefdda-b091-4399-9794-84f80656f90a/camera.hang active=true
-announced: broadcast=aug-play/e2e-room/20d100a5-efe6-446a-aa18-199493f3b3e4/camera.hang active=true
-announced: broadcast=aug-play/e2e-room/42041c41-8b18-4cc3-a573-23136b13af48/camera.hang active=true
-announced: broadcast=aug-play/e2e-room/905bf17b-5aea-42eb-b938-67d71f2cd832/camera.hang active=true
 announced: broadcast=boom-moq-s2 active=true
 announce: prefix=
-announced: broadcast=aug-play/e2e-room/905bf17b-5aea-42eb-b938-67d71f2cd832/camera.hang active=false
-announced: broadcast=aug-play/e2e-room/42041c41-8b18-4cc3-a573-23136b13af48/camera.hang active=false
-announced: broadcast=smoke-js-web-4885-25259.hang active=true
-subscribe start: id=0 broadcast=smoke-js-web-4885-25259.hang track=catalog.json
-subscribe ok: id=0 broadcast=smoke-js-web-4885-25259.hang track=catalog.json
-subscribe start: id=1 broadcast=smoke-js-web-4885-25259.hang track=video
-subscribe ok: id=1 broadcast=smoke-js-web-4885-25259.hang track=video
-received 7366 bytes from smoke-js-web-4885-25259.hang
-subscribe close: id=0 broadcast=smoke-js-web-4885-25259.hang track=catalog.json
-subscribe close: id=1 broadcast=smoke-js-web-4885-25259.hang track=video
+announced: broadcast=smoke-js-web-5111-9467.hang active=true
+subscribe start: id=0 broadcast=smoke-js-web-5111-9467.hang track=catalog.json
+subscribe ok: id=0 broadcast=smoke-js-web-5111-9467.hang track=catalog.json
+subscribe start: id=1 broadcast=smoke-js-web-5111-9467.hang track=video
+subscribe ok: id=1 broadcast=smoke-js-web-5111-9467.hang track=video
+received 7366 bytes from smoke-js-web-5111-9467.hang
+subscribe close: id=0 broadcast=smoke-js-web-5111-9467.hang track=catalog.json
+subscribe close: id=1 broadcast=smoke-js-web-5111-9467.hang track=video
 broadcast discovery failed; broadcasts resolve on request only. warn: session error: connection error: closed
  code: "GenericFailure"
 

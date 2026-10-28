@@ -4,19 +4,22 @@ connected version=moq-transport-22
 subscribe_namespace written: requestId=0
 announced: broadcast=openmoq/mtt/aiomoqt/bbb_4k30/moq_test_tracks_00/msf/cmaf/catalog/h264/1080/30/6000/2000/0/aac/2/128/1/0/clip/0 active=true
 announced: broadcast=openmoq/mtt/aiomoqt/artemis_directors/moq_test_tracks_00/msf/loc/catalog/h264/1080/30/6000/2000/0/aac/2/128/1/0/clip/0 active=true
-announced: broadcast=smoke-js-web-4885-810.hang active=true
-subscribe start: id=2 broadcast=smoke-js-web-4885-810.hang track=catalog.json
-subscribe written: id=2 broadcast=smoke-js-web-4885-810.hang track=catalog.json
-subscribe ok: id=2 broadcast=smoke-js-web-4885-810.hang track=catalog.json
-subscribe start: id=4 broadcast=smoke-js-web-4885-810.hang track=video
-subscribe written: id=4 broadcast=smoke-js-web-4885-810.hang track=video
-subscribe ok: id=4 broadcast=smoke-js-web-4885-810.hang track=video
-received 7043 bytes from smoke-js-web-4885-810.hang
-subscribe error: id=4 broadcast=smoke-js-web-4885-810.hang track=video error=session error: connection error: closed
+announced: broadcast=ci/player-soak/40604063417/aiomoqt-relay/loc active=true
+announced: broadcast=ci/player-soak/40604063417/aiomoqt-relay/cmaf active=true
+announced: broadcast=smoke-js-web-5111-1921.hang active=true
+subscribe start: id=2 broadcast=smoke-js-web-5111-1921.hang track=catalog.json
+subscribe written: id=2 broadcast=smoke-js-web-5111-1921.hang track=catalog.json
+subscribe ok: id=2 broadcast=smoke-js-web-5111-1921.hang track=catalog.json
+subscribe start: id=4 broadcast=smoke-js-web-5111-1921.hang track=video
+subscribe written: id=4 broadcast=smoke-js-web-5111-1921.hang track=video
+subscribe ok: id=4 broadcast=smoke-js-web-5111-1921.hang track=video
+received 7043 bytes from smoke-js-web-5111-1921.hang
 subscribe_namespace error: session error: connection error: closed
 announced: broadcast=openmoq/mtt/aiomoqt/bbb_4k30/moq_test_tracks_00/msf/cmaf/catalog/h264/1080/30/6000/2000/0/aac/2/128/1/0/clip/0 active=false
 announced: broadcast=openmoq/mtt/aiomoqt/artemis_directors/moq_test_tracks_00/msf/loc/catalog/h264/1080/30/6000/2000/0/aac/2/128/1/0/clip/0 active=false
-announced: broadcast=smoke-js-web-4885-810.hang active=false
+announced: broadcast=ci/player-soak/40604063417/aiomoqt-relay/loc active=false
+announced: broadcast=ci/player-soak/40604063417/aiomoqt-relay/cmaf active=false
+announced: broadcast=smoke-js-web-5111-1921.hang active=false
 broadcast discovery failed; broadcasts resolve on request only. warn: session error: connection error: closed
  code: "GenericFailure"
 
@@ -24,4 +27,5 @@ broadcast discovery failed; broadcasts resolve on request only. warn: session er
       at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:333:29)
       at async <anonymous> (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/ietf/subscriber.js:278:58)
 
-subscribe error: id=2 broadcast=smoke-js-web-4885-810.hang track=catalog.json error=session error: connection error: closed
+subscribe error: id=2 broadcast=smoke-js-web-5111-1921.hang track=catalog.json error=session error: connection error: closed
+subscribe error: id=4 broadcast=smoke-js-web-5111-1921.hang track=video error=session error: connection error: closed
