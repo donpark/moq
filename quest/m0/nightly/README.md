@@ -2,8 +2,8 @@
 
 ## Goal
 
-The scheduled Nightly on `main` passes end to end, so a red run means a new
-break instead of noise. Nightly is the backstop for what the PR gate skips on
+The scheduled Nightly and Interop runs on `main` pass end to end, so a red
+run means a new break instead of noise. Nightly is the backstop for what the PR gate skips on
 purpose (benches, examples, feature shapes; see
 [moq-dev/moq#5531](https://github.com/moq-dev/moq/pull/5531)), and it has
 failed every night since at least 2026-10-19, which let a bench and two
@@ -34,3 +34,4 @@ Public API: none. Wire: none.
 - [moq-net compiles in Fuzz and send-depth](/quest/m0/nightly/send-overflow.md) - the ietf publisher future stops overflowing the Send check
 - [Probing beside Cubic](/quest/m0/nightly/competing-cubic.md) - the `competing_cubic` probe test stays within its deadline budget
 - [cargo deny passes](/quest/m0/nightly/cargo-deny.md) - Audit stops failing on the yanked crypto-bigint and moq-studio's egui licenses
+- [Interop passes on main](/quest/m0/nightly/interop.md) - re-measure the stale wire-compat pin, fix the draft-14 harness test, and route each red cell to its owner
