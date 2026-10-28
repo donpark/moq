@@ -11,6 +11,16 @@ publishes a patch release (npm has 0.1.0 to 0.1.3).
 
 Decided 2026-10-27 (maintainer): one PR against `release` per backport, in m0.
 
+The implementation is ready in [moq-dev/moq#6961](https://github.com/moq-dev/moq/pull/6961),
+against `release` from `codex/backport-flate-budget`. It preserves the released
+API and passed `just check origin/release`; the 12 codec tests cover stopping
+inflation, owned output, and independent per-frame limits.
+
+Remaining: merge that PR once authorized, then publish and verify the patch
+release. The maintainer requested PRs only on 2026-10-27, so merging, version
+bumps, and publication are intentionally pending. Do not delete this quest
+until the release condition in Goal holds.
+
 `release`'s `js/flate/src/index.ts` is the older per-frame version (a 64 MiB
 `maxFrameSize`, not main's 32 MiB group budget), so port the two fixes onto its
 shape rather than main's budget:
