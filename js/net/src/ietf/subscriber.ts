@@ -553,6 +553,8 @@ export class Subscriber {
 						}
 						return count ?? 0;
 					}
+					// A refusal already ended the request, so end ours cleanly before failing it.
+					if (framed.type === RequestError.id) request.close();
 					throw new Error(`SubscribeNamespace rejected: typeId=0x${framed.type.toString(16)}`);
 				})();
 				// A consumer that leaves before the peer answers ends the request now, not on the answer.
