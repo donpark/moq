@@ -6114,7 +6114,7 @@ dependencies = [
 [[package]]
 name = "mp4-atom"
 version = "0.16.2"
-source = "git+https://github.com/kixelated/mp4-atom?rev=6c7fdedb96aca71268c35de9a109773021a8cfbc#6c7fdedb96aca71268c35de9a109773021a8cfbc"
+source = "git+https://github.com/kixelated/mp4-atom?rev=3e150f9683ac652ac26cd79ccb34322dfd2d1a64#3e150f9683ac652ac26cd79ccb34322dfd2d1a64"
 dependencies = [
  "bytes",
  "derive_more 2.1.1",
