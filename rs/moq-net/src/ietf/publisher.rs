@@ -10179,6 +10179,25 @@ mod serve_tests {
 				serving.await.unwrap();
 				assert_eq!(occurrences(&h.log, payload), 1, "{version} streamed={streamed}");
 				assert!(h.log.resets().is_empty(), "{version} streamed={streamed}");
+
+				// The first object's delta is its absolute Object ID.
+				let ids: Vec<u64> = data_streams(&h.log)
+					.into_values()
+					.filter_map(|sent| {
+						let bytes: Vec<u8> = sent
+							.into_iter()
+							.filter_map(|sent| match sent {
+								Sent::Write(bytes) => Some(bytes),
+								_ => None,
+							})
+							.flatten()
+							.collect();
+						let mut buf = bytes::Bytes::from(bytes);
+						let header = crate::coding::decode_buf(&mut buf, version, ietf::GroupHeader::decode).ok()?;
+						(header.group_id == 3).then(|| crate::coding::decode_varint(&mut &buf[..], version).unwrap())
+					})
+					.collect();
+				assert_eq!(ids, [5], "{version} streamed={streamed}");
 			}
 		}
 	}
