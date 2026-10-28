@@ -224,9 +224,21 @@ class Bump:
     alongside: str | None = None
 
 
+def baselines(found: list[Package], head: str) -> dict[str, str | None]:
+    """`released` for each package in `found`."""
+    since = {pkg.name: released(pkg, head) for pkg in found}
+    # A rider's own tag comes later, from the release its host's tag starts, so
+    # while that run is in flight its version shipped at the host's tag.
+    for rider in found:
+        host = since.get(rider.rides) if rider.rides else None
+        if since[rider.name] is None and host and rider.version(host) == rider.version(head):
+            since[rider.name] = host
+    return since
+
+
 def plan(head: str) -> list[Bump]:
     found = packages(head)
-    since = {pkg.name: released(pkg, head) for pkg in found}
+    since = baselines(found, head)
     bumps: dict[str, Bump] = {}
     for pkg in found:
         if since[pkg.name] is None:
@@ -292,16 +304,17 @@ class Tag:
 def pending(head: str) -> list[Tag]:
     """Each release tag HEAD's versions lack, for the packages that push their own."""
     found = packages(head)
+    since = baselines(found, head)
     tags = []
     ffi: str | None = None
     checked = False
     for pkg in found:
-        if not pkg.tag or pkg.rides or released(pkg, head) is not None:
+        if not pkg.tag or pkg.rides or since[pkg.name] is not None:
             continue
         blocker = None
         # A rider still at a released version needs its bump merged first: the
         # tag would publish that version again, which its release refuses.
-        stale = [rider for rider in found if rider.rides == pkg.name and released(rider, head) is not None]
+        stale = [rider for rider in found if rider.rides == pkg.name and since[rider.name] is not None]
         if stale:
             blocker = f"{stale[0].name} {stale[0].version(head)} is already released; merge its bump first"
         elif pkg.ffi:

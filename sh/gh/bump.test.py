@@ -241,6 +241,16 @@ class BumpTest(unittest.TestCase):
         self.commit("chore: bump")
         self.assertEqual(self.pending(assets), {"c-v0.8.1": None, "cpp-v0.2.0": None})
 
+    def test_obs_in_flight_from_a_cpp_tag_is_released(self):
+        self.commit("chore: bump", {"cpp/moq/VERSION": "0.1.1\n", "cpp/obs/VERSION": "0.7.1\n"})
+        # Release Cpp has not cut obs-moq-v0.7.1 yet.
+        self.git("tag", "cpp-v0.1.1")
+        self.commit("docs: unrelated", {"README.md": ""})
+        self.assertEqual(self.planned(), {})
+        self.assertEqual(self.pending(), {})
+        self.commit("fix(obs): plugin only", {"cpp/obs/src/plugin.cpp": "// fix\n"})
+        self.assertEqual(self.planned(), {"moq (C++)": "0.1.2", "obs-moq (OBS)": "0.7.2"})
+
     def test_obs_never_pushes_its_own_tag(self):
         self.commit("chore: bump obs", {"cpp/obs/VERSION": "0.8.0\n"})
         self.assertEqual(self.planned(), {"moq (C++)": "0.1.1"})
