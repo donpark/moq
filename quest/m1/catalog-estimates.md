@@ -23,8 +23,9 @@ Decided 2026-10-28 (maintainer):
 
 - **`jitter` and `delay` stay in hang.** @moq/watch, moq-audio and the TS
   export use them as latency floors, and a receiver can't measure cross-track
-  skew itself. Hang keeps updating in place
-  ([identity enforcement](/quest/m1/catalog-identity-rs.md)).
+  skew itself. Hang keeps updating them in place; only a decoder identity
+  change publishes a new track
+  ([#7110](https://github.com/moq-dev/moq/pull/7110)).
 - **Hang quantizes the rise.** A new `jitter` or `delay` republishes only when
   it crosses the next multiple of the track's frame duration. Measurement is
   unchanged.
