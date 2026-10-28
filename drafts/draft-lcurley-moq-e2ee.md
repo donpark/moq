@@ -280,8 +280,8 @@ Hang {{hang}} `catalog.json` and MSF's `catalog` are semantic names; authorized 
 The decrypted catalog is unchanged from its plaintext form: every track it references, including rendition-map keys, `track` fields, and application extensions, keeps its semantic name.
 A subscriber derives the physical name of each track it reads; neither side rewrites the catalog, so extensions need no profile support.
 
-A transport that compresses a track compresses the protected bytes, which do not compress, so a publisher SHOULD NOT mark a protected track compressed.
-This profile defines no compression before AEAD.
+If a track is compressed, compression is applied to the plaintext before AEAD and reversed after decryption.
+Encrypting then compressing is forbidden: ciphertext does not compress.
 
 
 # Bounds {#bounds}
