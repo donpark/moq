@@ -88,7 +88,8 @@ pub struct Config {
 	/// is recovered instead: the lost frames conceal, and the one before the
 	/// arriving packet comes back from its in-band forward error copy when the
 	/// sender coded one. Longer holes stay holes, since hiding a skipped group
-	/// is worse than showing it.
+	/// is worse than showing it. Refused above one second at consumer
+	/// construction.
 	pub conceal: Duration,
 }
 
@@ -668,5 +669,34 @@ mod tests {
 		let concealed = decoder.recover(None).unwrap();
 		assert_eq!(concealed.samples.len(), 960);
 		assert!(!concealed.activity.is_dtx());
+	}
+
+	/// Recovery advances the decoder as if the lost frame had decoded, so the
+	/// arriving packet continues the stream instead of starting over. A reset
+	/// between them would throw away the state the copy rebuilt.
+	#[test]
+	fn opus_recover_leaves_the_decoder_ready_for_the_next_packet() {
+		let packets = stepped_sine_packets(true);
+		let mut clean = Decoder::new(&opus_catalog()).unwrap();
+		let decoded: Vec<Vec<f32>> = packets
+			.iter()
+			.map(|packet| clean.decode(packet).unwrap().samples)
+			.collect();
+
+		let mut recovered = Decoder::new(&opus_catalog()).unwrap();
+		for packet in &packets[..3] {
+			recovered.decode(packet).unwrap();
+		}
+		recovered.recover(Some(&packets[4])).unwrap();
+		let next = recovered.decode(&packets[4]).unwrap().samples;
+
+		let mse = |a: &[f32], b: &[f32]| {
+			a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>() / a.len() as f32
+		};
+		assert!(
+			mse(&next, &decoded[4]) < 0.01,
+			"the packet after recovery should decode close to clean, got {}",
+			mse(&next, &decoded[4]),
+		);
 	}
 }

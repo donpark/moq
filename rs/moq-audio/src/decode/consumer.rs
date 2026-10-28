@@ -8,6 +8,11 @@ use super::decoder::{Config, Decoder, Start};
 use crate::resample::{Resampler, remix, validate_channels};
 use crate::{Activity, Error, Frame};
 
+/// The largest [`Config::conceal`] a consumer accepts. Concealment covers
+/// loss bursts; the work it permits is sized by a peer-controlled hole, so
+/// the bound is enforced rather than documented.
+const MAX_CONCEAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Subscribe to a moq-mux audio track and emit decoded PCM in the layout
 /// declared by [`Config`].
 ///
@@ -65,6 +70,15 @@ impl Consumer {
 		config: Config,
 	) -> Result<Self, Error> {
 		let decoder = Decoder::new(catalog)?;
+		// A conceal bound is developer policy, but the work and memory it
+		// permits are sized by a peer-controlled hole: refuse the absurd at
+		// construction rather than allocate it on demand.
+		if config.conceal > MAX_CONCEAL {
+			return Err(Error::Unsupported(format!(
+				"conceal {:?} exceeds {MAX_CONCEAL:?}: it covers loss bursts, not skips",
+				config.conceal
+			)));
+		}
 		let sample_rate = config.sample_rate.unwrap_or_else(|| decoder.sample_rate());
 		let channels = config.channels.unwrap_or_else(|| decoder.channel_count());
 		validate_channels(channels)?;
@@ -167,10 +181,13 @@ impl Consumer {
 	/// from and the next frame carries the new one.
 	///
 	/// A timestamp that doesn't continue the previous packet is a hole in the
-	/// output, not a splice: nothing is carried across it, and the frames on either
-	/// side stay anchored to their own packet timeline, so the hole is there to
-	/// see. "Doesn't continue" allows for the quantization the stamps carry, which
-	/// on a millisecond-stamped ingest is most of a millisecond.
+	/// output, not a splice: nothing is carried across it, and the frames on
+	/// either side stay anchored to their own packet timeline, so the hole is
+	/// there to see. "Doesn't continue" allows for the quantization the stamps
+	/// carry, which on a millisecond-stamped ingest is most of a millisecond.
+	/// With [`Config::conceal`] set, a hole the codec can cover is filled
+	/// instead and the timeline stays continuous; what it cannot cover remains
+	/// a hole.
 	pub async fn read(&mut self) -> Result<Option<Frame>, Error> {
 		loop {
 			if let Some(frame) = self.ready.pop_front() {
@@ -202,12 +219,27 @@ impl Consumer {
 				&& let Some(next) = self.next_start
 				&& discontinuous(next, mux_frame.timestamp)
 			{
+				let start = next;
+				let end = mux_frame.timestamp;
 				// What the resampler held from before the hole belongs before
 				// anything recovered over it, and recovery reads the prediction
-				// history the gap reset clears: drain, recover, then reset.
+				// history a reset clears: drain first, then recover.
 				let tail = self.drain_tail()?;
-				let recovered = self.recover(next, mux_frame.timestamp, &mux_frame.payload)?;
-				self.gap()?;
+				let (recovered, covered) = self.recover(start, end, &mux_frame.payload)?;
+				// A full recovery is not a gap. Covered zero (nothing recovered:
+				// overlap, too long, no concealment) leaves the hole to see, so
+				// the frame math runs only where it has a span to measure.
+				let full = covered > 0
+					&& covered >= frames_between(start, end, self.decoder.sample_rate())?;
+				if !full {
+					// What the codec could not fill is a discontinuity after
+					// all: prediction and timeline start over before the next
+					// packet, and the hole stays in the output to see.
+					self.gap()?;
+				}
+				// A fully recovered hole is not a gap: the decoder keeps the
+				// prediction the recovery built, the activity bookkeeping
+				// survives, and the timeline continues where it would have.
 				if let Some(frame) = tail {
 					self.ready.push_back(frame);
 				}
@@ -364,27 +396,33 @@ impl Consumer {
 	/// packet's in-band forward error copy when the sender coded one.
 	///
 	/// Covers at most [`Config::conceal`], and only where the decoder can
-	/// conceal at all. Frames are stamped into the hole and stop exactly where
-	/// the arriving packet resumes.
+	/// conceal at all. Frames are stamped on the decoded timeline the frames
+	/// before the hole use, so a fully covered hole meets them exactly; the
+	/// covered count lets the caller tell a full recovery (which is not a gap)
+	/// from a partial one (which is). An overlap is not a hole and is left to
+	/// the gap path.
 	fn recover(
 		&mut self,
 		start: moq_net::Timestamp,
 		end: moq_net::Timestamp,
 		next_packet: &[u8],
-	) -> Result<Vec<Frame>, Error> {
+	) -> Result<(Vec<Frame>, usize), Error> {
 		let mut frames = Vec::new();
-		if self.config.conceal.is_zero() {
-			return Ok(frames);
+		if end <= start
+			|| self.config.conceal.is_zero()
+			|| std::time::Duration::from(end.checked_sub(start)?) > self.config.conceal
+		{
+			return Ok((frames, 0));
 		}
 		let Some(conceal_len) = self.decoder.conceal_len() else {
-			return Ok(frames);
+			return Ok((frames, 0));
 		};
-		if std::time::Duration::from(end.checked_sub(start)?) > self.config.conceal {
-			return Ok(frames);
-		}
 		let rate = self.decoder.sample_rate();
 		let channels = self.decoder.channel_count().max(1) as usize;
 		let hole = frames_between(start, end, rate)?;
+		// The frames before the hole sit on the delay-shifted output timeline,
+		// so recovery starts there too and a full hole meets them exactly.
+		let base = rewind(start, self.delay_trimmed, rate)?.max(self.epoch.unwrap_or(start));
 		let mut covered = 0usize;
 		while covered < hole {
 			let remaining = hole - covered;
@@ -401,7 +439,7 @@ impl Consumer {
 				length = remaining;
 				samples.truncate(length * channels);
 			}
-			let decoded_at = advance(start, covered, rate)?;
+			let decoded_at = advance(base, covered, rate)?;
 			let (pcm, timestamp) = match self.resampler.as_mut() {
 				Some(r) => {
 					let held = if r.pending_frames() == 0 {
@@ -432,7 +470,7 @@ impl Consumer {
 			}
 			covered += length;
 		}
-		Ok(frames)
+		Ok((frames, covered))
 	}
 
 	/// The tail the resampler is still holding when the track ends, once.
@@ -1124,12 +1162,73 @@ mod tests {
 		.await
 		.unwrap();
 
-		// Six 20 ms packets with the fourth missing.
+		// Six 20 ms packets, all encoded so the fifth carries the fourth's
+		// in-band copy; the fourth is never published.
 		let pcm = vec![0.25f32; encoder.frame_size()];
-		for (packet, timestamp) in [0u64, 20_000, 40_000, 60_000, 80_000, 100_000].into_iter().enumerate() {
+		let payloads: Vec<_> = (0..6).map(|_| encoder.encode(&pcm).unwrap().payload).collect();
+		for (packet, payload) in payloads.iter().enumerate() {
 			if packet == 3 {
 				continue;
 			}
+			producer
+				.write(moq_mux::container::Frame {
+					timestamp: Timestamp::from_micros(packet as u64 * 20_000).unwrap(),
+					duration: None,
+					payload: payload.clone(),
+					keyframe: true,
+				})
+				.unwrap();
+			producer.cut(None).unwrap();
+		}
+		producer.finish().unwrap();
+
+		let mut frames = Vec::new();
+		while let Some(frame) = consumer.read().await.unwrap() {
+			frames.push(frame);
+		}
+		// A fully recovered hole is not a gap: the pre-skip slides the whole
+		// timeline back (6.5 ms), and every frame meets the next exactly,
+		// including the recovered one.
+		let stamps: Vec<u128> = frames.iter().map(|frame| frame.timestamp.as_micros()).collect();
+		assert_eq!(stamps, [0, 13_500, 33_500, 53_500, 73_500, 93_500]);
+		for pair in frames.windows(2) {
+			let samples = pair[0].data.len() / size_of::<f32>();
+			let ends_at = pair[0].timestamp.as_micros() + samples as u128 * 1_000_000 / 48_000;
+			assert_eq!(ends_at, pair[1].timestamp.as_micros(), "frames must meet");
+		}
+	}
+
+	/// An overlapping packet is not a hole: with `conceal` set the consumer
+	/// handles it exactly as it does without recovery, and never errors.
+	#[tokio::test]
+	async fn an_overlapping_packet_is_not_a_hole() {
+		let input = Input {
+			format: Format::F32,
+			sample_rate: 48_000,
+			channels: 1,
+		};
+		let mut encoder = Encoder::new(&crate::encode::Config::new(input)).unwrap();
+		let catalog = encoder.catalog();
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast.create_track("audio", hang::container::track_info()).unwrap();
+		let subscriber = broadcast.consume();
+		let mut producer = moq_mux::container::Producer::new(track, moq_mux::catalog::hang::Container::Legacy);
+		let mut consumer = Consumer::new(
+			&subscriber,
+			&catalog,
+			"audio",
+			Config {
+				conceal: std::time::Duration::from_millis(120),
+				..Config::new()
+			},
+		)
+		.await
+		.unwrap();
+
+		// A 20 ms packet at 0, then one at 15 ms: the second overlaps.
+		let pcm = vec![0.25f32; encoder.frame_size()];
+		for timestamp in [0u64, 15_000] {
 			producer
 				.write(moq_mux::container::Frame {
 					timestamp: Timestamp::from_micros(timestamp).unwrap(),
@@ -1142,15 +1241,35 @@ mod tests {
 		}
 		producer.finish().unwrap();
 
-		let mut stamps = Vec::new();
-		while let Some(frame) = consumer.read().await.unwrap() {
-			stamps.push(frame.timestamp.as_micros());
+		let mut frames = 0;
+		while let Some(_frame) = consumer.read().await.unwrap() {
+			frames += 1;
 		}
-		// Stamps follow the fork's documented model: the epoch's pre-skip slides
-		// the first packets back (0, 13.5k, 33.5k), and a hole re-anchors each
-		// side to its own packet timeline, so the recovered frame lands where the
-		// missing packet would have said.
-		assert_eq!(stamps, [0, 13_500, 33_500, 60_000, 80_000, 100_000]);
+		assert_eq!(frames, 2);
+	}
+
+	/// The conceal bound is enforced at construction: the work it permits is
+	/// sized by a peer-controlled hole.
+	#[tokio::test]
+	async fn an_absurd_conceal_bound_is_refused() {
+		let input = Input {
+			format: Format::F32,
+			sample_rate: 48_000,
+			channels: 1,
+		};
+		let encoder = Encoder::new(&crate::encode::Config::new(input)).unwrap();
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let result = Consumer::new(
+			&broadcast.consume(),
+			&encoder.catalog(),
+			"audio",
+			Config {
+				conceal: std::time::Duration::from_secs(60),
+				..Config::new()
+			},
+		)
+		.await;
+		assert!(matches!(result, Err(Error::Unsupported(_))));
 	}
 
 	#[tokio::test]
