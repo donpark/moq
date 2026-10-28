@@ -901,7 +901,10 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// A segment is the unit a group carries, which is what lets audio (whose samples are all
 	/// independently decodable, so it has no boundary of its own) follow the same segmentation as
 	/// video instead of opening a group per fragment.
-	fn starts_segment(&self, moof: &Moof, has_video: bool) -> bool {
+	///
+	/// `mdat_len` bounds the scan: each sample takes at least one byte of the mdat, and the resolver
+	/// refuses any past it, so a forged field-less run of billions of samples isn't walked here.
+	fn starts_segment(&self, moof: &Moof, has_video: bool, mdat_len: usize) -> bool {
 		if self.pending_cut {
 			return true;
 		}
@@ -929,6 +932,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 					.trun
 					.iter()
 					.flat_map(|trun| trun.samples.iter())
+					.take(mdat_len)
 					.any(|entry| track.defaults.resolve(&traf.tfhd, &entry).is_sync())
 		})
 	}
@@ -952,7 +956,7 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		// Resolve the segment boundary BEFORE the per-track loop. A moof can carry both an audio
 		// and a video traf, and whichever comes first must see the same answer, or the other rolls
 		// a fragment late and the two tracks stop agreeing on where segments fall.
-		if self.starts_segment(&moof, has_video) {
+		if self.starts_segment(&moof, has_video, payload.len()) {
 			self.segment += 1;
 			// A boundary the source declared is also an HLS segment boundary; one merely inferred
 			// from a keyframe is not, since the default pacing already sees that group open.

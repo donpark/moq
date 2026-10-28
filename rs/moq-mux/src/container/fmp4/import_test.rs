@@ -925,6 +925,60 @@ async fn unwrapped_samples_present_at_their_composition_time() {
 }
 
 /// bbb's init with `entries` as the edit list of track `track_id`.
+/// Once the video group is open, the keyframe scan for a segment boundary stops at the mdat
+/// rather than walking a forged moof's field-less runs of `u32::MAX` non-sync samples.
+#[test]
+fn fieldless_runs_do_not_stall_the_segment_scan() {
+	let (_, (video_id, video_scale), _) = bbb_init();
+	let init = bbb_init_with_edits(video_id, vec![media_edit(0)]);
+	let tick = video_scale.as_u64() / 24;
+
+	let moof = mp4_atom::Moof {
+		mfhd: mp4_atom::Mfhd { sequence_number: 2 },
+		traf: vec![mp4_atom::Traf {
+			tfhd: mp4_atom::Tfhd {
+				track_id: video_id,
+				default_sample_duration: Some(tick as u32),
+				default_sample_size: Some(1),
+				default_sample_flags: Some(0x0001_0000),
+				..Default::default()
+			},
+			tfdt: Some(mp4_atom::Tfdt {
+				base_media_decode_time: tick,
+			}),
+			trun: vec![
+				mp4_atom::Trun {
+					data_offset: None,
+					samples: mp4_atom::TrunSamples::Inherited {
+						count: u32::MAX,
+						first_flags: None,
+					},
+				};
+				1000
+			],
+			..Default::default()
+		}],
+	};
+	let mut forged = Vec::new();
+	moof.encode(&mut forged).unwrap();
+	mp4_atom::Mdat { data: vec![0; 6] }.encode(&mut forged).unwrap();
+
+	for passthrough in [false, true] {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
+		fmp4.decode(&init).unwrap();
+		fmp4.decode(&video_fragment(video_id, 0, tick, &[(0, 0, 0xA)])).unwrap();
+		assert!(
+			matches!(
+				fmp4.decode(&forged),
+				Err(crate::Error::Cmaf(super::Error::SampleRangeOutOfBounds { .. }))
+			),
+			"passthrough {passthrough}"
+		);
+	}
+}
+
 fn bbb_init_with_edits(track_id: u32, entries: Vec<mp4_atom::ElstEntry>) -> Vec<u8> {
 	let (init, _, _) = bbb_init();
 	let (ftyp, mut moov) = decode_init(&init);
