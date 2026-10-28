@@ -1,6 +1,7 @@
 // Main PRs run in the isolated batched gate; release PRs retain their own checks.
 import assert from "node:assert/strict";
-import { readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 const workflow = async (name: string) => Bun.YAML.parse(await Bun.file(`.github/workflows/${name}.yml`).text());
 const check = await workflow("check");
@@ -58,6 +59,44 @@ assert.ok(!JSON.stringify(land.jobs.check).includes("APP_PRIVATE_KEY"));
 assert.ok(land.jobs.check.steps.find((step: { id?: string }) => step.id === "check").run.includes('just ci "$base"'));
 assert.ok(land.jobs.land.steps.some((step: { run?: string }) => step.run?.includes("quest land push")));
 
+// A failed engine process must fail its job, rather than publish an empty
+// successful output. No phase in this fixture touches GitHub or a real ref.
+await mkdir(".tmp", { recursive: true });
+const scratch = await mkdtemp(join(process.cwd(), ".tmp/land-policy-"));
+try {
+	const bin = join(scratch, "bin");
+	await mkdir(bin);
+	await writeFile(join(bin, "quest"), '#!/bin/sh\nprintf "%s\\n" "$ENGINE_OUTPUT"\nexit "$ENGINE_EXIT"\n', {
+		mode: 0o755,
+	});
+	await writeFile(join(bin, "git"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+	for (const [job, id] of [
+		["resolve", "resolve"],
+		["check", "check"],
+	]) {
+		const script = land.jobs[job].steps.find((step: { id?: string }) => step.id === id).run;
+		for (const code of [0, 33]) {
+			const output = join(scratch, `${job}-${code}`);
+			const result = Bun.spawnSync(["bash", "-euo", "pipefail", "-c", script], {
+				cwd: scratch,
+				env: {
+					...process.env,
+					PATH: `${bin}:${process.env.PATH}`,
+					PLAN: JSON.stringify({ base: { sha: "a".repeat(40) } }),
+					GITHUB_OUTPUT: output,
+					ENGINE_EXIT: String(code),
+					ENGINE_OUTPUT: '{"checks":[]}',
+				},
+			});
+			assert.equal(result.exitCode, code, `${job} must propagate engine failure`);
+			const posted = await Bun.file(output).exists();
+			assert.equal(posted, code === 0, `${job} must not publish success after failure`);
+		}
+	}
+} finally {
+	await rm(scratch, { recursive: true, force: true });
+}
+
 // Every other workflow stays out of main PRs and main's merge groups: optional
 // checks run nightly on main, and on release PRs through the Release gate.
 const files = (await readdir(".github/workflows")).filter((file) => file.endsWith(".yml"));
@@ -69,7 +108,11 @@ for (const file of files) {
 	assert.equal(config.on.pull_request, undefined, `${file} must run on release PRs through release-gate.yml`);
 	for (const [id, job] of Object.entries(config.jobs ?? {})) {
 		if (JSON.stringify(job).includes("APP_PRIVATE_KEY")) {
-			assert.equal((job as { environment?: string }).environment, "moq-bot", `${file}/${id} must scope the bot key`);
+			assert.equal(
+				(job as { environment?: string }).environment,
+				"moq-bot",
+				`${file}/${id} must scope the bot key`,
+			);
 		}
 	}
 }
@@ -97,7 +140,11 @@ const calls = Object.entries(gate.jobs).filter(([, job]) => (job as { uses?: str
 for (const [id, job] of calls) {
 	const called = await workflow(job.uses.replace(/^\.\/\.github\/workflows\/|\.yml$/g, ""));
 	assert.ok("workflow_call" in called.on, `${job.uses} must be callable`);
-	assert.equal(id, job.uses.replace(/^\.\/\.github\/workflows\/|\.yml$/g, ""), `${id} must be named after its workflow`);
+	assert.equal(
+		id,
+		job.uses.replace(/^\.\/\.github\/workflows\/|\.yml$/g, ""),
+		`${id} must be named after its workflow`,
+	);
 }
 // Every workflow that used to run on release PRs blocks a release now.
 assert.deepEqual(calls.map(([id]) => id).sort(), [
