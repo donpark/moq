@@ -2300,9 +2300,12 @@ mod test {
 			for group in held {
 				assert!(group.poll_read_frame(&waiter).is_pending());
 			}
+			let mut refused = 0;
 			while let Poll::Ready(request) = dynamic.poll_requested_fill_group(&waiter) {
 				request.unwrap().reject(Error::NotFound);
+				refused += 1;
 			}
+			assert!(refused > 0, "short_first={short_first}: the recovery fetch arrives");
 
 			moq_clock::sleep(short).await;
 			let res = quick_held.poll_read_frame(&waiter);
