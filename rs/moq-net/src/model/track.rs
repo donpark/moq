@@ -1269,10 +1269,16 @@ impl TrackState {
 	}
 
 	/// The live feed's cached groups within `range`, by sequence: never fetched backfill.
-	fn live(&self, range: impl ops::RangeBounds<u64>) -> impl DoubleEndedIterator<Item = (&u64, &Slot)> {
-		self.visible
-			.range(range)
-			.map(|sequence| (sequence, self.lookup.get(sequence).expect("an indexed live slot")))
+	fn live(&self, range: impl ops::RangeBounds<u64> + Clone) -> impl DoubleEndedIterator<Item = (&u64, &Slot)> {
+		// Without backfill every cached group is the feed's, so the cache is walked as is.
+		let all = self.visible.len() == self.lookup.len();
+		let cached = all.then(|| self.lookup.range(range.clone()));
+		let indexed = (!all).then(|| {
+			self.visible
+				.range(range)
+				.map(|sequence| (sequence, self.lookup.get(sequence).expect("an indexed live slot")))
+		});
+		cached.into_iter().flatten().chain(indexed.into_iter().flatten())
 	}
 
 	/// The first live-feed group at or above `from` that `servable` covers for which `f`
