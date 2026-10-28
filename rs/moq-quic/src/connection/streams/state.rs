@@ -13,6 +13,7 @@ use tracing::{debug, trace};
 use super::{
 	Next, Recv, Retransmits, Schedule, Send, SendState, ShouldTransmit, StreamEvent, StreamHalf, ThinRetransmits,
 	lease::Rank,
+	send::{End, Error},
 };
 use crate::{
 	Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
@@ -87,6 +88,8 @@ pub(crate) struct StreamsState {
 	pub(super) side: Side,
 	// Set of streams that are currently open, or could be immediately opened by the peer
 	pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
+	/// How each send stream whose state is gone ended, until the application releases its ID
+	pub(super) ends: FxHashMap<StreamId, End>,
 	pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
 	pub(super) free_recv: Vec<StreamRecv>,
 	pub(super) next: [u64; 2],
@@ -116,7 +119,7 @@ pub(crate) struct StreamsState {
 	/// permitted to open but which have not yet been opened.
 	pub(super) send_streams: usize,
 	/// Streams with outgoing data queued and outgoing datagrams, in the order to send them
-	pub(super) pending: Schedule<StreamId, frame::Datagram>,
+	pub(super) pending: Schedule<StreamId, frame::OutgoingDatagram>,
 
 	pub(super) events: VecDeque<StreamEvent>,
 	/// Streams blocked on connection-level flow control or stream window space
@@ -197,6 +200,7 @@ impl StreamsState {
 		Self {
 			side,
 			send: FxHashMap::default(),
+			ends: FxHashMap::default(),
 			recv: FxHashMap::default(),
 			free_recv: Vec::new(),
 			next: [0, 0],
@@ -466,8 +470,8 @@ impl StreamsState {
 		// A reliable reset lingers until the data below its Reliable Size is acknowledged too, and
 		// one since shrunk by STOP_SENDING until its replacement is
 		if e.get_mut().as_mut().is_some_and(|s| s.reset_acked(reliable_size)) {
-			if let (_, Some(mut stream)) = e.remove_entry() {
-				self.pending.leave(&mut stream.slot);
+			if let (_, Some(stream)) = e.remove_entry() {
+				self.send_freed(id, stream);
 			}
 			self.stream_freed(id, StreamHalf::Send);
 		}
@@ -728,8 +732,8 @@ impl StreamsState {
 						continue;
 					}
 					let datagram = self.pending.sent_datagram(group);
-					trace!(len = datagram.data.len(), "DATAGRAM");
-					datagram.encode(true, buf);
+					trace!(len = datagram.len(), "DATAGRAM");
+					datagram.encode(buf);
 					written.datagrams += 1;
 					continue;
 				}
@@ -861,8 +865,8 @@ impl StreamsState {
 
 		// A reset is not reported as finished, like one without a Reliable Size
 		let reset = stream.is_reset();
-		if let (_, Some(mut stream)) = entry.remove_entry() {
-			self.pending.leave(&mut stream.slot);
+		if let (_, Some(stream)) = entry.remove_entry() {
+			self.send_freed(id, stream);
 		}
 		self.stream_freed(id, StreamHalf::Send);
 		if !reset {
@@ -1151,6 +1155,34 @@ impl StreamsState {
 		}
 	}
 
+	/// Drop a send stream's state, keeping how it ended until the application releases its ID
+	fn send_freed(&mut self, id: StreamId, mut stream: Box<Send>) {
+		self.pending.leave(&mut stream.slot);
+		if !stream.released
+			&& let Some(end) = stream.end()
+		{
+			self.ends.insert(id, end);
+		}
+	}
+
+	/// The state of send stream `id`, allocated on first use
+	///
+	/// A free function over the map, so the caller can still reach the other fields.
+	pub(super) fn send_mut(
+		send: &mut FxHashMap<StreamId, Option<Box<Send>>>,
+		id: StreamId,
+		max_data: VarInt,
+	) -> Result<&mut Send, Error> {
+		let stream = send
+			.get_mut(&id)
+			.ok_or(Error::Closed)?
+			.get_or_insert_with(|| Send::new(max_data));
+		match stream.released {
+			true => Err(Error::Closed),
+			false => Ok(stream),
+		}
+	}
+
 	/// Update counters for removal of a stream
 	pub(super) fn stream_freed(&mut self, id: StreamId, half: StreamHalf) {
 		if id.initiator() != self.side {
@@ -1214,10 +1246,12 @@ pub(super) fn get_or_insert_recv(opt: &mut Option<StreamRecv>, initial_max_data:
 mod tests {
 	use super::*;
 	use crate::{
-		LeaseError, ReadableError, RecvStream, SendStream, TransportErrorCode, WriteError,
-		connection::State as ConnState, connection::Streams,
+		TransportErrorCode,
+		connection::State as ConnState,
+		connection::Streams,
+		connection::streams::{recv, send},
 	};
-	use bytes::Bytes;
+	use bytes::{Buf, Bytes};
 
 	fn make(side: Side) -> StreamsState {
 		StreamsState::new(
@@ -1247,21 +1281,21 @@ mod tests {
 			}
 			.open(Dir::Uni, Default::default())
 			.unwrap();
-			let mut stream = SendStream {
+			let mut stream = send::Stream {
 				id,
 				state: &mut server,
 				pending: &mut pending,
 				conn_state: &state,
 			};
-			assert_eq!(stream.write(b"blocked"), Err(WriteError::Blocked));
-			assert_eq!(stream.write(b"blocked"), Err(WriteError::Blocked));
+			assert_eq!(stream.write(&mut &b"blocked"[..]), Err(send::Error::Blocked));
+			assert_eq!(stream.write(&mut &b"blocked"[..]), Err(send::Error::Blocked));
 			assert_eq!(stream.state.connection_blocked.len(), 1);
 			stream.reset(0u32.into()).unwrap();
 			assert!(
 				stream.state.connection_blocked.is_empty(),
 				"reset writer no longer waits for credit"
 			);
-			assert_eq!(stream.write(b"blocked"), Err(WriteError::ClosedStream));
+			assert_eq!(stream.write(&mut &b"blocked"[..]), Err(send::Error::Closed));
 			server.reset_acked(id, 0);
 			assert!(server.send.is_empty());
 			assert!(server.connection_blocked.is_empty());
@@ -1284,15 +1318,15 @@ mod tests {
 		}
 		.open(Dir::Uni, Default::default())
 		.unwrap();
-		let mut stream = SendStream {
+		let mut stream = send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
-		assert_eq!(stream.write(b"blocked"), Err(WriteError::Blocked));
+		assert_eq!(stream.write(&mut &b"blocked"[..]), Err(send::Error::Blocked));
 		stream.finish().unwrap();
-		assert_eq!(stream.write(b"closed"), Err(WriteError::ClosedStream));
+		assert_eq!(stream.write(&mut &b"closed"[..]), Err(send::Error::Closed));
 		server.received_ack_of(frame::StreamMeta {
 			id,
 			offsets: 0..0,
@@ -1322,13 +1356,13 @@ mod tests {
 			.open(Dir::Uni, Default::default())
 			.unwrap();
 			assert_eq!(
-				SendStream {
+				send::Stream {
 					id: holder,
 					state: &mut server,
 					pending: &mut pending,
 					conn_state: &state
 				}
-				.write(b"x"),
+				.write(&mut &b"x"[..]),
 				Ok(1)
 			);
 			let id = Streams {
@@ -1337,21 +1371,21 @@ mod tests {
 			}
 			.open(Dir::Uni, Default::default())
 			.unwrap();
-			let mut stream = SendStream {
+			let mut stream = send::Stream {
 				id,
 				state: &mut server,
 				pending: &mut pending,
 				conn_state: &state,
 			};
-			assert_eq!(stream.write(b"blocked"), Err(WriteError::Blocked));
+			assert_eq!(stream.write(&mut &b"blocked"[..]), Err(send::Error::Blocked));
 			let code = 7u32.into();
 			stream.state.received_stop_sending(id, code).unwrap();
 			assert_eq!(stream.state.poll(), Some(StreamEvent::Stopped { id, error_code: code }));
-			assert_eq!(stream.write(b"stopped"), Err(WriteError::Stopped(code)));
-			assert_eq!(stream.write(&[]), Err(WriteError::Stopped(code)));
-			let mut chunks = [Bytes::from_static(b"stopped")];
-			assert_eq!(stream.write_chunks(&mut chunks), Err(WriteError::Stopped(code)));
-			assert_eq!(chunks[0], b"stopped"[..]);
+			assert_eq!(stream.write(&mut &b"stopped"[..]), Err(send::Error::Stopped(code)));
+			assert_eq!(stream.write(&mut &[][..]), Err(send::Error::Stopped(code)));
+			let mut chunk = Bytes::from_static(b"stopped");
+			assert_eq!(stream.write(&mut chunk), Err(send::Error::Stopped(code)));
+			assert_eq!(chunk, b"stopped"[..]);
 			assert!(stream.state.connection_blocked.is_empty());
 			assert_eq!(stream.state.write_limit(), 0);
 			assert_eq!(stream.state.send[&holder].as_ref().unwrap().pending.buffered(), 1);
@@ -1375,19 +1409,19 @@ mod tests {
 				}
 				.open(Dir::Uni, Default::default())
 				.unwrap();
-				let mut stream = SendStream {
+				let mut stream = send::Stream {
 					id,
 					state: &mut server,
 					pending: &mut pending,
 					conn_state: &state,
 				};
-				assert_eq!(stream.write(b"x"), Err(WriteError::Blocked));
-				assert_eq!(stream.write(b"x"), Err(WriteError::Blocked));
+				assert_eq!(stream.write(&mut &b"x"[..]), Err(send::Error::Blocked));
+				assert_eq!(stream.write(&mut &b"x"[..]), Err(send::Error::Blocked));
 				id
 			})
 			.collect();
 		server.received_stop_sending(ids[0], 9u32.into()).unwrap();
-		SendStream {
+		send::Stream {
 			id: ids[1],
 			state: &mut server,
 			pending: &mut pending,
@@ -1395,7 +1429,7 @@ mod tests {
 		}
 		.reset(0u32.into())
 		.unwrap();
-		SendStream {
+		send::Stream {
 			id: ids[2],
 			state: &mut server,
 			pending: &mut pending,
@@ -1432,13 +1466,13 @@ mod tests {
 		}
 		.open(Dir::Uni, Default::default())
 		.unwrap();
-		SendStream {
+		send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		}
-		.write(&[42; 24])
+		.write(&mut &[42; 24][..])
 		.unwrap();
 		let send = server.send.get_mut(&id).unwrap().as_mut().unwrap();
 		assert_eq!(send.pending.poll_transmit(16).0, 0..16);
@@ -1467,13 +1501,13 @@ mod tests {
 			fin: false,
 		});
 		assert_eq!(server.write_limit(), 24);
-		SendStream {
+		send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		}
-		.write(&[7; 24])
+		.write(&mut &[7; 24][..])
 		.unwrap();
 		assert_eq!(server.write_limit(), 0);
 	}
@@ -1496,13 +1530,13 @@ mod tests {
 		}
 		.open(Dir::Uni, Default::default())
 		.unwrap();
-		SendStream {
+		send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		}
-		.write(&[42; 24])
+		.write(&mut &[42; 24][..])
 		.unwrap();
 		let mut buf = Vec::with_capacity(1000);
 		let sent = server.write_frames(&mut buf, 0..1000, true).streams;
@@ -1533,13 +1567,13 @@ mod tests {
 		}
 		.open(Dir::Uni, Default::default())
 		.unwrap();
-		SendStream {
+		send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		}
-		.write(&[42; 24])
+		.write(&mut &[42; 24][..])
 		.unwrap();
 		let send = server.send.get_mut(&id).unwrap().as_mut().unwrap();
 		send.pending.poll_transmit(16);
@@ -1549,7 +1583,7 @@ mod tests {
 			offsets: 16..23,
 			fin: false,
 		});
-		SendStream {
+		send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
@@ -1614,7 +1648,7 @@ mod tests {
 		assert_eq!(client.local_max_data - initial_max, 0);
 
 		let mut pending = Retransmits::default();
-		let mut recv = RecvStream {
+		let mut recv = recv::Stream {
 			id,
 			state: &mut client,
 			pending: &mut pending,
@@ -1655,7 +1689,7 @@ mod tests {
 		);
 
 		let mut pending = Retransmits::default();
-		RecvStream {
+		recv::Stream {
 			id,
 			state: &mut client,
 			pending: &mut pending,
@@ -1688,7 +1722,7 @@ mod tests {
 		assert_eq!(client.local_max_data - initial_max, 0);
 
 		let mut pending = Retransmits::default();
-		let mut recv = RecvStream {
+		let mut recv = recv::Stream {
 			id,
 			state: &mut client,
 			pending: &mut pending,
@@ -1714,13 +1748,13 @@ mod tests {
 		assert_eq!(client.local_max_data - initial_max, 4096);
 
 		// Ensure reading after a reset doesn't issue redundant credit
-		let mut recv = RecvStream {
+		let mut recv = recv::Stream {
 			id,
 			state: &mut client,
 			pending: &mut pending,
 		};
 		let mut chunks = recv.read().unwrap();
-		assert_eq!(chunks.next(1024).unwrap_err(), crate::ReadError::Reset(0u32.into()));
+		assert_eq!(chunks.next(1024).unwrap_err(), crate::recv::Error::Reset(0u32.into()));
 		let _ = chunks.finalize();
 		assert_eq!(client.data_recvd, 4096);
 		assert_eq!(client.local_max_data - initial_max, 4096);
@@ -1814,7 +1848,7 @@ mod tests {
 		assert_eq!(client.local_max_data, initial_max);
 
 		let mut pending = Retransmits::default();
-		let mut recv = RecvStream {
+		let mut recv = recv::Stream {
 			id,
 			state: &mut client,
 			pending: &mut pending,
@@ -1825,7 +1859,7 @@ mod tests {
 		assert!(!recv.pending.max_data);
 
 		assert!(recv.stop(0u32.into()).is_err());
-		assert_eq!(recv.read().err(), Some(ReadableError::ClosedStream));
+		assert_eq!(recv.read().err(), Some(recv::Error::Closed));
 
 		assert_eq!(client.local_max_data - initial_max, 32);
 		assert_eq!(
@@ -1869,7 +1903,7 @@ mod tests {
 			);
 
 			let mut pending = Retransmits::default();
-			let mut recv = RecvStream {
+			let mut recv = recv::Stream {
 				id,
 				state: &mut client,
 				pending: &mut pending,
@@ -1918,7 +1952,7 @@ mod tests {
 		.open(Dir::Uni, Default::default())
 		.unwrap();
 
-		let mut stream = SendStream {
+		let mut stream = send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
@@ -1930,10 +1964,10 @@ mod tests {
 		assert!(stream.state.events.contains(&StreamEvent::Stopped { id, error_code }));
 		stream.state.events.clear();
 
-		assert_eq!(stream.write(&[]), Err(WriteError::Stopped(error_code)));
+		assert_eq!(stream.write(&mut &[][..]), Err(send::Error::Stopped(error_code)));
 
 		stream.reset(0u32.into()).unwrap();
-		assert_eq!(stream.write(&[]), Err(WriteError::ClosedStream));
+		assert_eq!(stream.write(&mut &[][..]), Err(send::Error::Closed));
 
 		// A duplicate frame is a no-op
 		stream.state.received_stop_sending(id, error_code).unwrap();
@@ -1977,31 +2011,31 @@ mod tests {
 		let id_mid = streams.open(Dir::Bi, Default::default()).unwrap();
 		let id_low = streams.open(Dir::Bi, Default::default()).unwrap();
 
-		let mut mid = SendStream {
+		let mut mid = send::Stream {
 			id: id_mid,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
-		mid.write(b"mid").unwrap();
+		mid.write(&mut &b"mid"[..]).unwrap();
 
-		let mut low = SendStream {
+		let mut low = send::Stream {
 			id: id_low,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
 		low.set_priority(-1).unwrap();
-		low.write(b"low").unwrap();
+		low.write(&mut &b"low"[..]).unwrap();
 
-		let mut high = SendStream {
+		let mut high = send::Stream {
 			id: id_high,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
 		high.set_priority(1).unwrap();
-		high.write(b"high").unwrap();
+		high.write(&mut &b"high"[..]).unwrap();
 
 		let mut buf = Vec::with_capacity(40);
 		let meta = server.write_frames(&mut buf, 0..40, true).streams;
@@ -2032,14 +2066,14 @@ mod tests {
 			let id_low = streams.open(Dir::Bi, Default::default()).unwrap();
 			let id_high = streams.open(Dir::Bi, Default::default()).unwrap();
 
-			let mut low = SendStream {
+			let mut low = send::Stream {
 				id: id_low,
 				state: &mut server,
 				pending: &mut pending,
 				conn_state: &state,
 			};
 			low.set_priority(-1).unwrap();
-			assert_eq!(low.write(b"low").unwrap(), 3);
+			assert_eq!(low.write(&mut &b"low"[..]).unwrap(), 3);
 
 			let mut buf = Vec::with_capacity(40);
 			let mut sent = server.write_frames(&mut buf, 0..40, fair).streams;
@@ -2054,14 +2088,14 @@ mod tests {
 			server.retransmit(lost);
 			assert_eq!(server.pending.len(), 1);
 
-			let mut high = SendStream {
+			let mut high = send::Stream {
 				id: id_high,
 				state: &mut server,
 				pending: &mut pending,
 				conn_state: &state,
 			};
 			high.set_priority(1).unwrap();
-			assert_eq!(high.write(b"high").unwrap(), 4);
+			assert_eq!(high.write(&mut &b"high"[..]).unwrap(), 4);
 
 			buf.clear();
 			let sent = server.write_frames(&mut buf, 0..40, fair).streams;
@@ -2094,27 +2128,27 @@ mod tests {
 		let id_high = streams.open(Dir::Bi, Default::default()).unwrap();
 		let id_mid = streams.open(Dir::Bi, Default::default()).unwrap();
 
-		let mut mid = SendStream {
+		let mut mid = send::Stream {
 			id: id_mid,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
-		assert_eq!(mid.write(b"mid").unwrap(), 3);
+		assert_eq!(mid.write(&mut &b"mid"[..]).unwrap(), 3);
 		assert_eq!(server.pending.len(), 1);
 
-		let mut high = SendStream {
+		let mut high = send::Stream {
 			id: id_high,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
 		high.set_priority(1).unwrap();
-		assert_eq!(high.write(&[0; 200]).unwrap(), 200);
+		assert_eq!(high.write(&mut &[0; 200][..]).unwrap(), 200);
 		assert_eq!(server.pending.len(), 2);
 
 		// Lowering the queued high priority stream moves it behind mid at once.
-		let mut high = SendStream {
+		let mut high = send::Stream {
 			id: id_high,
 			state: &mut server,
 			pending: &mut pending,
@@ -2156,14 +2190,14 @@ mod tests {
 		let (busy, starved) = (&ids[..2], ids[2]);
 
 		for (&id, priority) in ids.iter().zip([5, 5, 0]) {
-			let mut stream = SendStream {
+			let mut stream = send::Stream {
 				id,
 				state: &mut server,
 				pending: &mut pending,
 				conn_state: &state,
 			};
 			stream.set_priority(priority).unwrap();
-			stream.write(&[0; 200]).unwrap();
+			stream.write(&mut &[0; 200][..]).unwrap();
 		}
 
 		let mut buf = Vec::with_capacity(1000);
@@ -2173,7 +2207,7 @@ mod tests {
 			assert!(busy.contains(&meta[0].id), "{meta:?}");
 		}
 
-		SendStream {
+		send::Stream {
 			id: starved,
 			state: &mut server,
 			pending: &mut pending,
@@ -2208,29 +2242,29 @@ mod tests {
 			let id_b = streams.open(Dir::Bi, Default::default()).unwrap();
 			let id_c = streams.open(Dir::Bi, Default::default()).unwrap();
 
-			let mut stream_a = SendStream {
+			let mut stream_a = send::Stream {
 				id: id_a,
 				state: &mut server,
 				pending: &mut pending,
 				conn_state: &state,
 			};
-			stream_a.write(&[b'a'; 100]).unwrap();
+			stream_a.write(&mut &[b'a'; 100][..]).unwrap();
 
-			let mut stream_b = SendStream {
+			let mut stream_b = send::Stream {
 				id: id_b,
 				state: &mut server,
 				pending: &mut pending,
 				conn_state: &state,
 			};
-			stream_b.write(&[b'b'; 100]).unwrap();
+			stream_b.write(&mut &[b'b'; 100][..]).unwrap();
 
-			let mut stream_c = SendStream {
+			let mut stream_c = send::Stream {
 				id: id_c,
 				state: &mut server,
 				pending: &mut pending,
 				conn_state: &state,
 			};
-			stream_c.write(&[b'c'; 100]).unwrap();
+			stream_c.write(&mut &[b'c'; 100][..]).unwrap();
 
 			let mut metas = vec![];
 			let mut buf = Vec::with_capacity(1024);
@@ -2282,21 +2316,21 @@ mod tests {
 		let id_b = streams.open(Dir::Bi, Default::default()).unwrap();
 		let id_c = streams.open(Dir::Bi, Default::default()).unwrap();
 
-		let mut stream_a = SendStream {
+		let mut stream_a = send::Stream {
 			id: id_a,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
-		stream_a.write(&[b'a'; 100]).unwrap();
+		stream_a.write(&mut &[b'a'; 100][..]).unwrap();
 
-		let mut stream_b = SendStream {
+		let mut stream_b = send::Stream {
 			id: id_b,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
-		stream_b.write(&[b'b'; 100]).unwrap();
+		stream_b.write(&mut &[b'b'; 100][..]).unwrap();
 
 		let mut metas = vec![];
 		let mut buf = Vec::with_capacity(1024);
@@ -2308,14 +2342,14 @@ mod tests {
 		metas.extend(meta);
 
 		// Queue stream_c which has higher priority
-		let mut stream_c = SendStream {
+		let mut stream_c = send::Stream {
 			id: id_c,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
 		stream_c.set_priority(1).unwrap();
-		stream_c.write(&[b'b'; 100]).unwrap();
+		stream_c.write(&mut &[b'b'; 100][..]).unwrap();
 
 		// loop until all the streams are written
 		loop {
@@ -2356,7 +2390,7 @@ mod tests {
 			)
 			.unwrap();
 		let mut pending = Retransmits::default();
-		let mut stream = RecvStream {
+		let mut stream = recv::Stream {
 			id,
 			state: &mut client,
 			pending: &mut pending,
@@ -2382,13 +2416,13 @@ mod tests {
 		};
 
 		let id = streams.open(Dir::Uni, Default::default()).unwrap();
-		let mut stream = SendStream {
+		let mut stream = send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
-		stream.write(b"hello").unwrap();
+		stream.write(&mut &b"hello"[..]).unwrap();
 		stream.reset(0u32.into()).unwrap();
 
 		assert_eq!(pending.reset_stream, &[(id, 0)]);
@@ -2430,7 +2464,7 @@ mod tests {
 
 		// Free stream 127
 		let mut pending = Retransmits::default();
-		let mut stream = RecvStream {
+		let mut stream = recv::Stream {
 			id: StreamId::new(Side::Server, Dir::Uni, 127),
 			state: &mut client,
 			pending: &mut pending,
@@ -2525,7 +2559,7 @@ mod tests {
 
 		// Free stream 127
 		let mut pending = Retransmits::default();
-		let mut stream = RecvStream {
+		let mut stream = recv::Stream {
 			id: StreamId::new(Side::Server, Dir::Uni, 127),
 			state: &mut client,
 			pending: &mut pending,
@@ -2560,7 +2594,7 @@ mod tests {
 			Ok(ShouldTransmit(false))
 		);
 		let mut pending = Retransmits::default();
-		let mut stream = RecvStream {
+		let mut stream = recv::Stream {
 			id: StreamId::new(Side::Server, Dir::Uni, 126),
 			state: &mut client,
 			pending: &mut pending,
@@ -2645,7 +2679,7 @@ mod tests {
 		);
 		let id = StreamId::new(Side::Server, Dir::Uni, 3);
 		let mut pending = Retransmits::default();
-		let mut recv = RecvStream {
+		let mut recv = recv::Stream {
 			id,
 			state: &mut client,
 			pending: &mut pending,
@@ -2674,7 +2708,7 @@ mod tests {
 		);
 		// Drain the stream so it's fully freed
 		let mut pending = Retransmits::default();
-		let mut recv = RecvStream {
+		let mut recv = recv::Stream {
 			id,
 			state: &mut client,
 			pending: &mut pending,
@@ -2723,7 +2757,7 @@ mod tests {
 				Ok(ShouldTransmit(false))
 			);
 			let mut pending = Retransmits::default();
-			let mut recv = RecvStream {
+			let mut recv = recv::Stream {
 				id,
 				state: &mut client,
 				pending: &mut pending,
@@ -2827,7 +2861,7 @@ mod tests {
 		.open(Dir::Uni, Default::default())
 		.expect("should be able to open a stream");
 
-		let mut stream = SendStream {
+		let mut stream = send::Stream {
 			id: stream_id,
 			state: &mut server,
 			pending: &mut retransmits,
@@ -2838,18 +2872,18 @@ mod tests {
 		let initial_send_len = initial_send_window as usize;
 		let data = vec![0xFFu8; initial_send_len];
 
-		assert_eq!(stream.write(&data), Ok(initial_send_len));
+		assert_eq!(stream.write(&mut &data[..]), Ok(initial_send_len));
 
 		// Try to write the same data again, observe that it's blocked
-		assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+		assert_eq!(stream.write(&mut &data[..]), Err(send::Error::Blocked));
 
 		// Check that we get a `Writable` event after increasing the send window
 		stream.state.set_send_window(larger_send_window);
 		assert_eq!(stream.state.poll(), Some(StreamEvent::Writable { id: stream_id }));
 
 		// Check that the stream accepts the exact same amount of data again
-		assert_eq!(stream.write(&data), Ok(initial_send_len));
-		assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+		assert_eq!(stream.write(&mut &data[..]), Ok(initial_send_len));
+		assert_eq!(stream.write(&mut &data[..]), Err(send::Error::Blocked));
 
 		assert_eq!(stream.state.poll(), None);
 
@@ -2863,9 +2897,9 @@ mod tests {
 		assert_eq!(stream.state.poll(), Some(StreamEvent::Writable { id: stream_id }));
 
 		// Check that our full send window is available again
-		assert_eq!(stream.write(&data), Ok(initial_send_len));
-		assert_eq!(stream.write(&data), Ok(initial_send_len));
-		assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+		assert_eq!(stream.write(&mut &data[..]), Ok(initial_send_len));
+		assert_eq!(stream.write(&mut &data[..]), Ok(initial_send_len));
+		assert_eq!(stream.write(&mut &data[..]), Err(send::Error::Blocked));
 	}
 
 	#[test]
@@ -2896,7 +2930,7 @@ mod tests {
 		.open(Dir::Uni, Default::default())
 		.expect("should be able to open a stream");
 
-		let mut stream = SendStream {
+		let mut stream = send::Stream {
 			id: stream_id,
 			state: &mut server,
 			pending: &mut retransmits,
@@ -2908,8 +2942,8 @@ mod tests {
 		let data = vec![0xFFu8; initial_send_len];
 
 		// Assert that the full send window is accepted
-		assert_eq!(stream.write(&data), Ok(initial_send_len));
-		assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+		assert_eq!(stream.write(&mut &data[..]), Ok(initial_send_len));
+		assert_eq!(stream.write(&mut &data[..]), Err(send::Error::Blocked));
 
 		assert_eq!(stream.state.write_limit(), 0);
 		assert_eq!(stream.state.poll(), None);
@@ -2920,7 +2954,7 @@ mod tests {
 		assert_eq!(stream.state.poll(), None);
 
 		// Assert that data is still not accepted
-		assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+		assert_eq!(stream.write(&mut &data[..]), Err(send::Error::Blocked));
 
 		// Ack some data, assert that writes are still not accepted due to outstanding sends
 		stream.state.received_ack_of(frame::StreamMeta {
@@ -2929,7 +2963,7 @@ mod tests {
 			fin: false,
 		});
 
-		assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+		assert_eq!(stream.write(&mut &data[..]), Err(send::Error::Blocked));
 
 		// Ack the rest of the data
 		stream.state.received_ack_of(frame::StreamMeta {
@@ -2943,8 +2977,8 @@ mod tests {
 		assert_eq!(stream.state.write_limit(), smaller_send_window);
 
 		// Assert that only `smaller_send_window` bytes are accepted
-		assert_eq!(stream.write(&data), Ok(smaller_send_window as usize));
-		assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+		assert_eq!(stream.write(&mut &data[..]), Ok(smaller_send_window as usize));
+		assert_eq!(stream.write(&mut &data[..]), Err(send::Error::Blocked));
 	}
 
 	#[test]
@@ -2986,9 +3020,9 @@ mod tests {
 	}
 
 	/// Read everything readable, returning the byte count and how the read stopped
-	fn drain(state: &mut StreamsState, id: StreamId) -> (u64, crate::ReadError) {
+	fn drain(state: &mut StreamsState, id: StreamId) -> (u64, recv::Error) {
 		let mut pending = Retransmits::default();
-		let mut recv = RecvStream {
+		let mut recv = recv::Stream {
 			id,
 			state,
 			pending: &mut pending,
@@ -3021,7 +3055,7 @@ mod tests {
 		// Data past the Reliable Size is dropped without counting twice
 		receive(&mut client, id, 4..20);
 		assert_eq!(client.data_recvd, 100);
-		assert_eq!(drain(&mut client, id), (10, crate::ReadError::Reset(7u32.into())));
+		assert_eq!(drain(&mut client, id), (10, crate::recv::Error::Reset(7u32.into())));
 		assert_eq!(client.local_max_data - initial_max, 100);
 	}
 
@@ -3032,9 +3066,9 @@ mod tests {
 		let initial_max = client.local_max_data;
 		let _ = client.received_reset(reset_at(id, 7, 20, Some(10))).unwrap();
 		receive(&mut client, id, 4..20);
-		assert_eq!(drain(&mut client, id), (0, crate::ReadError::Blocked));
+		assert_eq!(drain(&mut client, id), (0, crate::recv::Error::Blocked));
 		receive(&mut client, id, 0..4);
-		assert_eq!(drain(&mut client, id), (10, crate::ReadError::Reset(7u32.into())));
+		assert_eq!(drain(&mut client, id), (10, crate::recv::Error::Reset(7u32.into())));
 		assert_eq!(client.local_max_data - initial_max, 20);
 	}
 
@@ -3053,7 +3087,7 @@ mod tests {
 		);
 		assert_eq!(client.local_max_data - initial_max, 16);
 		receive(&mut client, id, 0..20);
-		assert_eq!(drain(&mut client, id), (4, crate::ReadError::Reset(7u32.into())));
+		assert_eq!(drain(&mut client, id), (4, crate::recv::Error::Reset(7u32.into())));
 		assert_eq!(client.local_max_data - initial_max, 20);
 	}
 
@@ -3066,7 +3100,7 @@ mod tests {
 		receive(&mut client, id, 0..2);
 		let _ = client.received_reset(reset_at(id, 7, 20, Some(10))).unwrap();
 		let _ = client.received_reset(reset_at(id, 7, 20, None)).unwrap();
-		assert_eq!(drain(&mut client, id), (0, crate::ReadError::Reset(7u32.into())));
+		assert_eq!(drain(&mut client, id), (0, crate::recv::Error::Reset(7u32.into())));
 		assert_eq!(client.local_max_data - initial_max, 20);
 	}
 
@@ -3119,7 +3153,7 @@ mod tests {
 			receive(&mut client, id, 0..10);
 			let _ = client.received_reset(reset_at(id, 7, 20, reliable_size)).unwrap();
 			let mut pending = Retransmits::default();
-			RecvStream {
+			recv::Stream {
 				id,
 				state: &mut client,
 				pending: &mut pending,
@@ -3158,16 +3192,16 @@ mod tests {
 		}
 		.open(Dir::Uni, Default::default())
 		.unwrap();
-		let mut stream = SendStream {
+		let mut stream = send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
-		stream.write(b"hello world").unwrap();
+		stream.write(&mut &b"hello world"[..]).unwrap();
 		let mut buf = Vec::new();
 		let sent = stream.state.write_frames(&mut buf, 0..100, true).streams;
-		stream.reset_at(4, 7u32.into()).unwrap();
+		stream.reset_at(stream.offset().rewind(4), 7u32.into()).unwrap();
 		assert!(pending.reset_stream.is_empty());
 		assert_eq!(server.buffered_data, 4);
 
@@ -3202,14 +3236,14 @@ mod tests {
 		}
 		.open(Dir::Uni, Default::default())
 		.unwrap();
-		let mut stream = SendStream {
+		let mut stream = send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
-		stream.write(b"hello world").unwrap();
-		stream.reset_at(4, 7u32.into()).unwrap();
+		stream.write(&mut &b"hello world"[..]).unwrap();
+		stream.reset_at(stream.offset().rewind(4), 7u32.into()).unwrap();
 		assert_eq!(pending.reset_stream, &[(id, 4)]);
 		assert_eq!(server.received_stop_sending(id, 9u32.into()), Ok(Some(0)));
 
@@ -3231,16 +3265,16 @@ mod tests {
 		}
 		.open(Dir::Uni, Default::default())
 		.unwrap();
-		let mut stream = SendStream {
+		let mut stream = send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
-		stream.write(b"hello world").unwrap();
+		stream.write(&mut &b"hello world"[..]).unwrap();
 		let mut buf = Vec::new();
 		let sent = stream.state.write_frames(&mut buf, 0..100, true).streams;
-		stream.reset_at(4, 7u32.into()).unwrap();
+		stream.reset_at(stream.offset().rewind(4), 7u32.into()).unwrap();
 
 		server.reset_acked(id, 4);
 		assert_eq!(server.received_stop_sending(id, 9u32.into()), Ok(Some(0)));
@@ -3272,14 +3306,14 @@ mod tests {
 			}
 			.open(Dir::Uni, Default::default())
 			.unwrap();
-			let mut stream = SendStream {
+			let mut stream = send::Stream {
 				id,
 				state: &mut server,
 				pending: &mut pending,
 				conn_state: &state,
 			};
-			stream.write(b"hello world").unwrap();
-			stream.reset_at(4, 7u32.into()).unwrap();
+			stream.write(&mut &b"hello world"[..]).unwrap();
+			stream.reset_at(stream.offset().rewind(4), 7u32.into()).unwrap();
 			assert_eq!(pending.reset_stream.is_empty(), !reset_stream_at);
 
 			assert_eq!(server.received_stop_sending(id, 9u32.into()), Ok(Some(0)));
@@ -3305,17 +3339,17 @@ mod tests {
 		}
 		.open(Dir::Uni, Default::default())
 		.unwrap();
-		let mut stream = SendStream {
+		let mut stream = send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
-		stream.write(b"hello world").unwrap();
+		stream.write(&mut &b"hello world"[..]).unwrap();
 		let mut buf = Vec::new();
 		let sent = stream.state.write_frames(&mut buf, 0..100, true).streams;
 		assert_eq!(sent[0].offsets, 0..11);
-		stream.reset_at(4, 7u32.into()).unwrap();
+		stream.reset_at(stream.offset().rewind(4), 7u32.into()).unwrap();
 		assert_eq!(server.buffered_data, 4);
 
 		// Only the lost prefix is retransmitted, without the FIN of a stream that was never finished
@@ -3346,15 +3380,15 @@ mod tests {
 		}
 		.open(Dir::Uni, Default::default())
 		.unwrap();
-		let mut stream = SendStream {
+		let mut stream = send::Stream {
 			id,
 			state: &mut server,
 			pending: &mut pending,
 			conn_state: &state,
 		};
-		stream.write(b"hello world").unwrap();
+		stream.write(&mut &b"hello world"[..]).unwrap();
 		stream.state.received_stop_sending(id, 9u32.into()).unwrap();
-		stream.reset_at(4, 7u32.into()).unwrap();
+		stream.reset_at(stream.offset().rewind(4), 7u32.into()).unwrap();
 
 		let send = server.send[&id].as_ref().unwrap();
 		let frame = send.reset_frame(id, true).unwrap();
@@ -3389,8 +3423,8 @@ mod tests {
 			.unwrap();
 	}
 
-	fn recv<'a>(client: &'a mut StreamsState, pending: &'a mut Retransmits, id: StreamId) -> RecvStream<'a> {
-		RecvStream {
+	fn recv<'a>(client: &'a mut StreamsState, pending: &'a mut Retransmits, id: StreamId) -> recv::Stream<'a> {
+		recv::Stream {
 			id,
 			state: client,
 			pending,
@@ -3400,15 +3434,24 @@ mod tests {
 	/// Lease whatever has arrived on `id`, returning how many bytes are leased.
 	fn lease(client: &mut StreamsState, id: StreamId) -> usize {
 		let mut pending = Retransmits::default();
-		let _ = recv(client, &mut pending, id).lease(0).unwrap();
+		recv(client, &mut pending, id).peek(0).0.unwrap();
 		client.check_leases();
 		client.leased(id).unwrap().len()
 	}
 
 	/// Wait on `id` for more than it has leased, as a reader decoding a message would.
-	fn wait(client: &mut StreamsState, id: StreamId, want: usize) -> Result<(), LeaseError> {
+	fn wait(client: &mut StreamsState, id: StreamId, want: usize) -> Result<(), recv::Error> {
+		wait_transmit(client, id, want).0
+	}
+
+	/// [`wait`], and whether it queued a frame.
+	fn wait_transmit(
+		client: &mut StreamsState,
+		id: StreamId,
+		want: usize,
+	) -> (Result<(), recv::Error>, ShouldTransmit) {
 		let mut pending = Retransmits::default();
-		let result = recv(client, &mut pending, id).lease(want).map(|_| ());
+		let result = recv(client, &mut pending, id).peek(want);
 		client.check_leases();
 		result
 	}
@@ -3417,7 +3460,7 @@ mod tests {
 		let mut pending = Retransmits::default();
 		let mut recv = recv(client, &mut pending, id);
 		recv.advance(n);
-		let _ = recv.release();
+		let _ = recv.release_taken();
 		client.check_leases();
 	}
 
@@ -3498,7 +3541,7 @@ mod tests {
 
 			if reset_first {
 				reset(&mut client, id, 128);
-				assert_eq!(wait(&mut client, id, 33), Err(LeaseError::Reset(0u32.into())));
+				assert_eq!(wait(&mut client, id, 33), Err(recv::Error::Reset(0u32.into())));
 				assert_eq!(client.local_max_data, initial + 128 - 32, "all but the lease");
 			}
 			let _ = stop(&mut client, id, 0);
@@ -3533,13 +3576,13 @@ mod tests {
 		let id = StreamId::new(Side::Server, Dir::Uni, 0);
 		data(&mut client, id, 0, 32, false);
 		let window = client.receive_window as usize;
-		assert!(matches!(wait(&mut client, id, window), Err(LeaseError::Blocked(_))));
-		assert_eq!(wait(&mut client, id, window + 1), Err(LeaseError::TooLarge));
+		assert!(matches!(wait(&mut client, id, window), Err(recv::Error::Blocked)));
+		assert_eq!(wait(&mut client, id, window + 1), Err(recv::Error::TooLarge));
 
 		// Taken bytes do not: a frame past the window waits, and gives way to eviction.
 		let mut pending = Retransmits::default();
 		let _ = recv(&mut client, &mut pending, id).take(10);
-		assert!(matches!(wait(&mut client, id, window - 9), Err(LeaseError::Blocked(_))));
+		assert!(matches!(wait(&mut client, id, window - 9), Err(recv::Error::Blocked)));
 	}
 
 	/// A connection with a 2 * `window` receive window, and its streams 0 and 1.
@@ -3591,7 +3634,7 @@ mod tests {
 		client.set_receive_window(VarInt::from_u64(3 * WINDOW / 2).unwrap());
 
 		let want = WINDOW as usize + 1;
-		assert!(matches!(wait(&mut client, ids[0], want), Err(LeaseError::Blocked(_))));
+		assert!(matches!(wait(&mut client, ids[0], want), Err(recv::Error::Blocked)));
 		assert_eq!(client.credit_stats().evicted, 2);
 		assert_eq!(readable(&mut client), [ids[2], ids[1]], "newest first");
 		assert_eq!(client.local_max_data, max_data + WINDOW / 2);
@@ -3637,12 +3680,10 @@ mod tests {
 				let mut pending = Retransmits::default();
 				let mut recv = recv(&mut client, &mut pending, id);
 				match reader {
-					Reader::Wait => assert!(matches!(recv.lease(buffers.len() + 1), Err(LeaseError::Blocked(_)))),
-					Reader::Park => {
-						let _ = recv.lease(1).unwrap();
-					}
+					Reader::Wait => assert!(matches!(recv.peek(buffers.len() + 1).0, Err(recv::Error::Blocked))),
+					Reader::Park => recv.peek(1).0.unwrap(),
 					Reader::Take => {
-						let _ = recv.lease(1).unwrap();
+						recv.peek(1).0.unwrap();
 						taken.push(recv.take(usize::MAX));
 					}
 				}
@@ -3682,7 +3723,7 @@ mod tests {
 			data(&mut client, id, 0, 1, false);
 		}
 		for &id in &ids {
-			assert!(matches!(wait(&mut client, id, 2), Err(LeaseError::Blocked(_))));
+			assert!(matches!(wait(&mut client, id, 2), Err(recv::Error::Blocked)));
 		}
 		assert_eq!(client.credit_stats().evicted, 1);
 		assert!(
@@ -3718,7 +3759,7 @@ mod tests {
 		for id in [ids[1], ids[2]] {
 			assert!(matches!(
 				wait(&mut client, id, WINDOW as usize + 1),
-				Err(LeaseError::Blocked(_))
+				Err(recv::Error::Blocked)
 			));
 		}
 		assert_eq!(client.credit_stats().evicted, 0);
@@ -3744,13 +3785,13 @@ mod tests {
 		assert_eq!(lease(&mut client, ids[0]), 100);
 		assert!(matches!(
 			wait(&mut client, ids[0], WINDOW as usize),
-			Err(LeaseError::Blocked(_))
+			Err(recv::Error::Blocked)
 		));
 		data(&mut client, ids[1], 0, WINDOW as usize, false);
 		assert_eq!(lease(&mut client, ids[1]), WINDOW as usize);
 		assert!(matches!(
 			wait(&mut client, ids[1], WINDOW as usize + 1),
-			Err(LeaseError::Blocked(_))
+			Err(recv::Error::Blocked)
 		));
 		assert_eq!(client.credit_stats().evicted, 0);
 		assert_eq!(client.local_max_data, client.data_recvd, "the peer is blocked");
@@ -3787,7 +3828,7 @@ mod tests {
 		for id in [ids[1], ids[2]] {
 			assert!(matches!(
 				wait(&mut client, id, WINDOW as usize + 1),
-				Err(LeaseError::Blocked(_))
+				Err(recv::Error::Blocked)
 			));
 		}
 		readable(&mut client);
@@ -3825,7 +3866,7 @@ mod tests {
 			assert_eq!(lease(&mut client, id), WINDOW as usize);
 			assert!(matches!(
 				wait(&mut client, id, WINDOW as usize + 1),
-				Err(LeaseError::Blocked(_))
+				Err(recv::Error::Blocked)
 			));
 		}
 		client.set_receive_window(VarInt::from_u64(2 * WINDOW).unwrap());
@@ -3868,7 +3909,7 @@ mod tests {
 		assert_eq!(lease(&mut client, ids[0]), WINDOW as usize);
 		assert!(matches!(
 			wait(&mut client, ids[0], WINDOW as usize + 1),
-			Err(LeaseError::Blocked(_))
+			Err(recv::Error::Blocked)
 		));
 		data(&mut client, ids[1], 0, WINDOW as usize, false);
 		assert_eq!(lease(&mut client, ids[1]), WINDOW as usize);
@@ -3876,12 +3917,12 @@ mod tests {
 		reset(&mut client, ids[0], WINDOW as u32);
 		assert!(matches!(
 			wait(&mut client, ids[1], WINDOW as usize + 1),
-			Err(LeaseError::Blocked(_))
+			Err(recv::Error::Blocked)
 		));
 		assert_eq!(client.credit_stats().evicted, 0);
 		assert_eq!(
 			wait(&mut client, ids[0], WINDOW as usize + 1),
-			Err(LeaseError::Reset(0u32.into()))
+			Err(recv::Error::Reset(0u32.into()))
 		);
 	}
 
@@ -3924,13 +3965,13 @@ mod tests {
 		// Debt as large as one stream's bytes, so the first stop only pays it.
 		client.set_receive_window(VarInt::from_u64(WINDOW).unwrap());
 
-		assert!(matches!(wait(&mut client, ids[0], 1), Err(LeaseError::Blocked(_))));
+		assert!(matches!(wait(&mut client, ids[0], 1), Err(recv::Error::Blocked)));
 		assert_eq!(readable(&mut client), [ids[1]]);
 		assert_eq!(client.credit_stats().evicted, 1);
 		assert_eq!(client.credit_stats().leased, 2 * WINDOW, "taken credit stays held");
-		assert!(matches!(wait(&mut client, ids[0], 1), Err(LeaseError::Blocked(_))));
+		assert!(matches!(wait(&mut client, ids[0], 1), Err(recv::Error::Blocked)));
 		assert_eq!(client.credit_stats().evicted, 1, "waits for the stop");
-		assert_eq!(wait(&mut client, ids[1], 1), Err(LeaseError::Evicted));
+		assert_eq!(wait(&mut client, ids[1], 1), Err(recv::Error::Evicted));
 
 		// The stop pays the debt alone, so eviction resumes with the other stream.
 		let _ = stop(&mut client, ids[1], 0);
@@ -3957,8 +3998,8 @@ mod tests {
 		assert_eq!(readable(&mut client), [high, low]);
 		assert_eq!(lease(&mut client, high), WINDOW as usize);
 		assert_eq!(lease(&mut client, low), WINDOW as usize - 1);
-		assert!(matches!(wait(&mut client, high, 2000), Err(LeaseError::Blocked(_))));
-		assert!(matches!(wait(&mut client, low, 2000), Err(LeaseError::Blocked(_))));
+		assert!(matches!(wait(&mut client, high, 2000), Err(recv::Error::Blocked)));
+		assert!(matches!(wait(&mut client, low, 2000), Err(recv::Error::Blocked)));
 		assert!(
 			client.leased(low).is_some_and(|lease| !lease.evicted),
 			"a byte of credit left"
@@ -3969,10 +4010,10 @@ mod tests {
 		// The arrival woke the reader of `low`, which may yet consume.
 		assert_eq!(readable(&mut client), [low]);
 		assert!(!client.leased(low).unwrap().evicted);
-		let blocked = wait(&mut client, low, 2000);
-		assert_eq!(blocked, Err(LeaseError::Blocked(ShouldTransmit(true))));
+		let blocked = wait_transmit(&mut client, low, 2000);
+		assert_eq!(blocked, (Err(recv::Error::Blocked), ShouldTransmit(true)));
 		assert_eq!(readable(&mut client), [low], "the evicted reader wakes");
-		assert_eq!(wait(&mut client, low, 1), Err(LeaseError::Evicted));
+		assert_eq!(wait(&mut client, low, 1), Err(recv::Error::Evicted));
 		assert_eq!(client.credit_stats().leased, WINDOW);
 		assert_eq!(client.credit_stats().evicted, 1);
 		assert_eq!(client.local_max_data, 3 * WINDOW, "the evicted credit returns");
@@ -4000,10 +4041,10 @@ mod tests {
 		assert_eq!(taken.len(), WINDOW as usize);
 
 		assert_eq!(
-			wait(&mut client, frame, 1),
-			Err(LeaseError::Blocked(ShouldTransmit(true)))
+			wait_transmit(&mut client, frame, 1),
+			(Err(recv::Error::Blocked), ShouldTransmit(true))
 		);
-		assert_eq!(wait(&mut client, frame, 1), Err(LeaseError::Evicted));
+		assert_eq!(wait(&mut client, frame, 1), Err(recv::Error::Evicted));
 		assert_eq!(client.local_max_data, WINDOW, "the taken bytes are still held");
 		drop(taken);
 		let _ = stop(&mut client, frame, 0);
@@ -4020,9 +4061,64 @@ mod tests {
 		assert_eq!(lease(&mut client, old), WINDOW as usize);
 		data(&mut client, new, 0, WINDOW as usize, false);
 		let _ = readable(&mut client);
-		assert!(matches!(wait(&mut client, new, 2000), Err(LeaseError::Blocked(_))));
-		assert_eq!(wait(&mut client, new, 1), Err(LeaseError::Evicted));
+		assert!(matches!(wait(&mut client, new, 2000), Err(recv::Error::Blocked)));
+		assert_eq!(wait(&mut client, new, 1), Err(recv::Error::Evicted));
 		assert_eq!(lease(&mut client, old), WINDOW as usize);
+	}
+
+	/// A lease moves its bytes out; restoring it keeps their credit, and releasing it after a
+	/// partial read returns only the read bytes' credit.
+	#[test]
+	fn lease_moves_out_and_back() {
+		const WINDOW: u64 = 1000;
+		let (mut client, [id, _]) = stuck(WINDOW);
+		data(&mut client, id, 0, 600, false);
+		let mut pending = Retransmits::default();
+		let mut stream = recv(&mut client, &mut pending, id);
+
+		let lease = stream.lease(0).0.unwrap();
+		assert_eq!(lease.remaining(), 600);
+		assert!(!lease.is_fin());
+		assert_eq!(stream.state.leased(id).unwrap().len(), 0, "moved out, not copied");
+		let _ = stream.restore(lease);
+		assert_eq!(stream.state.credit_stats().leased, 600);
+
+		let mut lease = stream.lease(0).0.unwrap();
+		assert_eq!(lease.remaining(), 600, "restored bytes are leased again");
+		lease.advance(250);
+		let _ = stream.release(lease);
+		assert_eq!(stream.state.credit_stats().leased, 350);
+		assert_eq!(stream.lease(0).0.unwrap().remaining(), 350);
+	}
+
+	/// Leasing again before handing the last lease back would lose its bytes.
+	#[test]
+	#[should_panic(expected = "leased again before the last lease was handed back")]
+	fn lease_twice_panics() {
+		let (mut client, [id, _]) = stuck(1000);
+		data(&mut client, id, 0, 100, false);
+		let mut pending = Retransmits::default();
+		let mut stream = recv(&mut client, &mut pending, id);
+		let _lease = stream.lease(0).0.unwrap();
+		let _ = stream.lease(0);
+	}
+
+	/// A lease out with its reader may be about to free the window, so nothing is evicted until
+	/// it comes back.
+	#[test]
+	fn lease_out_holds_eviction_off() {
+		const WINDOW: u64 = 1000;
+		let (mut client, [old, new]) = stuck(WINDOW);
+		data(&mut client, old, 0, WINDOW as usize, false);
+		let mut pending = Retransmits::default();
+		let held = recv(&mut client, &mut pending, old).lease(0).0.unwrap();
+		data(&mut client, new, 0, WINDOW as usize, false);
+		let _ = readable(&mut client);
+		assert!(matches!(wait(&mut client, new, 2000), Err(recv::Error::Blocked)));
+		assert_eq!(client.credit_stats().evicted, 0);
+
+		let _ = recv(&mut client, &mut pending, old).restore(held);
+		assert_eq!(wait(&mut client, new, 1), Err(recv::Error::Evicted));
 	}
 
 	/// A stream nobody has leased yet may have a reader about to run, so it holds eviction off
@@ -4036,13 +4132,14 @@ mod tests {
 		data(&mut client, fresh, 0, WINDOW as usize, false);
 		let mut pending = Retransmits::default();
 		recv(&mut client, &mut pending, fresh).set_priority(-1);
-		assert!(matches!(wait(&mut client, waiting, 2000), Err(LeaseError::Blocked(_))));
+		assert!(matches!(wait(&mut client, waiting, 2000), Err(recv::Error::Blocked)));
 		assert_eq!(client.credit_stats().evicted, 0);
 
 		assert_eq!(lease(&mut client, fresh), WINDOW as usize);
-		let blocked = wait(&mut client, fresh, 2000);
-		assert_eq!(blocked, Err(LeaseError::Blocked(ShouldTransmit(true))));
-		assert_eq!(wait(&mut client, fresh, 1), Err(LeaseError::Evicted));
+		let (blocked, transmit) = wait_transmit(&mut client, fresh, 2000);
+		assert_eq!(blocked, Err(recv::Error::Blocked));
+		assert!(transmit.should_transmit());
+		assert_eq!(wait(&mut client, fresh, 1), Err(recv::Error::Evicted));
 		assert_eq!(lease(&mut client, waiting), WINDOW as usize);
 	}
 
@@ -4071,8 +4168,8 @@ mod tests {
 
 		let mut pending = Retransmits::default();
 		assert_eq!(
-			recv(&mut client, &mut pending, waiting).lease(2 * WINDOW),
-			Err(LeaseError::Blocked(ShouldTransmit(true)))
+			recv(&mut client, &mut pending, waiting).peek(2 * WINDOW),
+			(Err(recv::Error::Blocked), ShouldTransmit(true))
 		);
 		assert!(client.leased(parked).unwrap().evicted);
 		assert!(!pending.max_stream_id[Dir::Uni as usize], "its reader has yet to hear");
@@ -4092,8 +4189,8 @@ mod tests {
 		data(&mut client, b, 0, WINDOW as usize, false);
 		assert_eq!(lease(&mut client, a), WINDOW as usize);
 		release(&mut client, a, 1);
-		assert!(matches!(wait(&mut client, b, 2000), Err(LeaseError::Blocked(_))));
-		assert!(matches!(wait(&mut client, a, 2000), Err(LeaseError::Blocked(_))));
+		assert!(matches!(wait(&mut client, b, 2000), Err(recv::Error::Blocked)));
+		assert!(matches!(wait(&mut client, a, 2000), Err(recv::Error::Blocked)));
 		assert_eq!(client.credit_stats().evicted, 0);
 	}
 
@@ -4127,7 +4224,7 @@ mod tests {
 		assert_eq!(lease(&mut client, id), 10);
 		let mut pending = Retransmits::default();
 		assert!(recv(&mut client, &mut pending, id).stop(0u32.into()).is_ok());
-		assert_eq!(wait(&mut client, id, 0), Err(LeaseError::ClosedStream));
+		assert_eq!(wait(&mut client, id, 0), Err(recv::Error::Closed));
 		assert!(recv(&mut client, &mut pending, id).stop(0u32.into()).is_err());
 		assert!(client.leased(id).is_none());
 	}
@@ -4151,10 +4248,10 @@ mod tests {
 		// One byte taken, so the reader waits for a unit the window can hold.
 		let mut pending = Retransmits::default();
 		let _ = recv(&mut client, &mut pending, waiting).take(1);
-		assert!(matches!(wait(&mut client, waiting, room), Err(LeaseError::Blocked(_))));
+		assert!(matches!(wait(&mut client, waiting, room), Err(recv::Error::Blocked)));
 		assert_eq!(client.credit_stats().evicted, 1);
-		assert_eq!(wait(&mut client, waiting, 1), Err(LeaseError::Evicted));
-		assert_eq!(wait(&mut client, reset_id, 1), Err(LeaseError::Reset(0u32.into())));
+		assert_eq!(wait(&mut client, waiting, 1), Err(recv::Error::Evicted));
+		assert_eq!(wait(&mut client, reset_id, 1), Err(recv::Error::Reset(0u32.into())));
 	}
 
 	/// A reset below what a lease already read and partly took leaves those bytes leased, and
@@ -4171,7 +4268,7 @@ mod tests {
 
 		let _ = client.received_reset(reset_at(id, 7, 200, Some(50))).unwrap();
 		assert_eq!(client.local_max_data, initial + 100, "the abandoned tail");
-		assert_eq!(wait(&mut client, id, 41), Err(LeaseError::Reset(7u32.into())));
+		assert_eq!(wait(&mut client, id, 41), Err(recv::Error::Reset(7u32.into())));
 		assert_eq!(client.leased(id).unwrap().len(), 40, "read before the reset");
 
 		release(&mut client, id, 0);
@@ -4221,7 +4318,7 @@ mod tests {
 		for index in 0..STREAMS + CYCLES {
 			let id = StreamId::new(Side::Server, Dir::Uni, index);
 			data(&mut client, id, 0, 1, false);
-			assert!(matches!(wait(&mut client, id, 2), Err(LeaseError::Blocked(_))));
+			assert!(matches!(wait(&mut client, id, 2), Err(recv::Error::Blocked)));
 			if index == STREAMS - 1 {
 				client.scans = 0;
 			}
@@ -4250,11 +4347,14 @@ mod tests {
 		data(&mut client, id, 0, 64, false);
 		let mut pending = Retransmits::default();
 		assert_eq!(
-			recv(&mut client, &mut pending, id).lease(1001),
-			Err(LeaseError::TooLarge)
+			recv(&mut client, &mut pending, id).peek(1001),
+			(Err(recv::Error::TooLarge), ShouldTransmit(false))
 		);
 		assert!(pending.max_stream_data.is_empty());
-		assert_eq!(recv(&mut client, &mut pending, id).lease(0), Ok(ShouldTransmit(true)));
+		assert_eq!(
+			recv(&mut client, &mut pending, id).peek(0),
+			(Ok(()), ShouldTransmit(true))
+		);
 		assert!(pending.max_stream_data.contains(&id));
 
 		let id = StreamId::new(Side::Server, Dir::Uni, 1);
@@ -4262,8 +4362,8 @@ mod tests {
 		reset(&mut client, id, 10);
 		let mut pending = Retransmits::default();
 		assert_eq!(
-			recv(&mut client, &mut pending, id).lease(11),
-			Err(LeaseError::Reset(0u32.into()))
+			recv(&mut client, &mut pending, id).peek(11),
+			(Err(recv::Error::Reset(0u32.into())), ShouldTransmit(false))
 		);
 		assert!(!pending.max_stream_id[Dir::Uni as usize]);
 		let pending = stop(&mut client, id, 0);
@@ -4315,9 +4415,9 @@ mod tests {
 			let _ = recv(&mut client, &mut pending, id).take(1);
 			assert!(matches!(
 				wait(&mut client, id, WINDOW as usize),
-				Err(LeaseError::Blocked(_))
+				Err(recv::Error::Blocked)
 			));
-			assert_eq!(wait(&mut client, id, 1), Err(LeaseError::Evicted));
+			assert_eq!(wait(&mut client, id, 1), Err(recv::Error::Evicted));
 
 			let mut frames = Retransmits::default();
 			if fin_first {
@@ -4346,9 +4446,9 @@ mod tests {
 	fn send_group_from_another_connection() {
 		let mut a = make(Side::Client);
 		let mut b = make(Side::Client);
-		let group = crate::SendGroups { state: &mut a }.open(0);
-		let _other = crate::SendGroups { state: &mut b }.open(0);
-		crate::SendGroups { state: &mut b }.set_priority(&group, 1);
+		let group = send::Groups { state: &mut a }.open(0);
+		let _other = send::Groups { state: &mut b }.open(0);
+		send::Groups { state: &mut b }.set_priority(&group, 1);
 	}
 
 	/// Ingest and read rounds across many streams, with a plain read or a lease released whole.
@@ -4384,15 +4484,15 @@ mod tests {
 								data: chunk.clone(),
 							};
 							let _ = client.received(frame, payload).unwrap();
-							let mut recv = RecvStream {
+							let mut recv = recv::Stream {
 								id,
 								state: &mut client,
 								pending: &mut pending,
 							};
 							if leased {
-								let _ = recv.lease(1).unwrap();
-								std::hint::black_box(recv.take(usize::MAX));
-								let _ = recv.release();
+								let mut lease = recv.lease(1).0.unwrap();
+								std::hint::black_box(lease.copy_to_bytes(lease.remaining()));
+								let _ = recv.release(lease);
 							} else {
 								let mut chunks = recv.read().unwrap();
 								std::hint::black_box(chunks.next(usize::MAX).unwrap());

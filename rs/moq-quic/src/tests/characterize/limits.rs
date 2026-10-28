@@ -12,7 +12,7 @@ fn openable(pair: &mut Pair, ch: ConnectionHandle) -> Vec<StreamId> {
 /// Finishes each client stream and has the server read it to the end
 fn finish_all(pair: &mut Pair, client_ch: ConnectionHandle, server_ch: ConnectionHandle, streams: &[StreamId]) {
 	for &s in streams {
-		pair.client_send(client_ch, s).write(b"x").unwrap();
+		pair.client_send(client_ch, s).write(&mut &b"x"[..]).unwrap();
 		pair.client_send(client_ch, s).finish().unwrap();
 	}
 	pair.drive();
@@ -59,7 +59,7 @@ fn max_concurrent_streams_lowered() {
 /// How many bytes a fresh client stream can write, up to `limit`
 fn writable(pair: &mut Pair, ch: ConnectionHandle, limit: usize) -> usize {
 	let s = pair.client_streams(ch).open(Dir::Uni, Default::default()).unwrap();
-	pair.client_send(ch, s).write(&vec![0; limit]).unwrap_or(0)
+	pair.client_send(ch, s).write(&mut &vec![0; limit][..]).unwrap_or(0)
 }
 
 /// Reads everything the server has buffered on every client uni stream, returning the total
