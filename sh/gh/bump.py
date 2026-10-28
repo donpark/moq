@@ -43,12 +43,18 @@ BRANCH = "release-bump"
 TITLE = "chore: patch-bump hand-versioned packages"
 REPO = "moq-dev/moq"
 
-# The C and C++ packages' moq-ffi pin, and its asset names.
+# The C and C++ packages' moq-ffi pin.
 FFI_VERSION = "cpp/moq/FFI_VERSION"
 FFI_SHA256 = "cpp/moq/FFI_SHA256.json"
-_spec = importlib.util.spec_from_file_location("ffi", Path(__file__).parents[1] / "cpp/ffi.py")
-ffi = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ffi)
+
+
+def load_ffi():
+    """sh/cpp/ffi.py, which names the pinned assets. Loaded only once C or C++ is
+    present, since a `release` from before their cut lacks it."""
+    spec = importlib.util.spec_from_file_location("ffi", Path(__file__).parents[1] / "cpp/ffi.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -265,6 +271,7 @@ def ffi_blocker(head: str) -> str | None:
     if len(pins) != 1:
         return f"{FFI_VERSION} pins no single moq-ffi release"
     release = pins[0]
+    ffi = load_ffi()
     hashes = json.loads(show(head, FFI_SHA256) or "{}")
     published = release_assets(f"moq-ffi-v{release}")
     missing = [asset for asset in (ffi.name(release, target) + ".tar.gz" for target in ffi.TARGETS)
@@ -284,15 +291,24 @@ class Tag:
 
 def pending(head: str) -> list[Tag]:
     """Each release tag HEAD's versions lack, for the packages that push their own."""
+    found = packages(head)
     tags = []
-    blocker: str | None = None
+    ffi: str | None = None
     checked = False
-    for pkg in packages(head):
+    for pkg in found:
         if not pkg.tag or pkg.rides or released(pkg, head) is not None:
             continue
-        if pkg.ffi and not checked:
-            blocker, checked = ffi_blocker(head), True
-        tags.append(Tag(f"{pkg.tag}{pkg.version(head)}", pkg, blocker if pkg.ffi else None))
+        blocker = None
+        # A rider still at a released version needs its bump merged first: the
+        # tag would publish that version again, which its release refuses.
+        stale = [rider for rider in found if rider.rides == pkg.name and released(rider, head) is not None]
+        if stale:
+            blocker = f"{stale[0].name} {stale[0].version(head)} is already released; merge its bump first"
+        elif pkg.ffi:
+            if not checked:
+                ffi, checked = ffi_blocker(head), True
+            blocker = ffi
+        tags.append(Tag(f"{pkg.tag}{pkg.version(head)}", pkg, blocker))
     return tags
 
 

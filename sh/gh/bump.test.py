@@ -123,7 +123,8 @@ class BumpTest(unittest.TestCase):
 
     def pin(self, version: str) -> set[str]:
         """Pin the C and C++ packages to moq-ffi `version`, returning its asset names."""
-        assets = {bump.ffi.name(version, target) + ".tar.gz" for target in bump.ffi.TARGETS}
+        ffi = bump.load_ffi()
+        assets = {ffi.name(version, target) + ".tar.gz" for target in ffi.TARGETS}
         self.commit("chore: pin moq-ffi", {
             "cpp/moq/FFI_VERSION": f"# Pinned.\n{version}\n",
             "cpp/moq/FFI_SHA256.json": json.dumps({asset: "0" * 64 for asset in assets}) + "\n",
@@ -230,9 +231,15 @@ class BumpTest(unittest.TestCase):
         self.commit("fix(cpp): library only", {"cpp/moq/src/moq.cpp": "// fix\n"})
         self.assertEqual(self.planned(), {"moq (C++)": "0.1.1", "obs-moq (OBS)": "0.7.1"})
 
-    def test_untagged_cpp_bumps_a_released_obs(self):
+    def test_untagged_cpp_bumps_a_released_obs_before_its_tag(self):
+        assets = self.pin("0.4.20")
         self.commit("chore: bump cpp", {"cpp/moq/VERSION": "0.2.0\n"})
-        self.assertEqual(self.planned(), {"obs-moq (OBS)": "0.7.1"})
+        self.assertEqual(self.planned(), {"moq (C)": "0.8.1", "obs-moq (OBS)": "0.7.1"})
+        # Tagging now would publish OBS 0.7.0 again.
+        self.assertIn("obs-moq (OBS) 0.7.0 is already released", self.pending(assets)["cpp-v0.2.0"])
+        bump.apply(bump.plan("HEAD"), self.root)
+        self.commit("chore: bump")
+        self.assertEqual(self.pending(assets), {"c-v0.8.1": None, "cpp-v0.2.0": None})
 
     def test_obs_never_pushes_its_own_tag(self):
         self.commit("chore: bump obs", {"cpp/obs/VERSION": "0.8.0\n"})
@@ -248,6 +255,7 @@ class BumpTest(unittest.TestCase):
             "dart/moq/pubspec.yaml": "name: moq\nversion: 0.1.1\n",
             "c/moq/VERSION": "0.8.1\n",
             "cpp/moq/VERSION": "0.1.1\n",
+            "cpp/obs/VERSION": "0.7.1\n",
         })
         self.assertEqual(self.pending(), {
             "moq-dart-v0.1.1": None,
@@ -276,8 +284,10 @@ class BumpTest(unittest.TestCase):
         # A `release` before the cut that brings C, C++, and OBS.
         self.git("rm", "--quiet", "-r", "c", "cpp")
         self.commit("chore: drop c and cpp")
-        self.assertEqual(self.planned(), {})
-        self.assertEqual(self.pending(), {})
+        # That `release` lacks sh/cpp/ffi.py too.
+        with mock.patch.object(bump, "load_ffi", side_effect=AssertionError("loaded ffi.py")):
+            self.assertEqual(self.planned(), {})
+            self.assertEqual(self.pending(), {})
 
     def test_patch(self):
         self.assertEqual(bump.patch("0.9.9"), "0.9.10")
