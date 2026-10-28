@@ -18,9 +18,8 @@ use bytes::{Bytes, BytesMut};
 
 use super::plaintext::{Clear, Plaintext, TAG_LEN};
 use crate::{
-	Connection, ConnectionHandle, DEFAULT_SUPPORTED_VERSIONS, DatagramEvent, Dir, Duration, Endpoint,
-	EndpointConfig, Event, Instant, LeaseError, Limits, ReadError, Side, StreamId, TransportConfig,
-	VarInt,
+	Connection, ConnectionHandle, DEFAULT_SUPPORTED_VERSIONS, DatagramEvent, Dir, Duration, Endpoint, EndpointConfig,
+	Event, Instant, LeaseError, Limits, ReadError, Side, StreamId, TransportConfig, VarInt,
 	frame::{self, Frame},
 	packet::{FixedLengthConnectionIdParser, PartialDecode},
 };

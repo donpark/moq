@@ -6,8 +6,8 @@
 
 use std::{str, sync::Arc};
 
-use bytes::BytesMut;
 use ::rustls::pki_types::CertificateDer;
+use bytes::BytesMut;
 
 use crate::{ConnectError, Side, TransportError, shared::ConnectionId, transport_parameters::TransportParameters};
 

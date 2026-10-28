@@ -11,9 +11,8 @@ use std::sync::Arc;
 use bytes::BytesMut;
 
 use crate::{
-	ConnectError, ConnectionId, Side, TransportError,
+	ClientConfig, ConnectError, ConnectionId, ServerConfig, Side, TransportError,
 	coding::{BufExt, BufMutExt},
-	ClientConfig, ServerConfig,
 	crypto::{
 		self, CryptoError, ExportKeyingMaterialError, HandshakeData, HeaderKey, KeyPair, Keys, PacketKey,
 		UnsupportedVersion,

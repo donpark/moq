@@ -884,11 +884,7 @@ async fn uring_forwards_the_setup_token() {
 			b"moqt-18".to_vec()
 		}];
 		let conn = client
-			.connect_with(
-				driver::ClientConfig::new(std::sync::Arc::new(tls)),
-				addr,
-				"localhost",
-			)
+			.connect_with(driver::ClientConfig::new(std::sync::Arc::new(tls)), addr, "localhost")
 			.unwrap()
 			.await
 			.unwrap();

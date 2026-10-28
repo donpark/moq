@@ -15,7 +15,11 @@
 #![cfg_attr(test, allow(dead_code, reason = "test builds compile helpers only some tests call"))]
 #![cfg_attr(
 	not(any(feature = "aws-lc-rs", feature = "ring")),
-	allow(dead_code, unused_imports, reason = "without a crypto provider only the mux connection is reachable")
+	allow(
+		dead_code,
+		unused_imports,
+		reason = "without a crypto provider only the mux connection is reachable"
+	)
 )]
 
 use std::{

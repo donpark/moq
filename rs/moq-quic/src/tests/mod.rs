@@ -314,10 +314,7 @@ fn close_before_a_client_certificate_leaves_ends() {
 		let mut client = ClientConfig::new(Arc::new(client));
 		client.transport = Arc::new(cubic_transport());
 
-		let mut pair = Pair::new(
-			Default::default(),
-			ServerConfig::with_crypto(Arc::new(server)),
-		);
+		let mut pair = Pair::new(Default::default(), ServerConfig::with_crypto(Arc::new(server)));
 		let client_ch = connect_before_the_finished_leaves(&mut pair, client);
 
 		let now = pair.time;

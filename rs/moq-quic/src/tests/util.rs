@@ -795,7 +795,10 @@ pub(super) fn server_crypto_with_alpn(alpn: Vec<Vec<u8>>) -> rustls::ServerConfi
 	server_crypto_inner(None, Some(alpn))
 }
 
-pub(super) fn server_crypto_with_cert(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> rustls::ServerConfig {
+pub(super) fn server_crypto_with_cert(
+	cert: CertificateDer<'static>,
+	key: PrivateKeyDer<'static>,
+) -> rustls::ServerConfig {
 	server_crypto_inner(Some((cert, key)), None)
 }
 
@@ -854,7 +857,10 @@ pub(super) fn client_crypto_with_alpn(protocols: Vec<Vec<u8>>) -> rustls::Client
 	client_crypto_inner(None, Some(protocols))
 }
 
-fn client_crypto_inner(certs: Option<Vec<CertificateDer<'static>>>, alpn: Option<Vec<Vec<u8>>>) -> rustls::ClientConfig {
+fn client_crypto_inner(
+	certs: Option<Vec<CertificateDer<'static>>>,
+	alpn: Option<Vec<Vec<u8>>>,
+) -> rustls::ClientConfig {
 	let mut roots = RootCertStore::empty();
 	for cert in certs.unwrap_or_else(|| vec![CERTIFIED_KEY.cert.der().clone()]) {
 		roots.add(cert).unwrap();

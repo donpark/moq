@@ -14,7 +14,9 @@ use rustls::{
 
 use crate::{
 	ConnectError, ConnectionId, Side, TransportError, TransportErrorCode,
-	crypto::{self, CryptoError, ExportKeyingMaterialError, HandshakeData, HeaderKey, KeyPair, Keys, UnsupportedVersion},
+	crypto::{
+		self, CryptoError, ExportKeyingMaterialError, HandshakeData, HeaderKey, KeyPair, Keys, UnsupportedVersion,
+	},
 	transport_parameters::TransportParameters,
 };
 
