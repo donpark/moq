@@ -14,7 +14,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use moq_uring::{Config, Error, Worker, quic, udp};
-use web_transport_trait::poll::{RecvStream as _, SendStream as _, Session as _};
+use web_transport_trait::poll::{SendStream as _, Session as _};
 
 fn worker() -> Option<Worker> {
 	match Worker::new(Config::default()) {
@@ -81,7 +81,7 @@ fn dial_and_accept_share_one_socket() {
 
 			for conn in [&a_to_b, &b_in, &b_to_a, &a_in] {
 				assert_eq!(
-					web_transport_trait::poll::Session::protocol(conn),
+					conn.protocol(),
 					Some(ALPN),
 					"negotiated ALPN"
 				);
@@ -128,7 +128,7 @@ fn dropped_raw_session_closes(explicit: bool) {
 	worker
 		.block_on(async move {
 			let conn = client.connect(&dial_config(server.local_addr())).await.expect("dial");
-			let mut peer = server.accept().await.expect("accept");
+			let peer = server.accept().await.expect("accept");
 			let session = quic::web::Session::raw(conn);
 			let mut remaining = session.clone();
 			drop(session);
@@ -138,11 +138,11 @@ fn dropped_raw_session_closes(explicit: bool) {
 			std::future::poll_fn(|cx| send.poll_write(cx, b"alive"))
 				.await
 				.expect("write");
-			let mut recv = std::future::poll_fn(|cx| peer.poll_accept_uni(cx))
+			let mut recv = peer.accept_uni()
 				.await
 				.expect("accept stream");
 			let mut payload = [0; 5];
-			let read = std::future::poll_fn(|cx| recv.poll_read(cx, &mut payload))
+			let read = recv.read(&mut &mut payload[..])
 				.await
 				.expect("read");
 			assert_eq!(read, Some(5));
@@ -155,7 +155,7 @@ fn dropped_raw_session_closes(explicit: bool) {
 			};
 			drop(remaining);
 			// Stream handles intentionally survive the final session handle.
-			let error = std::future::poll_fn(|cx| peer.poll_closed(cx)).await;
+			let error = peer.closed().await;
 			assert!(
 				matches!(error, quic::Error::App { code: actual, .. } if actual == code),
 				"peer saw {error:?}"
@@ -203,10 +203,10 @@ fn a_close_reaches_both_ends_with_its_code() {
 			assert!(closes(&outgoing), "outbound dials are not admissions");
 			let mut accepted = server.accept().await.expect("accept");
 
-			dialed.close(CLOSE_CODE, CLOSE_REASON);
+			dialed.close(CLOSE_CODE.into(), CLOSE_REASON.as_bytes());
 
 			for (end, conn) in [("closer", &mut dialed), ("peer", &mut accepted)] {
-				match std::future::poll_fn(|cx| conn.poll_closed(cx)).await {
+				match conn.closed().await {
 					quic::Error::App { code, reason } => {
 						assert_eq!(code, u64::from(CLOSE_CODE), "{end} close code");
 						assert_eq!(reason, CLOSE_REASON, "{end} close reason");
@@ -388,25 +388,23 @@ fn a_peer_stop_reaches_the_accepted_stream() {
 
 	worker
 		.block_on(async move {
-			let mut dialed = client.connect(&dial_config(server.local_addr())).await.expect("dial");
-			let mut accepted = server.accept().await.expect("accept");
+			let dialed = client.connect(&dial_config(server.local_addr())).await.expect("dial");
+			let accepted = server.accept().await.expect("accept");
 
 			// Held, not dropped: dropping the send half would reset it, and
 			// the peer would then see a reset rather than the stop.
-			let (mut send, mut recv) = std::future::poll_fn(|cx| dialed.poll_open_bi(cx))
+			let (mut send, recv) = dialed.open_bi(Default::default())
 				.await
 				.expect("open_bi");
 			// One byte makes the stream readable before the stop arrives. Nothing
 			// is awaited between them, so both frames leave in the same flush.
-			std::future::poll_fn(|cx| send.poll_write(cx, b"x"))
-				.await
-				.expect("write");
-			recv.stop(CLOSE_CODE);
+			send.write_all(&b"x"[..]).await.expect("write");
+			recv.stop(CLOSE_CODE.into());
 
-			let (mut send, _recv) = within(
+			let (send, _recv) = within(
 				&handle,
 				"the stopped stream to arrive",
-				std::future::poll_fn(|cx| accepted.poll_accept_bi(cx)),
+				accepted.accept_bi(),
 			)
 			.await
 			.expect("accept_bi");
@@ -414,11 +412,11 @@ fn a_peer_stop_reaches_the_accepted_stream() {
 			match within(
 				&handle,
 				"the stop to be reported",
-				std::future::poll_fn(|cx| send.poll_closed(cx)),
+				send.stopped(),
 			)
 			.await
 			{
-				Err(quic::Error::Stop(code)) => assert_eq!(code, u64::from(CLOSE_CODE), "stop code"),
+				Ok(Some(code)) => assert_eq!(code, CLOSE_CODE.into(), "stop code"),
 				other => panic!("expected the peer's stop, got {other:?}"),
 			}
 		})
@@ -623,9 +621,9 @@ fn connections_share_one_tx_buffer_fairly() {
 			let first_client = quic::client::connect(first_sock, &dial_config(server))
 				.await
 				.expect("first connection");
-			let mut first_server = endpoint.accept().await.expect("first accepted connection");
+			let first_server = endpoint.accept().await.expect("first accepted connection");
 
-			let mut send = std::future::poll_fn(|cx| first_server.poll_open_uni(cx))
+			let mut send = first_server.open_uni(Default::default())
 				.await
 				.expect("open busy stream");
 			let running = std::rc::Rc::new(std::cell::Cell::new(true));
@@ -642,7 +640,7 @@ fn connections_share_one_tx_buffer_fairly() {
 				while send_running.get() {
 					let mut offset = 0;
 					while offset < chunk.len() {
-						match std::future::poll_fn(|cx| send.poll_write(cx, &chunk[offset..])).await {
+						match send.write(&mut &chunk[offset..]).await {
 							Ok(n) => offset += n,
 							// The reader drops its half as the test winds down, which
 							// stops this stream mid-write. Only a stop *before* that is
@@ -660,13 +658,13 @@ fn connections_share_one_tx_buffer_fairly() {
 			});
 			let recv_running = running.clone();
 			handle.spawn(async move {
-				let mut first_client = first_client;
-				let mut recv = std::future::poll_fn(|cx| first_client.poll_accept_uni(cx))
+				let first_client = first_client;
+				let mut recv = first_client.accept_uni()
 					.await
 					.expect("accept busy stream");
 				let mut chunk = vec![0; 64 * 1024];
 				while recv_running.get() {
-					if std::future::poll_fn(|cx| recv.poll_read(cx, &mut chunk))
+					if recv.read(&mut &mut chunk[..])
 						.await
 						.expect("read busy stream")
 						.is_none()

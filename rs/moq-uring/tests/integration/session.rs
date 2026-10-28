@@ -112,7 +112,7 @@ fn lite_session_over_the_worker() {
 		.block_on(async move {
 			let conn = quic::client::connect(client_sock, &dial).await.expect("quic connect");
 			assert_eq!(
-				web_transport_trait::poll::Session::protocol(&conn),
+				conn.protocol(),
 				Some(ALPN),
 				"negotiated ALPN"
 			);
@@ -349,7 +349,7 @@ fn configured_roots_verify_the_server() {
 		.block_on(async move {
 			let conn = quic::client::connect(client_sock, &dial).await.expect("quic connect");
 			assert_eq!(
-				web_transport_trait::poll::Session::protocol(&conn),
+				conn.protocol(),
 				Some(ALPN),
 				"negotiated ALPN"
 			);
@@ -416,8 +416,8 @@ fn required_client_auth_refuses_an_anonymous_client() {
 				// The dial itself was refused; done.
 				Err(_) => {}
 				// Established locally, but the server's refusal closes it.
-				Ok(mut conn) => {
-					std::future::poll_fn(|cx| web_transport_trait::poll::Session::poll_closed(&mut conn, cx)).await;
+				Ok(conn) => {
+					conn.closed().await;
 				}
 			}
 		})
@@ -470,7 +470,7 @@ fn a_root_bundle_is_loaded_whole() {
 		.block_on(async move {
 			let conn = quic::client::connect(client_sock, &dial).await.expect("quic connect");
 			assert_eq!(
-				web_transport_trait::poll::Session::protocol(&conn),
+				conn.protocol(),
 				Some(ALPN),
 				"negotiated ALPN"
 			);

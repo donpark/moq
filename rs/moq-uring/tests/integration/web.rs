@@ -13,7 +13,6 @@ use std::net::UdpSocket;
 
 use moq_net::origin;
 use moq_uring::{Config, Error, Worker, quic, udp};
-use web_transport_trait::Stats as _;
 use web_transport_trait::poll::{RecvStream as _, SendStream as _, Session as _};
 
 fn worker() -> Option<Worker> {
@@ -83,7 +82,7 @@ type ClientFuture = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
 async fn read_all(recv: &mut moq_tokio::quic::web::RecvStream) -> Vec<u8> {
 	let mut out = Vec::new();
 	let mut buf = [0u8; 4096];
-	while let Some(n) = recv.read(&mut buf).await.expect("read") {
+	while let Some(n) = recv.read(&mut &mut buf[..]).await.expect("read") {
 		out.extend_from_slice(&buf[..n]);
 	}
 	out
@@ -428,7 +427,7 @@ fn an_abandoned_handshake_closes_the_connection() {
 	worker
 		.block_on(async move {
 			let conn = endpoint.accept().await.expect("accept");
-			let mut watch = conn.clone();
+			let watch = conn.clone();
 			let request = quic::web::Request::accept(conn).await.expect("handshake");
 			let err = request
 				.respond(quic::web::Response::default().with_protocol("never-offered"))
@@ -441,7 +440,7 @@ fn an_abandoned_handshake_closes_the_connection() {
 			within(
 				&handle,
 				"the abandoned connection to close",
-				std::future::poll_fn(|cx| watch.poll_closed(cx)),
+				watch.closed(),
 			)
 			.await;
 		})
@@ -465,12 +464,12 @@ fn an_unpolled_handshake_closes_the_connection() {
 	worker
 		.block_on(async move {
 			let conn = endpoint.accept().await.expect("accept");
-			let mut watch = conn.clone();
+			let watch = conn.clone();
 			drop(quic::web::Request::accept(conn));
 			within(
 				&handle,
 				"the unpolled handshake's connection to close",
-				std::future::poll_fn(|cx| watch.poll_closed(cx)),
+				watch.closed(),
 			)
 			.await;
 		})
@@ -538,15 +537,15 @@ fn a_dropped_stream_carries_a_webtransport_code() {
 			// The server writes this and then drops the stream unfinished.
 			let mut recv = session.accept_uni().await.expect("accept_uni");
 			let mut buf = [0u8; 4096];
-			let n = recv.read(&mut buf).await.expect("read").expect("payload");
+			let n = recv.read(&mut &mut buf[..]).await.expect("read").expect("payload");
 			assert_eq!(&buf[..n], PAYLOAD);
 
 			// Tell it we have the payload, so the reset below cannot race it.
 			let mut ack = session.open_uni(Default::default()).await.expect("open_uni");
-			ack.write_all(b"ack").await.expect("write");
+			ack.write_all(&b"ack"[..]).await.expect("write");
 			ack.finish().expect("finish");
 
-			let err = recv.read(&mut buf).await.expect_err("the server dropped it");
+			let err = recv.read(&mut &mut buf[..]).await.expect_err("the server dropped it");
 			assert!(matches!(err, moq_tokio::quic::web::ReadError::Reset(0)), "got {err:?}");
 
 			// And the other direction: the server drops the read half of this
@@ -612,19 +611,15 @@ fn a_dropped_stream_carries_a_webtransport_code() {
 }
 
 /// Write all of `buf` to a raw QUIC stream.
-async fn write_raw(send: &mut quic::SendStream, mut buf: &[u8]) {
-	while !buf.is_empty() {
-		let n = std::future::poll_fn(|cx| send.poll_write(cx, buf))
-			.await
-			.expect("write");
-		buf = &buf[n..];
-	}
+async fn write_raw(send: &mut quic::send::Stream, buf: &[u8]) {
+	send.write_all(buf).await.expect("write");
 }
 
 /// Append whatever arrives next on a raw QUIC stream, failing on its end.
-async fn read_more(recv: &mut quic::RecvStream, out: &mut Vec<u8>) {
+async fn read_more(recv: &mut quic::recv::Stream, out: &mut Vec<u8>) {
 	let mut buf = [0u8; 4096];
-	let n = std::future::poll_fn(|cx| recv.poll_read(cx, &mut buf))
+	let n = recv
+		.read(&mut &mut buf[..])
 		.await
 		.expect("read")
 		.expect("the stream ended early");
@@ -652,8 +647,7 @@ fn a_reset_stream_keeps_its_header() {
 				.open_uni(Default::default())
 				.await
 				.expect("open_uni")
-				.reset(8)
-				.expect("reset");
+				.reset(8);
 			session.closed().await;
 		})
 	});
@@ -820,12 +814,12 @@ fn dropped_session_delivers_close(explicit: bool) {
 
 	worker
 		.block_on(async {
-			let mut peer = client.connect(&dial).await.expect("dial");
+			let peer = client.connect(&dial).await.expect("dial");
 			let conn = server.accept().await.expect("accept");
-			let mut watch = conn.clone();
+			let watch = conn.clone();
 
 			// The client half of the handshake: SETTINGS, then the CONNECT.
-			let mut control = std::future::poll_fn(|cx| peer.poll_open_uni(cx))
+			let mut control = peer.open_uni(Default::default())
 				.await
 				.expect("control stream");
 			let mut settings = web_transport_proto::Settings::default();
@@ -834,7 +828,7 @@ fn dropped_session_delivers_close(explicit: bool) {
 			settings.encode(&mut bytes);
 			write_raw(&mut control, &bytes).await;
 
-			let (mut connect_send, mut connect_recv) = std::future::poll_fn(|cx| peer.poll_open_bi(cx))
+			let (mut connect_send, mut connect_recv) = peer.open_bi(Default::default())
 				.await
 				.expect("CONNECT stream");
 			let url = url::Url::parse(&format!("https://localhost:{}/", server.local_addr().port())).expect("url");
@@ -868,7 +862,7 @@ fn dropped_session_delivers_close(explicit: bool) {
 
 			// The server's control stream, read past its SETTINGS so that
 			// anything it reports from here on is the stream ending.
-			let mut server_control = std::future::poll_fn(|cx| peer.poll_accept_uni(cx))
+			let mut server_control = peer.accept_uni()
 				.await
 				.expect("server control stream");
 			let mut received = Vec::new();
@@ -912,17 +906,17 @@ fn dropped_session_delivers_close(explicit: bool) {
 			// including a reset of the control stream had the drop caused one.
 			let mut buf = [0u8; 64];
 			let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-			match server_control.poll_read(&mut cx, &mut buf) {
+			match std::pin::pin!(server_control.read(&mut &mut buf[..])).poll(&mut cx) {
 				std::task::Poll::Pending => {}
 				other => panic!("the server's control stream ended under the capsule: {other:?}"),
 			}
 
 			// The peer acts on the capsule, as a browser would.
-			peer.close(0, "");
+			peer.close(0u32.into(), b"");
 			within(
 				&handle,
 				"the connection to close",
-				std::future::poll_fn(|cx| watch.poll_closed(cx)),
+				watch.closed(),
 			)
 			.await;
 			drop(control);
@@ -947,34 +941,24 @@ fn cancelling_a_pending_web_handshake(send_settings: bool) {
 
 	worker
 		.block_on(async {
-			let mut peer = client.connect(&dial).await.expect("dial");
+			let peer = client.connect(&dial).await.expect("dial");
 			let conn = server.accept().await.expect("accept");
-			let mut watch = conn.clone();
+			let watch = conn.clone();
 			let mut control = None;
 			if send_settings {
-				let before = web_transport_trait::poll::Session::stats(&watch)
-					.bytes_received()
-					.expect("counted");
-				let mut stream = std::future::poll_fn(|cx| peer.poll_open_uni(cx))
+				let before = watch.stats().udp_rx.bytes;
+				let mut stream = peer.open_uni(Default::default())
 					.await
 					.expect("control stream");
 				let mut settings = web_transport_proto::Settings::default();
 				settings.enable_webtransport(1);
 				let mut bytes = Vec::new();
 				settings.encode(&mut bytes);
-				let mut remaining = bytes.as_slice();
-				while !remaining.is_empty() {
-					let n = std::future::poll_fn(|cx| stream.poll_write(cx, remaining))
-						.await
-						.expect("write settings");
-					remaining = &remaining[n..];
-				}
+				stream.write_all(bytes.as_slice()).await.expect("write settings");
 				control = Some(stream);
 				within(&handle, "peer SETTINGS to arrive", async {
 					loop {
-						if web_transport_trait::poll::Session::stats(&watch)
-							.bytes_received()
-							.expect("counted") > before
+						if watch.stats().udp_rx.bytes > before
 						{
 							break;
 						}
@@ -999,14 +983,14 @@ fn cancelling_a_pending_web_handshake(send_settings: bool) {
 			let err = within(
 				&handle,
 				"cancelled WebTransport connection to close",
-				std::future::poll_fn(|cx| watch.poll_closed(cx)),
+				watch.closed(),
 			)
 			.await;
 			assert!(matches!(err, quic::Error::App { code: 0x101, .. }), "got {err:?}");
 			within(
 				&handle,
 				"peer to receive the close",
-				std::future::poll_fn(|cx| peer.poll_closed(cx)),
+				peer.closed(),
 			)
 			.await;
 			drop(control);

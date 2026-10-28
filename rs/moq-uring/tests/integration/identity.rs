@@ -126,8 +126,8 @@ fn an_endpoint_runs_on_the_worker_that_adopted_its_socket() {
 		ready.send(()).expect("test alive");
 		worker
 			.block_on(async move {
-				let mut conn = quic::client::connect(sock, &dial_config(addr)).await.expect("dial");
-				std::future::poll_fn(|cx| web_transport_trait::poll::Session::poll_closed(&mut conn, cx)).await
+				let conn = quic::client::connect(sock, &dial_config(addr)).await.expect("dial");
+				conn.closed().await
 			})
 			.expect("client loop")
 	});
@@ -154,14 +154,14 @@ fn an_endpoint_runs_on_the_worker_that_adopted_its_socket() {
 
 	owner
 		.block_on(async {
-			let mut accepted = endpoint.accept().await.expect("accept on the owner");
+			let accepted = endpoint.accept().await.expect("accept on the owner");
 			assert_eq!(
-				web_transport_trait::poll::Session::protocol(&accepted),
+				accepted.protocol(),
 				Some(ALPN),
 				"negotiated ALPN"
 			);
-			web_transport_trait::poll::Session::close(&mut accepted, 0, "done");
-			std::future::poll_fn(|cx| web_transport_trait::poll::Session::poll_closed(&mut accepted, cx)).await;
+			accepted.close(moq_uring::quic::VarInt::from_u32(0), b"done");
+			accepted.closed().await;
 		})
 		.expect("owner loop");
 

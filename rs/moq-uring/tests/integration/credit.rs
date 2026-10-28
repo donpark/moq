@@ -16,7 +16,6 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 
 use moq_uring::{Config, Error, Worker, quic, udp};
-use web_transport_trait::poll::{RecvStream as _, SendStream as _, Session as _};
 
 const ALPN: &str = "moq-uring-credit";
 /// The server's connection window.
@@ -50,7 +49,7 @@ async fn within<T>(handle: &moq_uring::Handle, what: &str, future: impl Future<O
 
 /// Lease at least `want` bytes, returning how many were leased and whether
 /// the FIN follows them.
-async fn leased(handle: &moq_uring::Handle, recv: &mut quic::RecvStream, want: usize) -> (usize, bool) {
+async fn leased(handle: &moq_uring::Handle, recv: &mut quic::recv::Stream, want: usize) -> (usize, bool) {
 	within(
 		handle,
 		"stream data",
@@ -64,7 +63,7 @@ async fn leased(handle: &moq_uring::Handle, recv: &mut quic::RecvStream, want: u
 }
 
 /// Consume the first `n` leased bytes.
-async fn consume(handle: &moq_uring::Handle, recv: &mut quic::RecvStream, n: usize) {
+async fn consume(handle: &moq_uring::Handle, recv: &mut quic::recv::Stream, n: usize) {
 	within(
 		handle,
 		"stream data",
@@ -113,19 +112,17 @@ fn endpoints(
 }
 
 /// Write `len` bytes and the FIN, giving up quietly once the receiver stops.
-fn write(handle: &moq_uring::Handle, mut send: quic::SendStream, len: usize) {
+fn write(handle: &moq_uring::Handle, mut send: quic::send::Stream, len: usize) {
 	handle.spawn(async move {
-		let payload = vec![7u8; len];
-		let mut buf = &payload[..];
-		while !buf.is_empty() {
-			match std::future::poll_fn(|cx| send.poll_write(cx, buf)).await {
-				Ok(n) => buf = &buf[n..],
-				Err(_) => return,
-			}
+		if send.write_all(Bytes::from(vec![7u8; len])).await.is_ok() {
+			let _ = send.finish().stopped().await;
 		}
-		let _ = send.finish();
-		let _ = std::future::poll_fn(|cx| send.poll_closed(cx)).await;
 	});
+}
+
+/// Poll `future` once, without a waker.
+fn now<F: Future>(future: F) -> Poll<F::Output> {
+	std::pin::pin!(future).poll(&mut Context::from_waker(Waker::noop()))
 }
 
 #[test]
@@ -137,16 +134,16 @@ fn leases_spend_the_connection_window() {
 
 	worker
 		.block_on(async move {
-			let mut dialed = client.connect(&dial).await.expect("dial");
-			let mut accepted = server.accept().await.expect("accept");
-			let send = std::future::poll_fn(|cx| dialed.poll_open_uni(cx))
+			let dialed = client.connect(&dial).await.expect("dial");
+			let accepted = server.accept().await.expect("accept");
+			let send = dialed.open_uni(Default::default())
 				.await
 				.expect("open_uni");
 			write(&handle, send, WINDOW + 500);
 			let mut recv = within(
 				&handle,
 				"the stream",
-				std::future::poll_fn(|cx| accepted.poll_accept_uni(cx)),
+				accepted.accept_uni(),
 			)
 			.await
 			.expect("accept_uni");
@@ -156,7 +153,7 @@ fn leases_spend_the_connection_window() {
 			let mut cx = Context::from_waker(Waker::noop());
 			assert!(matches!(
 				recv.poll_lease(&mut cx, WINDOW + 1).map_ok(|lease| lease.remaining()),
-				Poll::Ready(Err(quic::Error::TooLarge))
+				Poll::Ready(Err(quic::recv::Error::TooLarge))
 			));
 
 			// Far below the usual update threshold, and still enough to unblock.
@@ -178,17 +175,17 @@ fn stuck_window_evicts_the_lower_priority() {
 
 	worker
 		.block_on(async move {
-			let mut dialed = client.connect(&dial).await.expect("dial");
-			let mut accepted = server.accept().await.expect("accept");
+			let dialed = client.connect(&dial).await.expect("dial");
+			let accepted = server.accept().await.expect("accept");
 			for _ in 0..2 {
-				let send = std::future::poll_fn(|cx| dialed.poll_open_uni(cx))
+				let send = dialed.open_uni(Default::default())
 					.await
 					.expect("open_uni");
 				write(&handle, send, WINDOW);
 			}
 			let mut streams = Vec::new();
 			for _ in 0..2 {
-				let accept = std::future::poll_fn(|cx| accepted.poll_accept_uni(cx));
+				let accept = accepted.accept_uni();
 				streams.push(within(&handle, "the stream", accept).await.expect("accept_uni"));
 			}
 			let [mut low, mut high] = streams.try_into().expect("two streams");
@@ -219,7 +216,7 @@ fn stuck_window_evicts_the_lower_priority() {
 				}),
 			)
 			.await;
-			assert!(matches!(low_done, Some(Err(quic::Error::Evicted))), "{low_done:?}");
+			assert!(matches!(low_done, Some(Err(quic::recv::Error::Evicted))), "{low_done:?}");
 			assert_eq!(high_done.expect("polled").expect("lease"), WINDOW);
 		})
 		.expect("worker");
@@ -259,41 +256,32 @@ fn chunked_writes_stop_at_the_window() {
 
 	worker
 		.block_on(async move {
-			let mut dialed = client.connect(&dial).await.expect("dial");
-			let mut accepted = server.accept().await.expect("accept");
+			let dialed = client.connect(&dial).await.expect("dial");
+			let accepted = server.accept().await.expect("accept");
 
-			let mut send = std::future::poll_fn(|cx| dialed.poll_open_uni(cx))
+			let mut send = dialed.open_uni(Default::default())
 				.await
 				.expect("open_uni");
 
 			// The bytes past the window stay in the caller's buffer, untaken,
 			// and moq-quic keeps the ones it took by reference, not as a copy.
-			let mut cx = Context::from_waker(Waker::noop());
 			let mut buf = Bytes::copy_from_slice(&payload);
 			assert!(buf.is_unique());
-			assert!(matches!(
-				send.poll_write_buf(&mut cx, &mut buf),
-				Poll::Ready(Ok(STREAM_WINDOW))
-			));
+			assert!(matches!(now(send.write(&mut buf)), Poll::Ready(Ok(STREAM_WINDOW))));
 			assert_eq!(buf, payload.slice(STREAM_WINDOW..));
 			assert!(!buf.is_unique(), "moq-quic copied the chunk");
-			assert!(send.poll_write_buf(&mut cx, &mut buf).is_pending());
+			assert!(now(send.write(&mut buf)).is_pending());
 			assert_eq!(buf, payload.slice(STREAM_WINDOW..));
 
 			handle.spawn(async move {
-				while !buf.is_empty() {
-					std::future::poll_fn(|cx| send.poll_write_buf(cx, &mut buf))
-						.await
-						.expect("write");
-				}
-				send.finish().expect("finish");
-				let _ = std::future::poll_fn(|cx| send.poll_closed(cx)).await;
+				send.write_all(buf).await.expect("write");
+				let _ = send.finish().stopped().await;
 			});
 
 			let mut recv = within(
 				&handle,
 				"the stream",
-				std::future::poll_fn(|cx| accepted.poll_accept_uni(cx)),
+				accepted.accept_uni(),
 			)
 			.await
 			.expect("accept_uni");
@@ -302,7 +290,7 @@ fn chunked_writes_stop_at_the_window() {
 			let first = within(
 				&handle,
 				"stream data",
-				std::future::poll_fn(|cx| recv.poll_read_chunk(cx, 1000)),
+				recv.read_chunk(1000),
 			)
 			.await
 			.expect("read")
@@ -313,7 +301,7 @@ fn chunked_writes_stop_at_the_window() {
 			while let Some(chunk) = within(
 				&handle,
 				"stream data",
-				std::future::poll_fn(|cx| recv.poll_read_chunk(cx, usize::MAX)),
+				recv.read_chunk(usize::MAX),
 			)
 			.await
 			.expect("read")
@@ -321,9 +309,8 @@ fn chunked_writes_stop_at_the_window() {
 				received.extend_from_slice(&chunk);
 			}
 			assert_eq!(received, payload);
-			within(&handle, "the FIN", std::future::poll_fn(|cx| recv.poll_closed(cx)))
-				.await
-				.expect("finished");
+			let reset = within(&handle, "the FIN", recv.received_reset()).await;
+			assert!(matches!(reset, Ok(None)), "{reset:?}");
 		})
 		.expect("worker");
 }
@@ -339,8 +326,8 @@ fn tiny_frames_do_not_pin_receive_buffers() {
 
 	worker
 		.block_on(async move {
-			let mut dialed = client.connect(&dial).await.expect("dial");
-			let mut accepted = server.accept().await.expect("accept");
+			let dialed = client.connect(&dial).await.expect("dial");
+			let accepted = server.accept().await.expect("accept");
 
 			dialed
 				.send_datagram(Bytes::from_static(b"x"), Default::default())
@@ -348,20 +335,20 @@ fn tiny_frames_do_not_pin_receive_buffers() {
 			let datagram = within(
 				&handle,
 				"the datagram",
-				std::future::poll_fn(|cx| accepted.poll_recv_datagram(cx)),
+				accepted.read_datagram(),
 			)
 			.await
 			.expect("recv_datagram");
 			assert!(owns_exactly(datagram));
 
-			let send = std::future::poll_fn(|cx| dialed.poll_open_uni(cx))
+			let send = dialed.open_uni(Default::default())
 				.await
 				.expect("open_uni");
 			write(&handle, send, 1);
 			let mut recv = within(
 				&handle,
 				"the stream",
-				std::future::poll_fn(|cx| accepted.poll_accept_uni(cx)),
+				accepted.accept_uni(),
 			)
 			.await
 			.expect("accept_uni");
@@ -387,4 +374,38 @@ fn tiny_frames_do_not_pin_receive_buffers() {
 fn owns_exactly(bytes: Bytes) -> bool {
 	let len = bytes.len();
 	bytes.try_into_mut().is_ok_and(|bytes| bytes.capacity() == len)
+}
+
+/// A held lease borrows nothing from the connection, so the driver and the
+/// other streams keep moving while it is out.
+#[test]
+fn a_held_lease_does_not_stall_the_connection() {
+	let Some(mut worker) = worker() else { return };
+	let handle = worker.handle();
+	let (server, client, dial) = endpoints(&handle, WINDOW, WINDOW);
+
+	worker
+		.block_on(async move {
+			let dialed = client.connect(&dial).await.expect("dial");
+			let accepted = server.accept().await.expect("accept");
+
+			write(&handle, dialed.open_uni(Default::default()).await.expect("open_uni"), 100);
+			let mut held = within(&handle, "the first stream", accepted.accept_uni())
+				.await
+				.expect("accept_uni");
+			let lease = within(&handle, "stream data", held.lease(100)).await.expect("lease");
+
+			write(&handle, dialed.open_uni(Default::default()).await.expect("open_uni"), WINDOW / 2);
+			let mut other = within(&handle, "the second stream", accepted.accept_uni())
+				.await
+				.expect("accept_uni");
+			let read = within(&handle, "the second stream's data", other.read_to_end(WINDOW))
+				.await
+				.expect("read");
+			assert_eq!(read.len(), WINDOW / 2);
+
+			assert_eq!(lease.remaining(), 100);
+			lease.release();
+		})
+		.expect("worker");
 }

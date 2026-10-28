@@ -82,7 +82,7 @@ fn a_connection_writes_a_trace() {
 		.block_on(async move {
 			let conn = quic::client::connect(client_sock, &dial).await.expect("quic connect");
 			assert_eq!(
-				web_transport_trait::poll::Session::protocol(&conn),
+				conn.protocol(),
 				Some(ALPN),
 				"negotiated ALPN"
 			);
