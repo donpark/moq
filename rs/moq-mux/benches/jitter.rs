@@ -212,7 +212,7 @@ fn admission(c: &mut Criterion) {
 						let mut read = 0;
 						for track in 1..=tracks {
 							for next in 1..=backlog {
-								if buffer.full(&track) {
+								if buffer.full(&track, &kio::Waiter::noop()) {
 									break;
 								}
 								buffer.push(track, frame(next * 20)).unwrap();

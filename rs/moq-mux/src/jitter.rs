@@ -123,11 +123,11 @@ impl<K: Ord + Clone, T> Buffer<K, T> {
 		}
 		self.writing(&key).push(key, arrival)
 	}
-	pub fn full<Q: Ord + ?Sized>(&self, key: &Q) -> bool
+	pub fn full<Q: Ord + ?Sized>(&mut self, key: &Q, waiter: &kio::Waiter) -> bool
 	where
 		K: Borrow<Q>,
 	{
-		self.pending().is_some_and(|pending| pending.held.contains_key(key)) || self.reading(key).full(key)
+		self.pending().is_some_and(|pending| pending.held.contains_key(key)) || self.writing(key).full(key, waiter)
 	}
 	pub fn holds<Q: Ord + ?Sized>(&self, key: &Q) -> bool
 	where
@@ -692,6 +692,8 @@ struct Floor<K> {
 struct Track<T> {
 	/// Frames in arrival order, each with its generation, decode time and deadline.
 	queue: VecDeque<(u64, Decode, Instant, T)>,
+	/// Wake the reader when its future tail enters the admission window.
+	read_timer: Option<Pin<Box<Sleep>>>,
 	/// The source's restart, skip and cut counters at the last frame.
 	restart: u64,
 	skip: u64,
@@ -950,6 +952,7 @@ impl<K: Ord + Clone, T> Engine<K, T> {
 		}
 		let track = self.tracks.entry(key).or_insert_with(|| Track {
 			queue: VecDeque::new(),
+			read_timer: None,
 			restart: arrival.restart,
 			skip: arrival.skip,
 			cut: arrival.cut,
@@ -1399,11 +1402,11 @@ impl<K: Ord + Clone, T> Engine<K, T> {
 
 	/// Whether `key` has output due, or its newest queued frame is beyond the delay and its
 	/// measured lead, so reading more would move future backlog out of the source.
-	pub fn full<Q: Ord + ?Sized>(&self, key: &Q) -> bool
+	pub fn full<Q: Ord + ?Sized>(&mut self, key: &Q, waiter: &kio::Waiter) -> bool
 	where
 		K: Borrow<Q>,
 	{
-		let Some((key, track)) = self.tracks.get_key_value(key) else {
+		let Some((stored, track)) = self.tracks.get_key_value(key) else {
 			return false;
 		};
 		let Some((_, _, first, _)) = track.queue.front() else {
@@ -1413,9 +1416,21 @@ impl<K: Ord + Clone, T> Engine<K, T> {
 		if self.delay.is_zero() || *first <= now {
 			return true;
 		}
-		let lead = Duration::from_secs_f64(self.lead(key).unwrap_or(0.0).max(0.0));
+		let lead = Duration::from_secs_f64(self.lead(stored).unwrap_or(0.0).max(0.0));
 		let (_, _, last, _) = track.queue.back().expect("the first frame is queued");
-		*last > now + self.delay + lead
+		let reopen = last.checked_sub(self.delay + lead).unwrap_or(now);
+		let track = self.tracks.get_mut(key).expect("the queued track");
+		if reopen <= now {
+			track.read_timer = None;
+			return false;
+		}
+		let timer = track
+			.read_timer
+			.get_or_insert_with(|| Box::pin(moq_clock::sleep_until(reopen)));
+		if timer.deadline() != reopen {
+			timer.as_mut().reset(reopen);
+		}
+		waiter.poll_future(timer.as_mut()).is_pending()
 	}
 
 	/// How many frames are waiting.
@@ -1543,7 +1558,7 @@ mod tests {
 		};
 		assert_eq!((first.item, first.generation), ("B1", 0));
 		buffer.hold_pending(first);
-		assert!(buffer.full(&1));
+		assert!(buffer.full(&1, &kio::Waiter::noop()));
 		let Poll::Ready(next) = buffer.poll_pending(&kio::Waiter::noop()) else {
 			panic!("B3 ready");
 		};
@@ -1801,7 +1816,7 @@ mod tests {
 				let end = if track == 1 { 1_200 } else { 800 };
 				for decode in (40..=end).step_by(40) {
 					assert!(
-						!buffer.full(&track),
+						!buffer.full(&track, &kio::Waiter::noop()),
 						"the fill must observe the whole backlog: {order:?}"
 					);
 					buffer
@@ -2876,7 +2891,7 @@ mod tests {
 		assert_eq!(due(&mut buffer), ["a20"], "the audio keeps the delay");
 		assert_eq!(buffer.next_deadline(), Some(start + Duration::from_millis(400)));
 		assert!(
-			!buffer.full(&1),
+			!buffer.full(&1, &kio::Waiter::noop()),
 			"acquisition measures the video lead before steering starts"
 		);
 		assert_eq!(buffer.dropped(), 0);
@@ -2965,28 +2980,46 @@ mod tests {
 	async fn admission_respects_due_output_the_future_tail_and_each_tracks_lead() {
 		let start = moq_clock::now();
 		let mut buffer = Buffer::new(DELAY).replay();
-		assert!(!buffer.full(&1));
+		assert!(!buffer.full(&1, &kio::Waiter::noop()));
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();
-		assert!(!buffer.full(&1), "a frame inside the delay leaves room to read ahead");
+		assert!(
+			!buffer.full(&1, &kio::Waiter::noop()),
+			"a frame inside the delay leaves room to read ahead"
+		);
 		buffer.push(1, arrival(start, 1, "v1")).unwrap();
 		assert!(
-			buffer.full(&1),
+			buffer.full(&1, &kio::Waiter::noop()),
 			"the tail is beyond the delay though the front is not due"
 		);
-		assert!(!buffer.full(&2), "the future tail only stops its own track");
+		assert!(
+			!buffer.full(&2, &kio::Waiter::noop()),
+			"the future tail only stops its own track"
+		);
 		buffer.leads.insert(1, VecDeque::from([0.2]));
-		assert!(!buffer.full(&1), "a track sent ahead keeps its measured lead");
+		assert!(
+			!buffer.full(&1, &kio::Waiter::noop()),
+			"a track sent ahead keeps its measured lead"
+		);
 		buffer.push(1, arrival(start, 201, "v201")).unwrap();
-		assert!(buffer.full(&1), "the tail is beyond the delay and lead");
+		assert!(
+			buffer.full(&1, &kio::Waiter::noop()),
+			"the tail is beyond the delay and lead"
+		);
 		tokio::time::advance(DELAY).await;
-		assert!(buffer.full(&1));
-		assert!(!buffer.full(&2), "another track's due frame does not stop this one");
+		assert!(buffer.full(&1, &kio::Waiter::noop()));
+		assert!(
+			!buffer.full(&2, &kio::Waiter::noop()),
+			"another track's due frame does not stop this one"
+		);
 		assert_eq!(due(&mut buffer), ["v0"]);
-		assert!(!buffer.full(&1), "time advancing opens room in the admission window");
+		assert!(
+			!buffer.full(&1, &kio::Waiter::noop()),
+			"time advancing opens room in the admission window"
+		);
 
 		let mut buffer = Buffer::new(Duration::ZERO);
 		buffer.push(1, arrival(start, 0, "v0")).unwrap();
-		assert!(buffer.full(&1));
+		assert!(buffer.full(&1, &kio::Waiter::noop()));
 	}
 
 	/// A fast track must leave its future backlog in the source beside a real-time track.
@@ -3001,7 +3034,7 @@ mod tests {
 			let at = start + Duration::from_millis(step * 20);
 			tokio::time::advance(at.saturating_duration_since(moq_clock::now())).await;
 			for (key, speed) in [(0, 1), (1, 3)] {
-				while next[key] <= step * 20 * speed && !buffer.full(&(key as u16)) {
+				while next[key] <= step * 20 * speed && !buffer.full(&(key as u16), &kio::Waiter::noop()) {
 					buffer.push(key as u16, arrival(at, next[key], "frame")).unwrap();
 					next[key] += 20;
 				}
@@ -3012,6 +3045,47 @@ mod tests {
 		assert!(
 			peak <= 54,
 			"a 500 ms window at 20 ms/frame plus one lookahead per track: {peak}"
+		);
+	}
+	/// A sparse future frame reopens input before the frame itself is due.
+	#[moq_clock::test]
+	async fn admission_wakes_when_a_future_tail_enters_the_window() {
+		let start = moq_clock::now();
+		let delay = Duration::from_millis(500);
+		let mut buffer = Buffer::new(delay).replay();
+		buffer.push(1, arrival(start, 0, "first")).unwrap();
+		buffer.push(1, arrival(start, 1_500, "future")).unwrap();
+		moq_clock::sleep(delay).await;
+		assert_eq!(due(&mut buffer), ["first"]);
+		let reopened = kio::wait(|waiter| {
+			loop {
+				if !buffer.full(&1, waiter) {
+					return Poll::Ready(moq_clock::now());
+				}
+				if buffer.poll_next(waiter).is_pending() {
+					return Poll::Pending;
+				}
+			}
+		})
+		.await;
+		assert_eq!(reopened, start + Duration::from_millis(1_500));
+	}
+
+	/// The initial clock must not require copying the source's whole future backlog.
+	#[moq_clock::test]
+	async fn admission_bounds_the_backlog_while_acquiring_a_clock() {
+		let start = moq_clock::now();
+		let mut buffer = Buffer::new(Duration::from_millis(500));
+		for frame in 0..256 {
+			if buffer.full(&1, &kio::Waiter::noop()) {
+				break;
+			}
+			buffer.push(1, arrival(start, frame * 20, "frame")).unwrap();
+		}
+		assert!(
+			buffer.len() <= 27,
+			"a 500 ms acquisition at 20 ms/frame plus one lookahead: {}",
+			buffer.len()
 		);
 	}
 }

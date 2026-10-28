@@ -470,14 +470,15 @@ impl<S: Stream> Export<S> {
 			let count = if kind == 0 { self.video.len() } else { self.audio.len() };
 			for index in 0..count {
 				loop {
-					if self.header_emitted && self.jitter.full(&(kind, index)) {
-						break;
-					}
 					let track = if kind == 0 {
 						&mut self.video[index]
 					} else {
 						&mut self.audio[index]
 					};
+					if self.header_emitted && self.jitter.full(&(kind, index), waiter) {
+						let _ = track.source.poll_received(waiter);
+						break;
+					}
 					if !self.header_emitted && track.pending.is_some() {
 						break;
 					}

@@ -481,7 +481,8 @@ impl<S: Stream> Export<S> {
 	fn fill(&mut self, waiter: &kio::Waiter) -> Result<()> {
 		for (name, track) in &mut self.tracks {
 			loop {
-				if self.header_emitted && self.jitter.full(name) {
+				if self.header_emitted && self.jitter.full(name, waiter) {
+					let _ = track.source.poll_received(waiter);
 					break;
 				}
 				if !self.header_emitted && track.pending.is_some() {

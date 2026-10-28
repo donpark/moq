@@ -474,7 +474,8 @@ impl Track {
 		// A placed frame is judged at release, against the keyframe's departure ([`Export::leads_video`]).
 		let aligned = !is_video && !self.kind.placed();
 		loop {
-			if !input.waiting_for_header && input.jitter.full(&self.key) {
+			if !input.waiting_for_header && input.jitter.full(&self.key, waiter) {
+				let _ = self.source.poll_received(waiter);
 				break;
 			}
 			match self.source.poll_event(waiter)? {
@@ -1504,9 +1505,14 @@ where
 
 		// Once every source has ended, the tail goes out late if it must: the end of the
 		// stream is not a missed deadline.
-		self.program
-			.schedule
-			.set_ended(!self.program.tracks.is_empty() && self.program.tracks.values().all(|track| track.finished));
+		self.program.schedule.set_ended(
+			!self.program.tracks.is_empty()
+				&& self
+					.program
+					.tracks
+					.values_mut()
+					.all(|track| track.finished || track.source.poll_received(waiter).is_ready()),
+		);
 
 		// 4. Mux each frame the jitter buffer lets go (the first carries the buffered
 		// PAT/PMT), then lay out every grid slot whose time has come ([`Self::lay_due`]).
@@ -1611,9 +1617,12 @@ where
 					},
 				)?;
 				if !finished && track.finished {
-					self.program
-						.schedule
-						.set_ended(self.program.tracks.values().all(|track| track.finished));
+					self.program.schedule.set_ended(
+						self.program
+							.tracks
+							.values_mut()
+							.all(|track| track.finished || track.source.poll_received(waiter).is_ready()),
+					);
 				}
 			}
 		}

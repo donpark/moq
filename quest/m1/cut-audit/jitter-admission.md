@@ -41,27 +41,37 @@ supports; record what it does not.
 Investigation in [moq-dev/moq#7012](https://github.com/moq-dev/moq/pull/7012):
 
 - A mocked-clock 120-second feed, with audio at 1x and video at 3x, reaches
-  4,938 queued frames under the original admission rule. The candidate's
-  newest-deadline check holds at most 54 frames for its two 20 ms tracks
-  and 500 ms delay, including one lookahead frame per track.
+  4,938 queued frames under the original admission rule. Established-clock
+  admission holds at most 54 frames for its two 20 ms tracks and 500 ms delay,
+  including one lookahead frame per track.
 - Admission needs each track's lead before the first two-second steering
-  window. Seeding it from acquisition fixes clean-path losses and the
-  different-lead publisher handoff regression introduced by the first
-  candidate. It does not replace acquisition or discontinuity alignment.
-- The candidate is incomplete. Resolve the TS integration before landing:
-  `declared_reorder_sizes_the_decode_clock_from_the_first_frame` renders
-  different bytes; `a_lost_discontinuity_marker_still_breaks_the_clock`
-  loses an on-time audio frame; and `a_pid_removed_can_return_as_another_stream`,
-  `each_version_out_follows_the_last_by_one_change`, and
-  `the_version_wraps_after_31` miss a decode deadline on PID 32. The
-  reorder, clean-path, drift, and different-lead handoff checks were also
-  compared with the original admission function, where they pass. Keep the
-  production guarantees and test assertions while reconciling admission
-  with TS release keys, source cursor budgets, and timeline transitions.
-- The added admission benchmark sweeps 1/4/16/64 tracks against
-  64/256/1024 source frames. At 64 tracks, the original fill grows from
-  0.507 ms to 7.696 ms, while the candidate stays about 0.230-0.236 ms.
-  This measures bounded read work, not an acceptable final implementation.
+  window. Seed it from acquisition, and wake the reader when a future tail
+  enters its window, before the queued frame itself is due.
+- Payload backpressure must not hide received group handles from the source
+  cursor's latency budget, nor hide a completely received finite tail from
+  TS scheduling. Track receipt separately from delivery, requiring both track
+  FIN and each group's FIN before recognizing the existing finite-tail rule.
+  Reap never-decoded aborted group handles with amortized doubling compaction;
+  their cache charge is cleared on eviction, so retaining their metadata forever
+  would merely move the unbounded queue. Keep the current gap and already
+  decoded markers and faults. All five original TS integration regressions pass.
+- **Acquisition remains unbounded and blocks completion.** Before a clock
+  exists, `full` ignores the acquisition's held frames. The new deterministic
+  probe offers 256 future frames and retains all 256, past its 500 ms window's
+  derived 27-frame bound. The current acquisition chooses the freshest frame
+  of the entire available join backlog. Stopping at a bounded prefix changes
+  that anchor and can change the measured lead of a track sampled afterward;
+  retaining the whole backlog preserves that behavior at an unbounded cost.
+  Decide a bounded sampling/ownership design before landing. Recommendation:
+  keep this draft while that design is settled alongside
+  [Container backpressure](/quest/m1/container-backpressure.md), which already
+  owns per-consumer decoded-frame and group-overhead byte budgets in Rust and
+  JS. This PR has not expanded into its public configuration design, and does
+  not claim a complete hostile-peer memory bound.
+- The admission benchmark sweeps 1/4/16/64 tracks against 64/256/1024 source
+  frames. At 64 tracks the original fill grows from 0.507 ms to 7.696 ms;
+  the iterated candidate remains about 0.25 ms. This measures established-clock
+  read work, not the unresolved startup path.
 
 Public API: none. Wire: none.
 

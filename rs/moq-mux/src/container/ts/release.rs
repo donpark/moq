@@ -141,7 +141,8 @@ impl Release {
 			&& let Some((name, track)) = self.track.as_mut()
 		{
 			loop {
-				if self.jitter.full(&()) {
+				if self.jitter.full(&(), waiter) {
+					let _ = track.poll_received(waiter);
 					break;
 				}
 				let (frame, arrived) = match track.poll_event(waiter) {
