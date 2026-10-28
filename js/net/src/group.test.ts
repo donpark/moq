@@ -140,6 +140,7 @@ test("a group read late keeps the instant it joined, alone, on a track, or resum
 		expect((await subscriber.recvGroup())?.arrived).toBe(created);
 
 		// A resumed read keeps the original group's arrival, not the replacement copy's.
+		const original = clock.now();
 		const failing = new Producer(0);
 		const resumed = failing.mirror();
 		clock.jump(Nano.fromMilli(Milli(1000)));
@@ -160,7 +161,7 @@ test("a group read late keeps the instant it joined, alone, on a track, or resum
 		await resumed.readFrame();
 		failing.abort(new Error("copy failed"));
 		expect((await resumed.readFrame())?.payload).toEqual(textFrame("b").payload);
-		expect(resumed.arrived).toBe(created + Nano.fromMilli(Milli(1000)));
+		expect(resumed.arrived).toBe(original);
 
 		for (const producer of [alone, live, replacement]) producer.finish();
 		subscriber.close();

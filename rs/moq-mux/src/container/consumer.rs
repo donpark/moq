@@ -4433,7 +4433,7 @@ mod tests {
 	#[tokio::test(start_paused = true)]
 	async fn a_hole_behind_a_full_max_buffer_expires_from_its_successors_arrival() {
 		let max_delay = Duration::from_millis(500);
-		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
 		let mut consumer = container_max_delay_only(track.subscribe(None), max_delay);
 		consumer.set_max_buffer(4096);
 		for sequence in 0..2u64 {

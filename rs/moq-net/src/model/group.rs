@@ -5011,7 +5011,7 @@ mod test {
 	async fn groups_carry_when_they_landed() {
 		let start = moq_clock::now();
 		let mut alone = Info { sequence: 0 }.produce();
-		let mut track = crate::broadcast::Info::new()
+		let track = crate::broadcast::Info::new()
 			.produce()
 			.create_track("test", None)
 			.unwrap();
