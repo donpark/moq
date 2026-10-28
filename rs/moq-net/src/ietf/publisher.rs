@@ -882,9 +882,9 @@ enum Joined<G> {
 		cache: track::Consumer,
 		/// The subscription's namespace, which the fetch is held to the grant on.
 		namespace: crate::Path,
-		/// The subscription's own request token authorized it, so the limit does not bound
-		/// the fetch either.
-		token: bool,
+		/// The grant the subscription's own request token earned, if one authorized it. The
+		/// fetch is held to it too, past the subscription's end, and the limit bounds neither.
+		grant: Option<crate::auth::RequestGrant>,
 		/// The subscription's ranking, which the fetch joins.
 		ranking: Ranking<G>,
 	},
@@ -1440,7 +1440,7 @@ impl Publisher {
 					// again on every resume.
 					let filter = msg.filter;
 					let namespace = msg.track_namespace.clone();
-					let token = request_grant.is_some();
+					let grant = request_grant.clone();
 					let save_join = |largest: Option<Location>,
 					                 cache: &crate::track::Consumer,
 					                 ranking: &Ranking<GroupOf<Transport>>| {
@@ -1453,7 +1453,7 @@ impl Publisher {
 									},
 									cache: cache.clone(),
 									namespace: namespace.clone(),
-									token,
+									grant: grant.clone(),
 									ranking: ranking.clone(),
 								},
 								(Filter::NextObject, None) => Joined::Empty,
@@ -1610,7 +1610,7 @@ impl Publisher {
 				})
 				.await
 			};
-			// A FETCH joining this subscription ends with it, before the peer reads a word.
+			// A FETCH joining this subscription is refused if it has not answered yet.
 			drop(_join);
 			// The subscription's demand is gone; only its credit may still wait on a verification.
 			drop((request_grant, _slot));
@@ -2857,10 +2857,12 @@ impl Publisher {
 		// A standalone one is also checked here, before it reaches the origin; a joining one
 		// was checked when its subscription was.
 		//
-		// One joining a subscription its own request token authorized holds no authority of its
-		// own, so it ends with that subscription: on the token's expiry, revocation, or a
-		// refused renewal.
+		// A joining one is refused if its subscription ends before FETCH_OK. After that the
+		// head is already held and the requester can still cancel, so it finishes on its own
+		// authority: the gate, and the token grant if one authorized the subscription, which
+		// ends it on the token's expiry, revocation, or a refused renewal.
 		let mut lapses_with = None;
+		let mut token_grant = None;
 		let (track, start, end, joined, ranking, mut gate) = match fetch_type {
 			FetchType::Standalone {
 				namespace,
@@ -2921,19 +2923,20 @@ impl Publisher {
 					return Err(Error::Unauthorized);
 				};
 				debug_assert_eq!(id, subscriber_request_id);
-				let (end, cache, namespace, ranking, token) = match self
+				let (end, cache, namespace, ranking, grant) = match self
 					.joined(&mut stream, &mut finished, &mut messages, subscriber_request_id)
 					.await?
 				{
 					Ok(joined) => joined,
 					Err((err, reason)) => return self.reject_fetch(stream, &err, reason).await,
 				};
-				// The cache outlives the subscription, so the fetch holds its own gate and ends
-				// with the subscription rather than trusting the cache. One the subscription's
-				// request token authorized is held to the peer's grant alone, as the subscription is.
+				// The cache outlives the subscription, so the fetch holds its own gate rather than
+				// trusting the cache. One the subscription's request token authorized is held to
+				// the peer's grant alone, as the subscription is.
 				let gate = crate::auth::Gate::new(auth, namespace, crate::auth::Direction::Publish);
-				let gate = if token { gate.named() } else { gate };
+				let gate = if grant.is_some() { gate.named() } else { gate };
 				lapses_with = Some(subscriber_request_id);
+				token_grant = grant;
 				let start = match fetch_type {
 					FetchType::RelativeJoining { group_offset, .. } => end.group.saturating_sub(group_offset),
 					FetchType::AbsoluteJoining { group_id, .. } if group_id <= end.group => group_id,
@@ -2962,7 +2965,7 @@ impl Publisher {
 		};
 
 		let joins = self.joins.clone();
-		let lapsed = |waiter: &kio::Waiter| {
+		let unsubscribed = |waiter: &kio::Waiter| {
 			lapses_with.is_some_and(|id| {
 				joins
 					.poll(waiter, |joins| match joins.contains_key(&id) {
@@ -2971,6 +2974,11 @@ impl Publisher {
 					})
 					.is_ready()
 			})
+		};
+		let expired = |waiter: &kio::Waiter| {
+			token_grant
+				.as_ref()
+				.is_some_and(|grant: &crate::auth::RequestGrant| grant.poll_ended(waiter).is_ready())
 		};
 
 		// The answer's highest group is read before replying: FETCH_OK names where the response
@@ -2994,7 +3002,7 @@ impl Publisher {
 				{
 					return Poll::Ready(None);
 				}
-				if gate.poll_denied(waiter).is_ready() || lapsed(waiter) {
+				if gate.poll_denied(waiter).is_ready() || unsubscribed(waiter) || expired(waiter) {
 					let err = Error::Unauthorized;
 					let reason = err.to_string();
 					return Poll::Ready(Some(Err((err, reason))));
@@ -3017,9 +3025,9 @@ impl Publisher {
 		let capped = range.end != end;
 		let end = range.end;
 		let group = group.without_status();
-		// FETCH keeps each object's Timestamp, in the units FETCH_OK declares wherever the
-		// draft can declare them. Opting out of the properties strips nothing from the objects.
-		let timescale = group.info.timescale;
+		// Only the TIMESCALE in FETCH_OK opts the answer into timestamps, so a requester that
+		// opted out of the properties gets an untimed track.
+		let timescale = group.info.timescale.filter(|_| msg.properties_wanted);
 		let frames = group
 			.frames
 			.iter()
@@ -3044,7 +3052,7 @@ impl Publisher {
 			// group has to be here in full or the two leave a gap.
 			if group.sequence != end.group || group.end() != end.object {
 				return self
-					.reject_fetch(stream, &Error::Evicted, "joining prefix unavailable")
+					.reject_fetch(stream, &Error::NotFound, "joining prefix unavailable")
 					.await;
 			}
 			end
@@ -3103,7 +3111,7 @@ impl Publisher {
 		let res = {
 			let mut ok = std::pin::pin!(ok);
 			kio::wait(|waiter| {
-				if gate.poll_denied(waiter).is_ready() || lapsed(waiter) {
+				if gate.poll_denied(waiter).is_ready() || unsubscribed(waiter) || expired(waiter) {
 					return Poll::Ready(Err(Error::Unauthorized));
 				}
 				waiter.poll_future(ok.as_mut())
@@ -3116,7 +3124,8 @@ impl Publisher {
 		}
 
 		// The groups after FETCH_OK, which may wait on a group still being written, so the
-		// subscriber cancelling still releases everything the answer holds.
+		// subscriber cancelling still releases everything the answer holds. A joining one no
+		// longer ends with its subscription.
 		let respond = async {
 			let mut rank = ranking.rank(range.start);
 			let uni = self
@@ -3166,7 +3175,7 @@ impl Publisher {
 				{
 					return Poll::Ready(None);
 				}
-				if gate.poll_denied(waiter).is_ready() || lapsed(waiter) {
+				if gate.poll_denied(waiter).is_ready() || expired(waiter) {
 					return Poll::Ready(Some(Err(Error::Unauthorized)));
 				}
 				waiter.poll_future(respond.as_mut()).map(Some)
@@ -3207,7 +3216,7 @@ impl Publisher {
 				track::Consumer,
 				crate::Path,
 				Ranking<GroupOf<Transport>>,
-				bool,
+				Option<crate::auth::RequestGrant>,
 			),
 			(Error, &'static str),
 		>,
@@ -3251,8 +3260,8 @@ impl Publisher {
 				cache,
 				namespace,
 				ranking,
-				token,
-			})) => return Ok(Ok((end, cache, namespace, ranking, token))),
+				grant,
+			})) => return Ok(Ok((end, cache, namespace, ranking, grant))),
 			Ok(None) => (
 				match self.version {
 					Version::Draft18 => Error::InvalidJoiningRequestId,
@@ -10387,8 +10396,8 @@ mod serve_tests {
 		assert!(h.log.resets().is_empty());
 	}
 
-	/// A joining FETCH reaching back past an evicted prefix group is refused, even when an
-	/// earlier group it holds has as many objects as the prefix promised.
+	/// A joining FETCH reaching back past an evicted prefix group is refused as missing before
+	/// FETCH_OK, even when an earlier group it holds has as many objects as the prefix promised.
 	#[moq_clock::test]
 	async fn a_joining_fetch_refuses_a_prefix_group_it_lost() {
 		let version = Version::Draft18;
@@ -10439,6 +10448,15 @@ mod serve_tests {
 			crate::coding::decode_varint(&mut response, version).unwrap(),
 			ietf::RequestError::ID
 		);
+		assert_eq!(
+			crate::coding::decode_buf(&mut response, version, |r, v| Ok(
+				ietf::RequestError::decode(r, v)?.error_code
+			))
+			.unwrap(),
+			DOES_NOT_EXIST
+		);
+		assert!(response.is_empty());
+		assert!(h.log.resets().is_empty());
 	}
 
 	/// A joining FETCH that arrives after its subscription ended has no live edge to name, so
@@ -10750,8 +10768,8 @@ mod serve_tests {
 	}
 
 	/// FETCH_OK carries the properties SUBSCRIBE_OK would, as far as each draft has room for
-	/// them, and INCLUDE_PROPERTIES=0 empties the block. Either way the objects keep their
-	/// Timestamps wherever the draft can declare their units.
+	/// them, and INCLUDE_PROPERTIES=0 empties the block. The objects carry Timestamps only
+	/// when that block declares their units.
 	#[moq_clock::test]
 	async fn fetch_ok_carries_the_track_properties() {
 		let info = track::Info {
@@ -10794,8 +10812,8 @@ mod serve_tests {
 				.unwrap();
 				assert_eq!(
 					occurrences(&h.log, &properties),
-					1,
-					"{version} wanted={wanted}: object unstamped"
+					usize::from(wanted),
+					"{version} wanted={wanted}: stamped only with a TIMESCALE"
 				);
 			}
 		}
@@ -11932,19 +11950,35 @@ mod serve_tests {
 		}
 	}
 
-	/// A joining FETCH holds no authority of its own: revocation or dropping its parent
-	/// ends it even while stream credit blocks the response after FETCH_OK.
+	/// How a joining FETCH's subscription ends while the answer, past FETCH_OK, waits on
+	/// stream credit.
+	#[derive(Clone, Copy, Debug, PartialEq)]
+	enum JoinEnd {
+		/// The subscription ends, and the session grant still covers the fetch.
+		Ended,
+		/// A token-authorized subscription ends, and its token is still granted.
+		TokenEnded,
+		/// The token's grant stops covering the track while its subscription still serves.
+		Narrowed,
+		/// The token is revoked after its subscription ended.
+		RevokedAfter,
+	}
+
+	/// Past FETCH_OK, a joining FETCH finishes its head on its own authority: the subscription
+	/// ending leaves it to finish, but the token that authorized the subscription still ends
+	/// it, before or after the subscription has.
 	#[moq_clock::test]
-	async fn a_joining_fetch_ends_with_its_subscription() {
-		for (version, token) in JOINING_DRAFTS
-			.into_iter()
-			.flat_map(|version| [false, true].map(|token| (version, token)))
-		{
+	async fn a_joining_fetch_outlives_its_subscription_but_not_its_token() {
+		const PAYLOAD: &[u8] = b"joined-prefix";
+		for (version, end) in JOINING_DRAFTS.into_iter().flat_map(|version| {
+			[JoinEnd::Ended, JoinEnd::TokenEnded, JoinEnd::Narrowed, JoinEnd::RevokedAfter].map(|end| (version, end))
+		}) {
+			let token = end != JoinEnd::Ended;
 			let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
 			let broadcast = origin.publish("room", crate::origin::Route::default()).unwrap();
 			let track = broadcast.create_track("video", crate::track::Info::timed()).unwrap();
 			let mut group = track.create_group(group::Info { sequence: 0 }).unwrap();
-			group.write_frame(timestamp(), b"joined-prefix".to_vec()).unwrap();
+			group.write_frame(timestamp(), PAYLOAD.to_vec()).unwrap();
 			settle().await;
 
 			let bi = kio::Producer::new(true);
@@ -11978,7 +12012,7 @@ mod serve_tests {
 				msg.authorization_token = None;
 			}
 			let mut subscription = Box::pin(publisher.clone().run_subscribe_stream(stream, msg));
-			let enforced = if token {
+			let mut enforced = if token {
 				let accepted = async { requests.next().await.expect("a request") };
 				let request = match futures::future::select(std::pin::pin!(accepted), subscription.as_mut()).await {
 					futures::future::Either::Left((request, _)) => request,
@@ -12033,21 +12067,52 @@ mod serve_tests {
 				"{version}: FETCH_OK never went out"
 			);
 
-			if let Some(enforced) = enforced {
-				enforced.revoke(crate::SessionError::Unauthorized, "revoked");
-				let _ = moq_clock::timeout(std::time::Duration::from_secs(1), subscription.as_mut())
-					.await
-					.unwrap_or_else(|_| panic!("{version}: the revoked subscription kept serving"));
+			let mut subscription = Some(subscription);
+			if end == JoinEnd::Narrowed {
+				enforced.as_ref().expect("a token").update(crate::auth::Grant::default());
+				// The subscription reads the update first, and the fetch still sees it. The
+				// subscription's request then waits on the fetch, which holds its token's slot.
+				let serving = subscription.as_mut().expect("still serving");
+				assert!(futures::poll!(serving.as_mut()).is_pending(), "{version}");
 			} else {
-				// Session authorization stays valid, and the cache stays alive.
-				drop(subscription);
+				subscription = None;
+				for _ in 0..10 {
+					assert!(
+						futures::poll!(fetch.as_mut()).is_pending(),
+						"{version} {end:?}: the fetch ended with its subscription"
+					);
+					moq_clock::sim::yield_now().await;
+				}
+				if end == JoinEnd::RevokedAfter {
+					let enforced = enforced.take().expect("a token");
+					enforced.revoke(crate::SessionError::Unauthorized, "revoked");
+				}
 			}
 
+			let Ok(mut open) = credit.write() else {
+				panic!("credit gate closed");
+			};
+			*open = true;
+			drop(open);
 			let res = moq_clock::timeout(std::time::Duration::from_secs(1), fetch)
 				.await
-				.unwrap_or_else(|_| panic!("{version}: the fetch outlived its subscription"));
-			assert!(matches!(res, Err(Error::Unauthorized)), "{version}: {res:?}");
-			drop(credit);
+				.unwrap_or_else(|_| panic!("{version} {end:?}: the fetch never ended"));
+			let finished = matches!(end, JoinEnd::Ended | JoinEnd::TokenEnded);
+			match finished {
+				true => assert!(res.is_ok(), "{version} {end:?}: {res:?}"),
+				false => assert!(matches!(res, Err(Error::Unauthorized)), "{version} {end:?}: {res:?}"),
+			}
+			if let Some(subscription) = subscription {
+				let _ = moq_clock::timeout(std::time::Duration::from_secs(1), subscription)
+					.await
+					.unwrap_or_else(|_| panic!("{version}: the revoked subscription kept serving"));
+			}
+			assert_eq!(
+				occurrences(&session.log, PAYLOAD),
+				usize::from(finished),
+				"{version} {end:?}: the head on the wire"
+			);
+			drop(enforced);
 		}
 	}
 
