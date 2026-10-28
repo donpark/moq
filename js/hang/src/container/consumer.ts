@@ -21,8 +21,9 @@ export interface ConsumerProps {
 	// Read-only: a Getter (e.g. another component's output) is accepted directly.
 	maxDelay?: GetterInit<Milli>;
 	/**
-	 * Cap the bytes of decoded frames held ahead of the reader, each frame's and group's own overhead
-	 * included (default: {@link DEFAULT_MAX_BUFFER}). Mirrors Rust's `Consumer::set_max_buffer`.
+	 * Cap the bytes of decoded frames held ahead of the reader, counting the whole wire payload they
+	 * share and each frame's and group's own overhead (default: {@link DEFAULT_MAX_BUFFER}). Mirrors
+	 * Rust's `Consumer::set_max_buffer`.
 	 *
 	 * Once it is full the consumer stops decoding ahead and stops pulling new groups past one successor
 	 * to the group being read, so the undecoded rest stays in the transport's cache, which bounds it. The group being read still decodes a wire
@@ -75,6 +76,7 @@ interface Group {
 	// and the groups past it, kept on insert so a hole reads it without scanning the backlog.
 	late: Instant;
 	frames: ReceivedFrame[]; // decode order
+	costs: number[]; // What each of frames holds against the max buffer
 	empty: boolean; // no wire frame was published; empty groups mean nothing
 	media: boolean; // a decodable (non-marker) frame was buffered
 	bare?: boolean; // a data track's marker group: one object with no bytes
@@ -232,6 +234,7 @@ export class Consumer {
 					consumer,
 					late: now(),
 					frames: [],
+					costs: [],
 					empty: true,
 					media: false,
 					index: 0,
@@ -348,6 +351,9 @@ export class Consumer {
 			group.bare = decoded.length === 0;
 		}
 
+		// Decoded payloads are views of the wire payload, which stays allocated until the last of them is
+		// read, so that one also holds whatever of it the views leave out, such as a large header.
+		let views = 0;
 		for (const sample of decoded) {
 			const marker = this.#format.end?.(sample) !== undefined;
 
@@ -382,7 +388,10 @@ export class Consumer {
 
 			group.start ??= frame.timestamp;
 			group.frames.push(frame);
-			this.#charge(group, FRAME_COST + frame.payload.byteLength);
+			const cost = FRAME_COST + frame.payload.byteLength;
+			group.costs.push(cost);
+			this.#charge(group, cost);
+			views += frame.payload.byteLength;
 
 			if (group.latest === undefined || frame.timestamp > group.latest) {
 				group.latest = frame.timestamp;
@@ -392,6 +401,11 @@ export class Consumer {
 			if (group.end === undefined || end > group.end) {
 				group.end = end;
 			}
+		}
+		const rest = wire.payload.byteLength - views;
+		if (decoded.length > 0 && rest > 0) {
+			group.costs[group.costs.length - 1] += rest;
+			this.#charge(group, rest);
 		}
 	}
 
@@ -588,6 +602,7 @@ export class Consumer {
 	#discard(group: Group): boolean {
 		group.consumer.close();
 		group.frames.length = 0;
+		group.costs.length = 0;
 		this.#release(group);
 		const start = this.#start;
 		if (
@@ -700,7 +715,7 @@ export class Consumer {
 				const seq = head.consumer.sequence;
 				const frame = head.frames.shift();
 				if (frame) {
-					this.#refund(head, FRAME_COST + frame.payload.byteLength);
+					this.#refund(head, head.costs.shift() ?? 0);
 					const end = this.#format.end?.(frame);
 					if (end !== undefined) {
 						this.#updateBuffered();

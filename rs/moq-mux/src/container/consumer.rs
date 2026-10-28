@@ -106,7 +106,8 @@ pub(crate) enum Item {
 /// ## Memory
 ///
 /// Decoded frames waiting to be read are charged to a byte cap, [`set_max_buffer`](Self::set_max_buffer),
-/// along with each buffered frame's and group's own overhead. Once it is full the consumer stops
+/// counting the whole wire payload they share, along with each buffered frame's and group's own
+/// overhead. Once it is full the consumer stops
 /// decoding ahead and stops pulling new groups past one successor to the cursor's group, so the
 /// undecoded rest stays in the transport's cache, which bounds it. The group the cursor is on still decodes a wire frame whenever it holds nothing, so
 /// reading never waits on its own lookahead. If that group stalls while the cap is full, the cursor
@@ -836,8 +837,8 @@ impl<F: Container> Consumer<F> {
 		let _ = track.update(subscription);
 	}
 
-	/// Cap the bytes of decoded frames held ahead of the reader, each frame's and group's own
-	/// overhead included (default [`DEFAULT_MAX_BUFFER`]). Past it the consumer stops decoding ahead
+	/// Cap the bytes of decoded frames held ahead of the reader, counting the wire payload they share
+	/// and each frame's and group's own overhead (default [`DEFAULT_MAX_BUFFER`]). Past it the consumer stops decoding ahead
 	/// and pulling new groups; see the type docs.
 	pub fn set_max_buffer(&mut self, bytes: usize) {
 		self.memory.set_max(bytes);
@@ -889,7 +890,8 @@ struct GroupBuffer<F: Container> {
 	fault: Option<F::Error>,
 
 	// Read frames that haven't been consumed yet, each with when its wire frame landed.
-	buffered: VecDeque<(Frame, Instant)>,
+	// Each with when it arrived and what it holds against the max buffer.
+	buffered: VecDeque<(Frame, Instant, usize)>,
 	markers: VecDeque<(usize, Timestamp)>,
 	delivered: usize,
 
@@ -941,9 +943,9 @@ impl<F: Container> GroupBuffer<F> {
 				self.refund(MARKER_COST);
 				return Poll::Ready(Ok(Some(Event::FrameEnd { end, opens: index == 0 })));
 			}
-			if let Some((frame, arrived)) = self.buffered.pop_front() {
+			if let Some((frame, arrived, cost)) = self.buffered.pop_front() {
 				self.delivered += 1;
-				self.refund(frame_cost(&frame));
+				self.refund(cost);
 				return Poll::Ready(Ok(Some(Event::Frame { frame, arrived })));
 			}
 			if !ready!(self.buffer_once(waiter, format)?) {
@@ -969,6 +971,7 @@ impl<F: Container> GroupBuffer<F> {
 		};
 		self.empty = false;
 		let arrived = wire.arrived();
+		let size = wire.payload.len();
 		let frames = format.decode(wire).map_err(Failure::Decode)?;
 		if format.kind() == super::Kind::Data {
 			// A data track's marker is one object with no bytes, alone in its group.
@@ -979,6 +982,10 @@ impl<F: Container> GroupBuffer<F> {
 			self.bare = frames.is_empty();
 		}
 
+		// Decoded payloads are views of the wire payload, which stays allocated until the last of them
+		// is read, so that one also holds whatever of it the views leave out, such as a large header.
+		let mut views = 0;
+		let first = self.buffered.len();
 		for mut frame in frames {
 			if let Some(bound) = format.end(&frame) {
 				self.note_end(bound);
@@ -1012,8 +1019,18 @@ impl<F: Container> GroupBuffer<F> {
 			self.index += 1;
 			self.media = true;
 
-			self.charge(frame_cost(&frame));
-			self.buffered.push_back((frame, arrived));
+			let cost = frame_cost(&frame);
+			views += frame.payload.len();
+			self.charge(cost);
+			self.buffered.push_back((frame, arrived, cost));
+		}
+		let rest = size.saturating_sub(views);
+		if self.buffered.len() > first
+			&& rest > 0
+			&& let Some((_, _, cost)) = self.buffered.back_mut()
+		{
+			*cost += rest;
+			self.charge(rest);
 		}
 
 		Poll::Ready(Ok(true))
@@ -1130,7 +1147,7 @@ const MARKER_COST: usize = std::mem::size_of::<(usize, Timestamp)>();
 
 /// What a buffered frame holds against the max buffer: its payload and its own entry.
 fn frame_cost(frame: &Frame) -> usize {
-	std::mem::size_of::<(Frame, Instant)>() + frame.payload.len()
+	std::mem::size_of::<(Frame, Instant, usize)>() + frame.payload.len()
 }
 
 impl<F: Container> std::ops::Deref for GroupBuffer<F> {
@@ -4234,6 +4251,78 @@ mod tests {
 			}
 		}
 		assert_eq!(frames, vec![ts(0), ts(20_000)]);
+	}
+
+	/// A decoded payload is a view of its wire frame, which stays allocated while the frame is held, so
+	/// the max buffer charges the whole wire frame rather than the view. Here each is a 1 byte payload
+	/// behind a large LOC property block.
+	#[test]
+	fn a_small_view_of_a_large_wire_frame_is_charged_the_wire_frame() {
+		const PADDING: usize = 60_000;
+		const MAX_BUFFER: usize = 16 * 1024;
+
+		// A QUIC varint, which is all LOC's framing needs.
+		fn varint(buf: &mut Vec<u8>, value: usize) {
+			match value {
+				0..64 => buf.push(value as u8),
+				64..16_384 => buf.extend_from_slice(&(value as u16 | 0x4000).to_be_bytes()),
+				_ => buf.extend_from_slice(&(value as u32 | 0x8000_0000).to_be_bytes()),
+			}
+		}
+
+		let waiter = kio::Waiter::noop();
+		let track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let subscriber =
+			track.subscribe(moq_net::track::Subscription::default().with_max_delay(Duration::from_secs(30)));
+		let loc = Container::Loc(crate::container::Kind::Data);
+		let mut consumer = Consumer::new(subscriber, Container::Loc(crate::container::Kind::Data));
+		consumer.set_max_buffer(MAX_BUFFER);
+
+		let mut stalled = track.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
+		let frame = Frame {
+			timestamp: ts(0),
+			payload: Bytes::from_static(&[0xDE]),
+			keyframe: false,
+			duration: None,
+		};
+		loc.write(&mut stalled, &[frame]).unwrap();
+		let mut padded = track.create_group(moq_net::group::Info { sequence: 1 }).unwrap();
+		for i in 0..8 {
+			let timestamp = 10_000 + i * 1_000;
+			// An unknown video-config property (0x0d) padding the frame, then the timestamp (0x10).
+			let mut props = Vec::new();
+			varint(&mut props, 0x0d);
+			varint(&mut props, PADDING);
+			props.resize(props.len() + PADDING, 0);
+			varint(&mut props, 0x10 - 0x0d);
+			varint(&mut props, timestamp);
+			let mut wire = Vec::new();
+			varint(&mut wire, props.len());
+			wire.extend_from_slice(&props);
+			wire.push(0xAD);
+			padded.write_frame(ts(timestamp as u64), wire).unwrap();
+		}
+		padded.finish().unwrap();
+
+		// The padded frames fill the max buffer behind the stalled group, which moves the cursor on to them.
+		// Charging only the 1 byte views, the buffer never fills and the reader waits on the stall forever.
+		let slack = PADDING + 1024 + 2 * std::mem::size_of::<GroupBuffer<Container>>();
+		let mut reads = Vec::new();
+		while let Poll::Ready(read) = consumer.poll_read(&waiter) {
+			let used = consumer.buffered_bytes();
+			assert!(
+				used <= MAX_BUFFER + slack,
+				"holding {used} bytes past a {MAX_BUFFER} byte max buffer"
+			);
+			match read.unwrap() {
+				Some(Read::Frame { frame, .. }) => reads.push(Some(frame.timestamp)),
+				Some(Read::Gap { .. }) => reads.push(None),
+				other => panic!("unexpected read: {other:?}"),
+			}
+		}
+		let mut expected = vec![Some(ts(0)), None];
+		expected.extend((0..8).map(|i| Some(ts(10_000 + i * 1_000))));
+		assert_eq!(reads, expected);
 	}
 
 	/// A stalled successor does not hide a readable group behind it once group overhead alone fills the

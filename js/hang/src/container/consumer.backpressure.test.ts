@@ -205,6 +205,49 @@ test("Consumer admits reads completing together one at a time against the max bu
 	}
 });
 
+// Keeps one byte of each decoded payload, a view of a wire frame mostly made of header, as LOC's is
+// behind a large property block.
+class Header extends Format {
+	override decode(frame: Uint8Array): Frame[] {
+		return super.decode(frame).map((decoded) => ({ ...decoded, payload: decoded.payload.subarray(0, 1) }));
+	}
+}
+
+test("Consumer charges a small view of a large wire frame the wire frame", async () => {
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format: new Header("data"),
+		maxDelay: Milli(5_000),
+		maxBuffer: 16 * 1024,
+	});
+	try {
+		const stalled = track.createGroup(0);
+		write(stalled, 0);
+		const padded = track.createGroup(1);
+		const padding = new Uint8Array(60_000);
+		for (let i = 0; i < 8; i++) {
+			padded.writeFrame({
+				payload: encodeFrame(padding, (10_000 + i) as Micro),
+				timestamp: Time.Timestamp.now(),
+			});
+		}
+		padded.finish();
+
+		// The padded frames fill the max buffer behind the stalled group, which moves the cursor on to them.
+		// Charging only the one byte views, the buffer never fills and the reader waits on the stall.
+		expect(await within(consumer.next())).toMatchObject({ kind: "frame", frame: { timestamp: 0 } });
+		expect(await within(consumer.next())).toMatchObject({ kind: "gap" });
+		for (let i = 0; i < 8; i++) {
+			expect(await within(consumer.next())).toMatchObject({ kind: "frame", frame: { timestamp: 10_000 + i } });
+		}
+	} finally {
+		consumer.close();
+		track.close();
+		warn.mockRestore();
+	}
+});
+
 test("Consumer stamps frames the max buffer held back with when they landed, not when they decoded", async () => {
 	const clock = new Manual();
 	const installed = clock.install();
