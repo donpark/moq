@@ -47,7 +47,6 @@ side by side and fix any name or signature that still differs, and check
 
 ## Required
 
-- [Streams](/quest/m1/quic-api/streams.md) - `send::`/`recv::` namespaces, one error per direction, `finish(self) -> send::Finished`, consuming `reset`/`stop`, `Buf` writes, both drivers mirrored
 - [Crypto](/quest/m1/quic-api/crypto.md) - crypto traits sealed to rustls, concrete peer identity and handshake data
 - [Config](/quest/m1/quic-api/config.md) - plain config structs, `Limits` as the one spelling, one endpoint constructor and `connect` that own the socket, v1-only `Version`, a local-close event
 - [Waits](/quest/m1/quic-api/waits.md) - moq-quic owns every wait as a `poll_*` on `&kio::Waiter`, deleting `StreamEvent` and the drivers' and qmux's waiter tables
