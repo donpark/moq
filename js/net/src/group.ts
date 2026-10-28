@@ -105,6 +105,23 @@ class GroupState {
 	}
 }
 
+// A written frame and when it landed. It keeps the writer's frame rather than copying it, so a
+// lazy payload is read only when a reader takes it.
+class Landed implements Frame {
+	readonly arrived: Instant;
+	#frame: Frame;
+	constructor(frame: Frame, arrived: Instant) {
+		this.#frame = frame;
+		this.arrived = arrived;
+	}
+	get payload(): Uint8Array {
+		return this.#frame.payload;
+	}
+	get timestamp(): Timestamp | undefined {
+		return this.#frame.timestamp;
+	}
+}
+
 // Refuse a frame whose timedness disagrees with the track's.
 function checkTimed(timed: boolean | undefined, frame: Frame) {
 	if (timed !== undefined && timed !== (frame.timestamp !== undefined)) throw new TimestampMismatch();
@@ -391,7 +408,7 @@ export class Producer {
 		}
 
 		const arrived = now();
-		frame = { payload: frame.payload, timestamp: frame.timestamp, arrived };
+		frame = new Landed(frame, arrived);
 		if (this.#state.flate) {
 			frame = this.#state.flate.push(frame, inflated);
 			if (this.#state.flate.stored > MAX_GROUP_CACHE_BYTES) {
