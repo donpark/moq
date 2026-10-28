@@ -4,8 +4,8 @@
 
 `@moq/qmux` `Session.datagrams` is typed as the browser's
 `WebTransportDatagramDuplexStream` and nothing more. Its policy fields either
-take effect or refuse loudly. `incomingHighWaterMark` bounds the inbound queue
-whenever it is set. Setting `incomingMaxAge` or `outgoingMaxAge` to anything
+take effect or refuse loudly. `incomingHighWaterMark` limits every push after
+it is set. Setting `incomingMaxAge` or `outgoingMaxAge` to anything
 other than `null`, or changing `outgoingHighWaterMark`, throws. Applications can
 no longer construct a `Datagrams`, inject inbound packets, overwrite the
 negotiated size limit, or close the receive side.
