@@ -25,12 +25,14 @@ Each run:
 - Record the newest upstream commit checked in the README, so the next run
   starts there.
 
-First run: three fixes on quinn `main` are not in the ledger yet:
+First run: three fixes on quinn `main` are not in the ledger yet. Check
+each against the fork's code before porting, since a missing ledger entry
+does not prove the bug remains:
 [`f233510c`](https://github.com/quinn-rs/quinn/commit/f233510c) (honor a
 disabled idle timeout when accepting),
 [`6c69f9f4`](https://github.com/quinn-rs/quinn/commit/6c69f9f4) (don't
-credit a reset stream's unread data twice on stop: flow-control accounting a
-peer drives), and
+credit a reset stream's unread data twice on stop; the fork rewrote `stop`
+under the README's "Stream credit on stop", so it may already hold), and
 [`623a0369`](https://github.com/quinn-rs/quinn/commit/623a0369) (don't make
 specific IPv6 endpoints dual-stack).
 
