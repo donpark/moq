@@ -1,5 +1,4 @@
 use std::{
-	any::Any,
 	fmt,
 	future::Future,
 	io,
@@ -35,7 +34,8 @@ use crate::quic::driver::{
 use moq_congestion::Controller;
 use moq_quic::{
 	ConnectionError, ConnectionHandle, ConnectionStats, Dir, EndpointEvent, StreamEvent, StreamId, TransportError,
-	TransportErrorCode,
+	TransportErrorCode, crypto,
+	rustls::pki_types::CertificateDer,
 };
 
 /// In-progress connection attempt future
@@ -99,15 +99,10 @@ impl Connecting {
 
 	/// Parameters negotiated during the handshake
 	///
-	/// The dynamic type returned is determined by the configured
-	/// [`Session`](moq_quic::crypto::Session). For the default `rustls` session, the return value can
-	/// be [`downcast`](Box::downcast) to a
-	/// [`crypto::rustls::HandshakeData`](crate::quic::driver::crypto::rustls::HandshakeData).
-	///
 	/// Peer certificates are not available at this stage; see [`Connection::peer_identity()`].
 	///
 	/// This operation is cancel-safe.
-	pub async fn handshake_data(&mut self) -> Result<Box<dyn Any>, ConnectionError> {
+	pub async fn handshake_data(&mut self) -> Result<crypto::HandshakeData, ConnectionError> {
 		// Taking &mut self allows us to use a single oneshot channel rather than dealing with
 		// potentially many tasks waiting on the same event. It's a bit of a hack, but keeps things
 		// simple.
@@ -121,7 +116,6 @@ impl Connecting {
 		let inner = conn.state.lock();
 		inner
 			.inner
-			.crypto_session()
 			.handshake_data()
 			.ok_or_else(|| inner.error.clone().expect("spurious handshake data ready notification"))
 	}
@@ -541,25 +535,18 @@ impl Connection {
 	/// Parameters negotiated during the handshake
 	///
 	/// Guaranteed to return `Some` on fully established connections or after
-	/// [`Connecting::handshake_data()`] succeeds. See that method's documentations for details on
-	/// the returned value.
-	///
-	/// [`Connection::handshake_data()`]: crate::quic::driver::Connecting::handshake_data
-	pub fn handshake_data(&self) -> Option<Box<dyn Any>> {
-		self.0.state.lock().inner.crypto_session().handshake_data()
+	/// [`Connecting::handshake_data()`] succeeds.
+	pub fn handshake_data(&self) -> Option<crypto::HandshakeData> {
+		self.0.state.lock().inner.handshake_data()
 	}
 
-	/// Cryptographic identity of the peer
-	///
-	/// The dynamic type returned is determined by the configured
-	/// [`Session`](moq_quic::crypto::Session). For the default `rustls` session, the return value can
-	/// be [`downcast`](Box::downcast) to a <code>Vec<[rustls::pki_types::CertificateDer]></code>.
+	/// The certificate chain the peer presented, end entity first, if it presented one
 	///
 	/// For custom asynchronous validation (e.g. checking a certificate against an external
 	/// database), call this after awaiting [`Connecting`] and use [`close()`][Self::close] to
 	/// reject untrusted peers.
-	pub fn peer_identity(&self) -> Option<Box<dyn Any>> {
-		self.0.state.lock().inner.crypto_session().peer_identity()
+	pub fn peer_identity(&self) -> Option<Vec<CertificateDer<'static>>> {
+		self.0.state.lock().inner.peer_identity()
 	}
 
 	/// A stable identifier for this connection
@@ -584,13 +571,8 @@ impl Connection {
 		output: &mut [u8],
 		label: &[u8],
 		context: &[u8],
-	) -> Result<(), moq_quic::crypto::ExportKeyingMaterialError> {
-		self.0
-			.state
-			.lock()
-			.inner
-			.crypto_session()
-			.export_keying_material(output, label, context)
+	) -> Result<(), crypto::ExportKeyingMaterialError> {
+		self.0.state.lock().inner.export_keying_material(output, label, context)
 	}
 
 	/// See [`moq_quic::Connection::set_limits`]

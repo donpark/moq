@@ -725,9 +725,7 @@ fn a_reset_stream_keeps_its_header_without_credit() {
 				.with_root_certificates(roots)
 				.with_no_client_auth();
 			crypto.alpn_protocols = vec![b"h3".to_vec()];
-			let mut config = driver::ClientConfig::new(std::sync::Arc::new(
-				driver::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic crypto"),
-			));
+			let mut config = driver::ClientConfig::new(std::sync::Arc::new(crypto));
 			// Little enough connection credit for the server to run out of
 			let mut transport = driver::TransportConfig::default();
 			transport.receive_window(driver::VarInt::from_u32(16 * 1024));

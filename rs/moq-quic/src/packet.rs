@@ -913,18 +913,11 @@ mod tests {
 	#[test]
 	fn header_encoding() {
 		use crate::Side;
-		use crate::crypto::rustls::{initial_keys, initial_suite_from_provider};
-		#[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
-		use rustls::crypto::aws_lc_rs::default_provider;
-		#[cfg(feature = "ring")]
-		use rustls::crypto::ring::default_provider;
+		use crate::crypto::rustls::initial_keys;
 		use rustls::quic::Version;
 
 		let dcid = ConnectionId::new(&hex!("06b858ec6f80452b"));
-		let provider = default_provider();
-
-		let suite = initial_suite_from_provider(&std::sync::Arc::new(provider)).unwrap();
-		let client = initial_keys(Version::V1, dcid, Side::Client, &suite);
+		let client = initial_keys(Version::V1, dcid, Side::Client);
 		let mut buf = Vec::new();
 		let header = Header::Initial(InitialHeader {
 			number: PacketNumber::U8(0),
@@ -950,7 +943,7 @@ mod tests {
 			)[..]
 		);
 
-		let server = initial_keys(Version::V1, dcid, Side::Server, &suite);
+		let server = initial_keys(Version::V1, dcid, Side::Server);
 		let supported_versions = crate::DEFAULT_SUPPORTED_VERSIONS.to_vec();
 		let decode = PartialDecode::new(
 			buf.as_slice().into(),

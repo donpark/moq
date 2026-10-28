@@ -72,7 +72,6 @@ impl ServerBuilder {
 
 		config.alpn_protocols = vec![crate::quic::web::ALPN.as_bytes().to_vec()]; // this one is important
 
-		let config: crate::quic::driver::crypto::rustls::QuicServerConfig = config.try_into().unwrap();
 		let config = crate::quic::driver::ServerConfig::with_crypto(Arc::new(config));
 
 		let server =

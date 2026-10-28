@@ -118,8 +118,7 @@ async fn setup_through(
 		.with_custom_certificate_verifier(Arc::new(AnyCert))
 		.with_no_client_auth();
 	tls.alpn_protocols = vec![version.alpn().as_bytes().to_vec()];
-	let quic = driver::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic config");
-	let mut client = driver::ClientConfig::new(Arc::new(quic));
+	let mut client = driver::ClientConfig::new(Arc::new(tls));
 	client.transport_config(Arc::new(transport));
 
 	let endpoint = driver::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("endpoint");
@@ -421,8 +420,7 @@ async fn reversed(version: &str) -> Reversed {
 		.with_single_cert(vec![cert.der().clone()], key.into())
 		.expect("tls");
 	tls.alpn_protocols = vec![alpn.clone()];
-	let quic = driver::crypto::rustls::QuicServerConfig::try_from(tls).expect("quic config");
-	let mut config = driver::ServerConfig::with_crypto(Arc::new(quic));
+	let mut config = driver::ServerConfig::with_crypto(Arc::new(tls));
 	config.transport_config(Arc::new(transport(WINDOW as u64)));
 	let server = driver::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).expect("server endpoint");
 	let addr = server.local_addr().expect("addr");
@@ -432,12 +430,11 @@ async fn reversed(version: &str) -> Reversed {
 		.with_custom_certificate_verifier(Arc::new(AnyCert))
 		.with_no_client_auth();
 	tls.alpn_protocols = vec![alpn];
-	let quic = driver::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic config");
 	let client = driver::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");
 	let (conn, accepted) = tokio::join!(
 		async {
 			client
-				.connect_with(driver::ClientConfig::new(Arc::new(quic)), addr, "localhost")
+				.connect_with(driver::ClientConfig::new(Arc::new(tls)), addr, "localhost")
 				.expect("connect")
 				.await
 				.expect("handshake")
@@ -640,8 +637,7 @@ async fn javascript_partial_frame_gives_way(version: &str) {
 		.with_single_cert(vec![cert.der().clone()], key.into())
 		.expect("tls");
 	tls.alpn_protocols = vec![web::ALPN.as_bytes().to_vec()];
-	let quic = driver::crypto::rustls::QuicServerConfig::try_from(tls).expect("quic config");
-	let mut config = driver::ServerConfig::with_crypto(Arc::new(quic));
+	let mut config = driver::ServerConfig::with_crypto(Arc::new(tls));
 	config.transport_config(Arc::new(transport(WINDOW as u64)));
 	let endpoint = driver::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).expect("endpoint");
 	let port = endpoint.local_addr().expect("addr").port();

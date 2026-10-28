@@ -1,8 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-use crate::quic::driver::crypto::rustls::QuicClientConfig;
 use crate::quic::web::proto::ConnectRequest;
 use rustls::{client::danger::ServerCertVerifier, pki_types::CertificateDer};
 use tokio::net::lookup_host;
@@ -126,8 +124,7 @@ impl ClientBuilder {
 	fn build(self, mut crypto: rustls::ClientConfig) -> Result<Client, ClientError> {
 		crypto.alpn_protocols = vec![ALPN.as_bytes().to_vec()];
 
-		let client_config = QuicClientConfig::try_from(crypto).unwrap();
-		let mut client_config = crate::quic::driver::ClientConfig::new(Arc::new(client_config));
+		let mut client_config = crate::quic::driver::ClientConfig::new(Arc::new(crypto));
 
 		let mut transport = crate::quic::driver::TransportConfig::default();
 		if let Some(cc) = &self.congestion_controller {

@@ -98,12 +98,11 @@ fn restart(reset_secret: bool) -> Result<driver::ConnectionError, tokio::time::e
 			.with_root_certificates(roots)
 			.with_no_client_auth();
 		tls.alpn_protocols = vec![b"moq-lite-06".to_vec()];
-		let quic = driver::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic config");
 
 		let endpoint = driver::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("endpoint");
 		let conn = endpoint
 			.connect_with(
-				driver::ClientConfig::new(Arc::new(quic)),
+				driver::ClientConfig::new(Arc::new(tls)),
 				([127, 0, 0, 1], port).into(),
 				"localhost",
 			)

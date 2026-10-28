@@ -3632,10 +3632,9 @@ mod tests {
 			.iter()
 			.map(|alpn| alpn.as_bytes().to_vec())
 			.collect();
-		let crypto = driver::crypto::rustls::QuicServerConfig::try_from(tls).expect("quic crypto");
 		let mut transport = driver::TransportConfig::default();
 		transport.max_idle_timeout(Some(idle.try_into().expect("idle timeout")));
-		let mut server_config = driver::ServerConfig::with_crypto(Arc::new(crypto));
+		let mut server_config = driver::ServerConfig::with_crypto(Arc::new(tls));
 		server_config.transport_config(Arc::new(transport));
 		driver::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).expect("server")
 	}

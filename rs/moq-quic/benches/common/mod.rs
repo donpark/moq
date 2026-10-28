@@ -623,13 +623,13 @@ fn transport(receive_window: VarInt, send_window: u64, probe: bool) -> Arc<Trans
 }
 
 fn server_config(receive_window: VarInt) -> Arc<ServerConfig> {
-	let mut config = ServerConfig::with_crypto(Arc::new(Plaintext));
+	let mut config = Plaintext::server();
 	config.transport_config(transport(receive_window, SEND_WINDOW, false));
 	Arc::new(config)
 }
 
 fn client_config(send_window: u64, probe: bool) -> ClientConfig {
-	let mut config = ClientConfig::new(Arc::new(Plaintext));
+	let mut config = Plaintext::client();
 	config.transport_config(transport(VarInt::MAX, send_window, probe));
 	config
 }

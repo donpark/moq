@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::BloomTokenLog;
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-use crate::crypto::rustls::{QuicServerConfig, configured_provider};
+use crate::crypto::rustls::{QuicClientConfig, QuicServerConfig, configured_provider};
 use crate::{
 	DEFAULT_SUPPORTED_VERSIONS, Duration, MAX_CID_SIZE, RandomConnectionIdGenerator, TokenLog, TokenMemoryCache,
 	TokenStore, VarInt, VarIntBoundsExceeded,
@@ -48,7 +48,7 @@ pub struct EndpointConfig {
 
 impl EndpointConfig {
 	/// Create a default config with a particular `reset_key`
-	pub fn new(reset_key: Arc<dyn HmacKey>) -> Self {
+	pub(crate) fn new(reset_key: Arc<dyn HmacKey>) -> Self {
 		let cid_factory = || -> Box<dyn ConnectionIdGenerator> { Box::<HashedConnectionIdGenerator>::default() };
 		Self {
 			reset_key,
@@ -74,13 +74,6 @@ impl EndpointConfig {
 		factory: Arc<dyn Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync>,
 	) -> &mut Self {
 		self.connection_id_generator_factory = factory;
-		self
-	}
-
-	/// Private key used to send authenticated connection resets to peers who were
-	/// communicating with a previous instance of this endpoint.
-	pub fn reset_key(&mut self, key: Arc<dyn HmacKey>) -> &mut Self {
-		self.reset_key = key;
 		self
 	}
 
@@ -241,9 +234,7 @@ pub struct ServerConfig {
 	pub transport: Arc<TransportConfig>,
 
 	/// TLS configuration used for incoming connections
-	///
-	/// Must be set to use TLS 1.3 only.
-	pub crypto: Arc<dyn crypto::ServerConfig>,
+	pub(crate) crypto: Arc<dyn crypto::ServerConfig>,
 
 	/// Configuration for sending and handling validation tokens
 	pub validation_token: ValidationTokenConfig,
@@ -270,7 +261,8 @@ pub struct ServerConfig {
 
 impl ServerConfig {
 	/// Create a default config with a particular handshake token key
-	pub fn new(crypto: Arc<dyn crypto::ServerConfig>, token_key: Arc<dyn HandshakeTokenKey>) -> Self {
+	#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+	fn new(crypto: Arc<dyn crypto::ServerConfig>, token_key: Arc<dyn HandshakeTokenKey>) -> Self {
 		Self {
 			transport: Arc::new(TransportConfig::default()),
 			crypto,
@@ -300,12 +292,6 @@ impl ServerConfig {
 	/// Set a custom [`ValidationTokenConfig`]
 	pub fn validation_token_config(&mut self, validation_token: ValidationTokenConfig) -> &mut Self {
 		self.validation_token = validation_token;
-		self
-	}
-
-	/// Private key used to authenticate data included in handshake tokens
-	pub fn token_key(&mut self, value: Arc<dyn HandshakeTokenKey>) -> &mut Self {
-		self.token_key = value;
 		self
 	}
 
@@ -397,16 +383,20 @@ impl ServerConfig {
 		cert_chain: Vec<CertificateDer<'static>>,
 		key: PrivateKeyDer<'static>,
 	) -> Result<Self, rustls::Error> {
-		Ok(Self::with_crypto(Arc::new(QuicServerConfig::new(cert_chain, key)?)))
+		Ok(Self::with_crypto(Arc::new(QuicServerConfig::inner(cert_chain, key)?)))
 	}
-}
 
-#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
-impl ServerConfig {
-	/// Create a server config with the given [`crypto::ServerConfig`]
+	/// Create a server config that runs the handshake with `tls`
 	///
+	/// The config must enable TLS 1.3, or every incoming connection fails its handshake.
+	/// Early data stays off: if `tls` accepts it, the connection uses a copy that does not.
 	/// Uses a randomized handshake token key.
-	pub fn with_crypto(crypto: Arc<dyn crypto::ServerConfig>) -> Self {
+	pub fn with_crypto(tls: Arc<rustls::ServerConfig>) -> Self {
+		Self::from_crypto(Arc::new(QuicServerConfig::new(tls)))
+	}
+
+	/// Create a server config on any crypto, such as the fuzz target's plaintext
+	pub(crate) fn from_crypto(crypto: Arc<dyn crypto::ServerConfig>) -> Self {
 		#[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
 		use aws_lc_rs::hkdf;
 		use rand::Rng;
@@ -570,8 +560,9 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
-	/// Create a default config with a particular cryptographic config
-	pub fn new(crypto: Arc<dyn crypto::ClientConfig>) -> Self {
+	/// Create a client config on any crypto, such as the fuzz target's plaintext
+	#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+	pub(crate) fn from_crypto(crypto: Arc<dyn crypto::ClientConfig>) -> Self {
 		Self {
 			transport: Default::default(),
 			crypto,
@@ -621,13 +612,22 @@ impl ClientConfig {
 
 #[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
 impl ClientConfig {
+	/// Create a client config that runs the handshake with `tls`
+	///
+	/// The config must enable TLS 1.3, or connecting fails with [`ConnectError::Tls`].
+	/// Early data stays off: if `tls` enables it, the connection uses a copy that does not.
+	///
+	/// [`ConnectError::Tls`]: crate::ConnectError::Tls
+	pub fn new(tls: Arc<rustls::ClientConfig>) -> Self {
+		Self::from_crypto(Arc::new(QuicClientConfig::new(tls)))
+	}
+
 	/// Create a client configuration that trusts specified trust anchors
 	pub fn with_root_certificates(
 		roots: Arc<rustls::RootCertStore>,
 	) -> Result<Self, rustls::client::VerifierBuilderError> {
-		Ok(Self::new(Arc::new(crypto::rustls::QuicClientConfig::new(
-			WebPkiServerVerifier::builder_with_provider(roots, configured_provider()).build()?,
-		))))
+		let verifier = WebPkiServerVerifier::builder_with_provider(roots, configured_provider()).build()?;
+		Ok(Self::new(Arc::new(QuicClientConfig::inner(verifier))))
 	}
 }
 

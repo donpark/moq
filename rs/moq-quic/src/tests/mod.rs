@@ -35,7 +35,6 @@ use crate::{
 	Duration, Instant,
 	cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
 	congestion::{self, Controller, ControllerFactory, ControllerMetrics},
-	crypto::rustls::QuicServerConfig,
 	frame::FrameStruct,
 	packet::{Header, InitialHeader, PacketNumber},
 	transport_parameters::TransportParameters,
@@ -312,12 +311,12 @@ fn close_before_a_client_certificate_leaves_ends() {
 				PrivatePkcs8KeyDer::from(identity.signing_key.serialize_der()).into(),
 			)
 			.unwrap();
-		let mut client = ClientConfig::new(Arc::new(crypto::rustls::QuicClientConfig::try_from(client).unwrap()));
+		let mut client = ClientConfig::new(Arc::new(client));
 		client.transport = Arc::new(cubic_transport());
 
 		let mut pair = Pair::new(
 			Default::default(),
-			ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server).unwrap())),
+			ServerConfig::with_crypto(Arc::new(server)),
 		);
 		let client_ch = connect_before_the_finished_leaves(&mut pair, client);
 
@@ -794,14 +793,12 @@ fn export_keying_material() {
 	// client keying material
 	let mut client_buf = [0u8; 64];
 	pair.client_conn_mut(client_ch)
-		.crypto_session()
 		.export_keying_material(&mut client_buf, LABEL, CONTEXT)
 		.unwrap();
 
 	// server keying material
 	let mut server_buf = [0u8; 64];
 	pair.server_conn_mut(server_ch)
-		.crypto_session()
 		.export_keying_material(&mut server_buf, LABEL, CONTEXT)
 		.unwrap();
 
@@ -968,7 +965,6 @@ fn reject_missing_client_cert() {
 		)
 		.with_single_cert(vec![cert], PrivateKeyDer::from(key))
 		.unwrap();
-	let config = QuicServerConfig::try_from(config).unwrap();
 
 	let mut pair = Pair::new(Default::default(), ServerConfig::with_crypto(Arc::new(config)));
 
@@ -1251,19 +1247,12 @@ fn alpn_success() {
 	assert_matches!(pair.server_conn_mut(server_ch).poll(), Some(Event::HandshakeConfirmed));
 	assert_matches!(pair.server_conn_mut(server_ch).poll(), Some(Event::Connected));
 
-	let hd = pair
-		.client_conn_mut(client_ch)
-		.crypto_session()
-		.handshake_data()
-		.unwrap()
-		.downcast::<crypto::rustls::HandshakeData>()
-		.unwrap();
-	assert_eq!(hd.protocol.unwrap(), &b"bar"[..]);
-	assert_eq!(
-		hd.protocol_version.unwrap().downcast_ref::<rustls::ProtocolVersion>(),
-		Some(&rustls::ProtocolVersion::TLSv1_3)
-	);
-	assert!(hd.cipher_suite.unwrap().downcast_ref::<rustls::CipherSuite>().is_some());
+	let client = pair.client_conn_mut(client_ch).handshake_data().unwrap();
+	assert_eq!(client.alpn.as_deref(), Some(&b"bar"[..]));
+	assert_eq!(client.server_name, None);
+	let server = pair.server_conn_mut(server_ch).handshake_data().unwrap();
+	assert_eq!(server.alpn.as_deref(), Some(&b"bar"[..]));
+	assert_eq!(server.server_name.as_deref(), Some("localhost"));
 }
 
 #[test]

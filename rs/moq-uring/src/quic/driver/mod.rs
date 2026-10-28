@@ -23,7 +23,6 @@ pub(crate) use connection::{End, Shared};
 
 use std::sync::Arc;
 
-use moq_quic::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -164,8 +163,7 @@ pub(crate) fn client_config(config: &client::Config) -> Result<moq_quic::ClientC
 	};
 	tls.alpn_protocols = alpn(&config.alpn);
 
-	let crypto = QuicClientConfig::try_from(tls).map_err(|err| Error::Tls(err.to_string()))?;
-	let mut client = moq_quic::ClientConfig::new(Arc::new(crypto));
+	let mut client = moq_quic::ClientConfig::new(Arc::new(tls));
 	let transport = transport_config(&config.transport)?;
 	#[cfg(feature = "qlog")]
 	let transport = with_qlog(transport, &config.transport, qlog::Side::Client);
@@ -175,8 +173,7 @@ pub(crate) fn client_config(config: &client::Config) -> Result<moq_quic::ClientC
 
 /// Serve as `config` says.
 pub(crate) fn server_config(config: &server::Config) -> Result<moq_quic::ServerConfig, Error> {
-	let crypto = QuicServerConfig::try_from(config.tls.clone()).map_err(|err| Error::Tls(err.to_string()))?;
-	let mut server = moq_quic::ServerConfig::with_crypto(Arc::new(crypto));
+	let mut server = moq_quic::ServerConfig::with_crypto(config.tls.clone());
 	let transport = transport_config(&config.transport)?;
 	#[cfg(feature = "qlog")]
 	let transport = with_qlog(transport, &config.transport, qlog::Side::Server);

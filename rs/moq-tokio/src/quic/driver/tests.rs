@@ -22,12 +22,7 @@ use std::{
 use crate::quic::driver::runtime::{AsyncUdpSocket, UdpSender, wrap_udp_socket};
 use crate::quic::driver::{Duration, Instant};
 use bytes::{Buf, Bytes};
-use moq_quic::{
-	ConnectionId, RandomConnectionIdGenerator,
-	crypto::rustls::{QuicClientConfig, QuicServerConfig},
-	crypto::{Keys, ServerConfig as ProtoServerConfig, Session, UnsupportedVersion},
-	transport_parameters::TransportParameters,
-};
+use moq_quic::RandomConnectionIdGenerator;
 use moq_sock::udp::RecvMeta;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use rustls::{
@@ -316,13 +311,13 @@ impl EndpointFactory {
 	}
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct HandshakeBlocker {
 	state: Mutex<HandshakeBlockerState>,
 	changed: Condvar,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct HandshakeBlockerState {
 	started: bool,
 	released: bool,
@@ -362,23 +357,17 @@ impl Drop for HandshakeReleaseGuard {
 	}
 }
 
-struct BlockingServerConfig {
-	inner: Arc<dyn ProtoServerConfig>,
+/// Blocks the server's handshake on the ClientHello, which `Incoming::accept` processes
+#[derive(Debug)]
+struct BlockingResolver {
+	key: Arc<rustls::sign::CertifiedKey>,
 	blocker: Arc<HandshakeBlocker>,
 }
 
-impl ProtoServerConfig for BlockingServerConfig {
-	fn initial_keys(&self, version: u32, dst_cid: ConnectionId) -> Result<Keys, UnsupportedVersion> {
-		self.inner.initial_keys(version, dst_cid)
-	}
-
-	fn retry_tag(&self, version: u32, orig_dst_cid: ConnectionId, packet: &[u8]) -> [u8; 16] {
-		self.inner.retry_tag(version, orig_dst_cid, packet)
-	}
-
-	fn start_session(self: Arc<Self>, version: u32, params: &TransportParameters) -> Box<dyn Session> {
+impl rustls::server::ResolvesServerCert for BlockingResolver {
+	fn resolve(&self, _hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
 		self.blocker.block();
-		self.inner.clone().start_session(version, params)
+		Some(self.key.clone())
 	}
 }
 
@@ -447,15 +436,19 @@ fn blocking_server_pair(
 ) -> (Endpoint, Endpoint, Arc<HandshakeBlocker>) {
 	let factory = EndpointFactory::new();
 	let key = PrivateKeyDer::Pkcs8(factory.cert.signing_key.serialize_der().into());
-	let mut server_crypto = rustls::ServerConfig::builder_with_provider(default_provider().into())
+	let provider = Arc::new(default_provider());
+	let key = rustls::sign::CertifiedKey::from_der(vec![factory.cert.cert.der().clone()], key, &provider).unwrap();
+	let blocker = Arc::new(HandshakeBlocker::default());
+	let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider)
 		.with_protocol_versions(&[&rustls::version::TLS13])
 		.unwrap()
 		.with_no_client_auth()
-		.with_single_cert(vec![factory.cert.cert.der().clone()], key)
-		.unwrap();
+		.with_cert_resolver(Arc::new(BlockingResolver {
+			key: Arc::new(key),
+			blocker: blocker.clone(),
+		}));
 	server_crypto.alpn_protocols = vec![server_alpn.to_vec()];
-	let mut server_config =
-		crate::quic::driver::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto).unwrap()));
+	let mut server_config = crate::quic::driver::ServerConfig::with_crypto(Arc::new(server_crypto));
 	// Loopback answers in microseconds. The default 333 ms initial RTT would hold every
 	// connection closed before its handshake in draining for three seconds.
 	let transport = Arc::new({
@@ -464,11 +457,6 @@ fn blocking_server_pair(
 		transport
 	});
 	server_config.transport_config(transport.clone());
-	let blocker = Arc::new(HandshakeBlocker::default());
-	server_config.crypto = Arc::new(BlockingServerConfig {
-		inner: server_config.crypto.clone(),
-		blocker: blocker.clone(),
-	});
 
 	let server =
 		Endpoint::new_with_abstract_socket(factory.endpoint_config.clone(), Some(server_config), server_socket)
@@ -490,7 +478,7 @@ fn blocking_server_pair(
 		.with_root_certificates(roots)
 		.with_no_client_auth();
 	client_crypto.alpn_protocols = vec![client_alpn.to_vec()];
-	let mut client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
+	let mut client_config = ClientConfig::new(Arc::new(client_crypto));
 	client_config.transport_config(transport);
 	client.set_default_client_config(client_config);
 
@@ -782,7 +770,7 @@ fn run_echo(args: EchoArgs) {
 			let _guard = error_span!("client").entered();
 			Endpoint::client(args.client_addr).unwrap()
 		};
-		let mut client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
+		let mut client_config = ClientConfig::new(Arc::new(client_crypto));
 		client_config.transport_config(transport_config);
 		client.set_default_client_config(client_config);
 

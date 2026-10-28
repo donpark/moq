@@ -13,6 +13,10 @@
 
 #![warn(missing_docs)]
 #![cfg_attr(test, allow(dead_code, reason = "test builds compile helpers only some tests call"))]
+#![cfg_attr(
+	not(any(feature = "aws-lc-rs", feature = "ring")),
+	allow(dead_code, unused_imports, reason = "without a crypto provider only the mux connection is reachable")
+)]
 
 use std::{
 	fmt,
@@ -32,7 +36,7 @@ pub mod fuzz;
 mod range_set;
 #[cfg(all(test, any(feature = "aws-lc-rs", feature = "ring")))]
 mod tests;
-pub mod transport_parameters;
+mod transport_parameters;
 mod varint;
 
 pub use varint::{VarInt, VarIntBoundsExceeded};
@@ -53,7 +57,7 @@ pub use connection::mux;
 #[cfg(feature = "qlog")]
 pub use connection::qlog::QlogStream;
 
-#[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
+// The configs take and report rustls types, so callers name the same version.
 pub use rustls;
 
 mod config;

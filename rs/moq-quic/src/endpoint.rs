@@ -1357,7 +1357,7 @@ impl Drop for AcceptDropGuard {
 /// Errors in the parameters being used to create a new connection
 ///
 /// These arise before any I/O has been performed.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, PartialEq)]
 pub enum ConnectError {
 	/// The endpoint can no longer create new connections
 	///
@@ -1385,6 +1385,9 @@ pub enum ConnectError {
 	/// The local endpoint does not support the QUIC version specified in the client configuration
 	#[error("unsupported QUIC version")]
 	UnsupportedVersion,
+	/// rustls refused the client config, such as one without TLS 1.3
+	#[error("TLS config: {0}")]
+	Tls(rustls::Error),
 }
 
 /// Error type for attempting to accept an [`Incoming`]
@@ -1450,11 +1453,14 @@ impl Accepting {
 		} = &args;
 		let pref_addr_cid = args.side_args.pref_addr_cid();
 
-		let tls = server_crypto.start_session(version, &params);
-		let mut conn = Connection::new(tls, args);
-		let result = conn
-			.handle_first_packet(now, remote, ecn, packet_number, packet, rest)
-			.map(|()| conn);
+		let result = server_crypto
+			.start_session(version, &params)
+			.map_err(ConnectionError::TransportError)
+			.and_then(|tls| {
+				let mut conn = Connection::new(tls, args);
+				conn.handle_first_packet(now, remote, ecn, packet_number, packet, rest)
+					.map(|()| conn)
+			});
 
 		Accepted {
 			incoming_idx,

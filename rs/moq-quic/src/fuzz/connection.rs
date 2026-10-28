@@ -18,8 +18,8 @@ use bytes::{Bytes, BytesMut};
 
 use super::plaintext::{Clear, Plaintext, TAG_LEN};
 use crate::{
-	ClientConfig, Connection, ConnectionHandle, DEFAULT_SUPPORTED_VERSIONS, DatagramEvent, Dir, Duration, Endpoint,
-	EndpointConfig, Event, Instant, LeaseError, Limits, ReadError, ServerConfig, Side, StreamId, TransportConfig,
+	Connection, ConnectionHandle, DEFAULT_SUPPORTED_VERSIONS, DatagramEvent, Dir, Duration, Endpoint,
+	EndpointConfig, Event, Instant, LeaseError, Limits, ReadError, Side, StreamId, TransportConfig,
 	VarInt,
 	frame::{self, Frame},
 	packet::{FixedLengthConnectionIdParser, PartialDecode},
@@ -218,7 +218,7 @@ struct Peer {
 impl Peer {
 	fn new(side: Side, port: u16) -> Self {
 		let server = side.is_server().then(|| {
-			let mut config = ServerConfig::with_crypto(Arc::new(Plaintext));
+			let mut config = Plaintext::server();
 			config.transport_config(transport());
 			Arc::new(config)
 		});
@@ -319,7 +319,7 @@ impl Pair {
 			capture: None,
 		};
 
-		let mut config = ClientConfig::new(Arc::new(Plaintext));
+		let mut config = Plaintext::client();
 		config.transport_config(transport());
 		let (ch, conn) = pair
 			.client

@@ -6,14 +6,18 @@
 //! body. Packets leave in the clear with a zeroed tag the size of AES-GCM's, so they are
 //! as large as real ones, and any packet with room for a tag decrypts.
 
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use bytes::BytesMut;
 
 use crate::{
 	ConnectError, ConnectionId, Side, TransportError,
 	coding::{BufExt, BufMutExt},
-	crypto::{self, CryptoError, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, UnsupportedVersion},
+	ClientConfig, ServerConfig,
+	crypto::{
+		self, CryptoError, ExportKeyingMaterialError, HandshakeData, HeaderKey, KeyPair, Keys, PacketKey,
+		UnsupportedVersion,
+	},
 	transport_parameters::TransportParameters,
 };
 
@@ -25,8 +29,20 @@ const MESSAGES: usize = 2;
 
 /// Client and server crypto that skips TLS and leaves every packet in the clear.
 ///
-/// Pass it to `ClientConfig::new` and `ServerConfig::with_crypto`.
+/// Build each side's config with [`Plaintext::client`] and [`Plaintext::server`].
 pub struct Plaintext;
+
+impl Plaintext {
+	/// A client config whose connections run plaintext crypto.
+	pub fn client() -> ClientConfig {
+		ClientConfig::from_crypto(Arc::new(Self))
+	}
+
+	/// A server config whose connections run plaintext crypto.
+	pub fn server() -> ServerConfig {
+		ServerConfig::from_crypto(Arc::new(Self))
+	}
+}
 
 impl crypto::ClientConfig for Plaintext {
 	fn start_session(
@@ -48,8 +64,12 @@ impl crypto::ServerConfig for Plaintext {
 		[0; 16]
 	}
 
-	fn start_session(self: Arc<Self>, _version: u32, params: &TransportParameters) -> Box<dyn crypto::Session> {
-		Box::new(Session::new(Side::Server, params))
+	fn start_session(
+		self: Arc<Self>,
+		_version: u32,
+		params: &TransportParameters,
+	) -> Result<Box<dyn crypto::Session>, TransportError> {
+		Ok(Box::new(Session::new(Side::Server, params)))
 	}
 }
 
@@ -104,11 +124,11 @@ impl crypto::Session for Session {
 		keys()
 	}
 
-	fn handshake_data(&self) -> Option<Box<dyn Any>> {
+	fn handshake_data(&self) -> Option<HandshakeData> {
 		None
 	}
 
-	fn peer_identity(&self) -> Option<Box<dyn Any>> {
+	fn peer_identity(&self) -> Option<Vec<rustls::pki_types::CertificateDer<'static>>> {
 		None
 	}
 
