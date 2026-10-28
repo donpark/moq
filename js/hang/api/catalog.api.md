@@ -862,8 +862,6 @@ export function compressionSupported(compression: Compression): compression is "
 
 export function containerSupported(container: Container): boolean;
 
-export const countSchema: $ZodBranded<ZodMiniNumber<number>, "u53", "out">;
-
 export function detectFormat(name: string): Format | undefined;
 
 export function encode(root: Root): Root;
