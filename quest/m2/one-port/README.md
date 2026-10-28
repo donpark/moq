@@ -31,12 +31,12 @@ Decided 2026-10-05, from moq.pro's audit: `moq-rtc` taking a fed socket
 m2 rather than m3, since moq.pro's edge cutover and its uring rollout wait on
 them.
 
-Decided 2026-10-15: [UDP demux](/quest/m2/p2p/udp-demux.md) remains
-under P2P, now deferred to m2,
-because [native pairs](/quest/m2/p2p/native-quic.md) run QUIC and ICE's
-STUN on one socket through the same demux. The rest of this line builds on
-that shared prerequisite in m2. QUIC shard steering landed in #5638;
-reuse its filter rather than recreating that completed work.
+The UDP demux has landed: `moq_sock::demux` classifies, and the tokio QUIC
+listener's socket diverts the WebRTC media path inline in its receive to a
+`moq_tokio::quic::demux::WebRtc` feed, which `moq_relay::Relay::webrtc`
+hands an embedder. [Native pairs](/quest/m2/p2p/native-quic.md) reuse the
+classifier. QUIC shard steering landed in #5638; reuse its filter rather than
+recreating that completed work.
 
 ### Classifying a datagram
 
@@ -62,11 +62,11 @@ unknown tuple is not SRT; it is dropped or given to the WebRTC mux.
 
 ### Virtual sockets
 
-One OS socket, or one shard of a reuseport group, is read by the demux and
-fanned into virtual sockets, one per stack, each with the `AsyncUdpSocket`
-shape. Sends go straight to the shared socket, so every stack answers from
-the same address and port. moq-tokio's `quic::driver` accepts the virtual socket through
-`new_with_abstract_socket`. `moq-rtc`'s `Mux` already demuxes STUN by ufrag
+One OS socket, or one shard of a reuseport group, is read by the QUIC
+endpoint's own socket, which keeps QUIC in place and copies every other
+class into that stack's bounded feed, shared by every shard. Sends go
+straight to the shared socket, so every stack answers from the same address
+and port. `moq-rtc`'s `Mux` already demuxes STUN by ufrag
 internally and takes a fed socket in
 [WebRTC on the shared socket](/quest/m2/one-port/rtc-feed.md). SRT skips `srt-tokio`,
 which accepts a `tokio::net::UdpSocket` but no abstraction, and feeds
@@ -101,6 +101,5 @@ pre-accepted streams can stand behind.
 
 ## Related
 
-- [UDP demux](/quest/m2/p2p/udp-demux.md) - one socket carries QUIC, with a WebRTC hook for embedders; owned by deferred native P2P in m2
 - [One port on the io_uring workers](/quest/m2/uring-demux.md) - the io_uring workers host the UDP demux
 - [Stream transports](/quest/m2/perf/stream/README.md) - the io_uring workers that would host the TCP acceptor later
