@@ -261,13 +261,13 @@ while read -r version <&3; do
     done
 done 3<"$HARNESS_RUN/shared"
 echo "session cells: $ran ran, $skipped skipped"
+if ((${#failed[@]})); then
+    printf 'FAIL %s\n' "${failed[@]}" >&2
+    exit 1
+fi
 if [[ -n "$remeasure" ]]; then
     bun "$DIR/compat/resolve.ts" remeasure "$DIR/compat/planned-breaks.json" "$HARNESS_RUN/current-help" "$HARNESS_RUN/released-help" "$HARNESS_RUN/versions.json" "$HARNESS_RUN/measured"
     bun x biome format --write "$DIR/compat/planned-breaks.json"
     echo "rewrote compat/planned-breaks.json: review the diff and refresh each reason"
-fi
-if ((${#failed[@]})); then
-    printf 'FAIL %s\n' "${failed[@]}" >&2
-    exit 1
 fi
 echo "wire compatibility: token, session, catalog, and container lanes passed"
