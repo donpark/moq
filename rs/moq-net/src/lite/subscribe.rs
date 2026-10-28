@@ -492,6 +492,9 @@ pub struct SubscribeStart {
 	/// The publisher's largest (group, frame) when it answered, `None` for a track with
 	/// nothing yet. Lite07+ only; not on the wire before, where it decodes as `None`.
 	pub largest: Option<crate::track::Position>,
+	/// The group each range's start resolved to, by index, `None` for one that is empty or
+	/// unresolved. Lite07+ only; empty before.
+	pub starts: Vec<Option<u64>>,
 }
 
 impl Message for SubscribeStart {
@@ -512,7 +515,14 @@ impl Message for SubscribeStart {
 			},
 			false => None,
 		};
-		Ok(Self { group, largest })
+		// Not preallocated: each start costs a byte of the bounded message.
+		let mut starts = Vec::new();
+		if version.has_ranges() {
+			for _ in 0..r.varint()? {
+				starts.push(r.varint_opt()?);
+			}
+		}
+		Ok(Self { group, largest, starts })
 	}
 
 	fn encode_msg(&self, w: &mut Encoder<'_>, version: Version) -> Result<(), EncodeError> {
@@ -524,6 +534,12 @@ impl Message for SubscribeStart {
 			w.varint_opt(self.largest.map(|largest| largest.group))?;
 			if let Some(largest) = self.largest {
 				w.varint(largest.frame)?;
+			}
+		}
+		if version.has_ranges() {
+			w.varint(self.starts.len() as u64)?;
+			for start in &self.starts {
+				w.varint_opt(*start)?;
 			}
 		}
 		Ok(())
@@ -782,6 +798,7 @@ mod test {
 		let resp = SubscribeResponse::Start(SubscribeStart {
 			group: 42,
 			largest: None,
+			starts: Vec::new(),
 		});
 		let mut buf = Vec::new();
 		resp.encode(&mut Encoder::new(&mut buf, Version::Lite05.into()), Version::Lite05)
@@ -798,7 +815,11 @@ mod test {
 	#[test]
 	fn subscribe_start_carries_the_largest_position_on_lite07() {
 		for largest in [None, Some(crate::track::Position { group: 3, frame: 2 })] {
-			let resp = SubscribeResponse::Start(SubscribeStart { group: 4, largest });
+			let resp = SubscribeResponse::Start(SubscribeStart {
+				group: 4,
+				largest,
+				starts: Vec::new(),
+			});
 			let mut buf = Vec::new();
 			resp.encode(
 				&mut crate::coding::Encoder::new(&mut buf, Version::Lite07.into()),
@@ -813,6 +834,7 @@ mod test {
 		let resp = SubscribeResponse::Start(SubscribeStart {
 			group: 4,
 			largest: Some(crate::track::Position { group: 3, frame: 2 }),
+			starts: Vec::new(),
 		});
 		let mut buf = Vec::new();
 		resp.encode(
@@ -821,6 +843,29 @@ mod test {
 		)
 		.unwrap();
 		assert_eq!(buf, [0, 1, 4], "lite-06 has no largest position");
+	}
+
+	/// Lite-07 says where each range's start resolved, `None` for one that didn't; earlier
+	/// versions leave it off the wire.
+	#[test]
+	fn subscribe_start_carries_the_range_starts_on_lite07() {
+		let start = SubscribeStart {
+			group: 4,
+			largest: None,
+			starts: vec![Some(2), None, Some(0)],
+		};
+		let resp = SubscribeResponse::Start(start.clone());
+		let buf = resp.encode_bytes(Version::Lite07).unwrap();
+		assert_eq!(buf.as_ref(), [0, 6, 4, 0, 3, 3, 0, 1]);
+		match SubscribeResponse::decode_slice(&buf, Version::Lite07).unwrap().0 {
+			SubscribeResponse::Start(decoded) => assert_eq!(decoded.starts, start.starts),
+			other => panic!("expected Start, got {other:?}"),
+		}
+		let buf = resp.encode_bytes(Version::Lite06).unwrap();
+		match SubscribeResponse::decode_slice(&buf, Version::Lite06).unwrap().0 {
+			SubscribeResponse::Start(decoded) => assert!(decoded.starts.is_empty()),
+			other => panic!("expected Start, got {other:?}"),
+		}
 	}
 
 	#[test]

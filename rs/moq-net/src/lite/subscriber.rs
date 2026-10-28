@@ -3424,6 +3424,7 @@ mod tests {
 			lite::SubscribeResponse::Start(lite::SubscribeStart {
 				group: 0,
 				largest: None,
+				starts: vec![Some(0)],
 			})
 			.encode(
 				&mut crate::coding::Encoder::new(&mut responses, version.into()),
@@ -3542,6 +3543,7 @@ mod tests {
 		lite::SubscribeResponse::Start(lite::SubscribeStart {
 			group: 0,
 			largest: None,
+			starts: vec![Some(0)],
 		})
 		.encode(&mut encoder, version)
 		.unwrap();
@@ -3596,6 +3598,7 @@ mod tests {
 		lite::SubscribeResponse::Start(lite::SubscribeStart {
 			group: 4,
 			largest: Some(largest),
+			starts: vec![Some(4)],
 		})
 		.encode(
 			&mut crate::coding::Encoder::new(&mut responses, version.into()),
@@ -3658,6 +3661,7 @@ mod tests {
 				lite::SubscribeResponse::Start(lite::SubscribeStart {
 					group: 0,
 					largest: None,
+					starts: vec![Some(0)],
 				}),
 				lite::SubscribeResponse::Drop(lite::SubscribeDrop {
 					start: 2,
@@ -3798,6 +3802,7 @@ mod tests {
 			lite::SubscribeResponse::Start(lite::SubscribeStart {
 				group: 0,
 				largest: None,
+				starts: vec![Some(0)],
 			})
 			.encode(
 				&mut crate::coding::Encoder::new(&mut responses, version.into()),
@@ -7895,6 +7900,14 @@ impl ServeLoop {
 									// signal, so a reader waiting on a skipped group
 									// fails over instead of stalling on a live route.
 									lite::SubscribeResponse::Start(start) => {
+										// One resolved start per range the SUBSCRIBE carried, unless an
+										// update the publisher read first replaced them.
+										if serve.subscriber.version.has_ranges()
+											&& !active.updated && start.starts.len() != active.ranges.len()
+										{
+											tracing::warn!(track = %serve.name, starts = start.starts.len(), ranges = active.ranges.len(), "subscribe start resolves other ranges");
+											return Poll::Ready(ServeEnd::GiveBack(Error::ProtocolViolation));
+										}
 										// Where the live feed is, on versions whose answer says.
 										if serve.subscriber.version.has_largest() {
 											self.serving.set_live(start.largest, Some(start.group));

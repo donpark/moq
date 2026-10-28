@@ -693,6 +693,12 @@ impl Subscriber {
 		self.reader().window().start()
 	}
 
+	/// Where each of the reader's ranges starts; see [`track::Subscriber::starts`].
+	pub(super) fn starts(&self) -> Vec<Option<u64>> {
+		let mut reader = self.reader();
+		reader.window().resolved().iter().map(|r| r.map(|r| r.start)).collect()
+	}
+
 	/// The lowest group at or above `from` the reader's ranges cover; see
 	/// [`track::Subscriber::next_in_range`].
 	pub(super) fn next_in_range(&self, from: u64) -> Option<u64> {

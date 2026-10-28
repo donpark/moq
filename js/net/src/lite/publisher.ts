@@ -963,6 +963,7 @@ export class Publisher {
 				served,
 				floor,
 				bounds,
+				rangeStarts: msg.rangeStarts ?? [],
 			});
 
 			console.debug(`publish done: broadcast=${msg.broadcast} track=${track.name}`);
@@ -1127,11 +1128,15 @@ export class Publisher {
 			// The read cursor's floor; see {@link cursorFloor}.
 			floor: number;
 			bounds: FrameBounds;
+			// Each lite-07 range's start, which SUBSCRIBE_START answers for. This publisher
+			// resolves no relative or time anchor, so only an absolute start is known.
+			rangeStarts: (number | undefined)[];
 		},
 	): Promise<boolean> {
 		const { sub, broadcast, stamp, publisher, compress, served, bounds } = serving;
 		// The read cursor's floor, assigned with the cap in {@link bounds} on every move.
 		let floor = serving.floor;
+		let rangeStarts = serving.rangeStarts;
 		const moveCursor = () =>
 			track.withRange({
 				start: { included: floor },
@@ -1267,6 +1272,7 @@ export class Publisher {
 							bounds.startFrame = update.startFrame;
 							bounds.endGroup = update.endGroup;
 							bounds.endFrame = update.endFrame;
+							rangeStarts = update.rangeStarts ?? [];
 							moveCursor();
 							// A microtask is too short: decoding one framed update crosses several
 							// awaits, each of which can requeue behind the serving continuation. A
@@ -1314,7 +1320,7 @@ export class Publisher {
 								startSent = true;
 								startSequence = bounds.startGroup;
 								raiseFloor(bounds.startGroup);
-								const start = new SubscribeStart(bounds.startGroup, largest);
+								const start = new SubscribeStart(bounds.startGroup, largest, rangeStarts);
 								if (
 									!(await controls.response(encodeSubscribeResponse(stream, { start }, this.version)))
 								)
@@ -1397,7 +1403,7 @@ export class Publisher {
 						!(await controls.response(
 							encodeSubscribeResponse(
 								stream,
-								{ start: new SubscribeStart(startSequence, largest) },
+								{ start: new SubscribeStart(startSequence, largest, rangeStarts) },
 								this.version,
 							),
 						))

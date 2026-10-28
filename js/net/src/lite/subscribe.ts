@@ -118,6 +118,11 @@ interface Span {
 	startFrame: number;
 	endGroup?: number;
 	endFrame?: number;
+	/**
+	 * Lite-07's start group of each range in turn, `undefined` for one that does not name a
+	 * group. Decoded only, so SUBSCRIBE_START can answer for every range.
+	 */
+	rangeStarts?: (number | undefined)[];
 }
 
 /**
@@ -202,9 +207,12 @@ async function decodeSpan(r: Reader, version: Version): Promise<Span> {
 	let end: Point | undefined;
 	let floor = true;
 	let live = false;
+	// Not preallocated: each range costs at least two bytes of the bounded message.
+	const rangeStarts: (number | undefined)[] = [];
 	for (let i = 0; i < count; i++) {
 		const from = await decodeAnchor(r);
 		const to = await decodeAnchor(r);
+		rangeStarts.push(from?.[0]);
 		if (from === undefined) floor = false;
 		else if (start === undefined || before(from, start)) start = from;
 		if (to === undefined) live = true;
@@ -221,6 +229,7 @@ async function decodeSpan(r: Reader, version: Version): Promise<Span> {
 		startFrame,
 		endGroup: end === undefined ? undefined : end[1] === 0 ? end[0] - 1 : end[0],
 		endFrame: end === undefined || end[1] === 0 ? undefined : end[1] - 1,
+		rangeStarts,
 	};
 }
 
@@ -318,6 +327,9 @@ export class SubscribeUpdate {
 	/** See {@link Subscribe.endFrame}. */
 	endFrame?: number;
 
+	/** See {@link Subscribe.rangeStarts}. */
+	rangeStarts?: (number | undefined)[];
+
 	constructor(props: {
 		priority: number;
 		wantedGroup?: number;
@@ -327,6 +339,7 @@ export class SubscribeUpdate {
 		endGroup?: number;
 		startFrame?: number;
 		endFrame?: number;
+		rangeStarts?: (number | undefined)[];
 	}) {
 		if (props.wantedGroup !== undefined && (!Number.isSafeInteger(props.wantedGroup) || props.wantedGroup < 0))
 			throw new RangeError("wanted group must be a safe non-negative integer");
@@ -338,6 +351,7 @@ export class SubscribeUpdate {
 		this.endGroup = props.endGroup;
 		this.startFrame = props.startFrame ?? 0;
 		this.endFrame = props.endFrame;
+		this.rangeStarts = props.rangeStarts;
 	}
 
 	async #encode(w: Writer, version: Version) {
@@ -427,6 +441,12 @@ export class Subscribe {
 	 */
 	endFrame?: number;
 
+	/**
+	 * The start group of each lite-07 range in turn, `undefined` for one that names none.
+	 * Decoded only, so SUBSCRIBE_START can answer for every range.
+	 */
+	rangeStarts?: (number | undefined)[];
+
 	constructor(props: {
 		id: bigint;
 		broadcast: Path.Valid;
@@ -439,6 +459,7 @@ export class Subscribe {
 		endGroup?: number;
 		startFrame?: number;
 		endFrame?: number;
+		rangeStarts?: (number | undefined)[];
 	}) {
 		this.id = props.id;
 		this.broadcast = props.broadcast;
@@ -451,6 +472,7 @@ export class Subscribe {
 		this.endGroup = props.endGroup;
 		this.startFrame = props.startFrame ?? 0;
 		this.endFrame = props.endFrame;
+		this.rangeStarts = props.rangeStarts;
 	}
 
 	async #encode(w: Writer, version: Version) {
@@ -617,9 +639,16 @@ export class SubscribeStart {
 	 */
 	largest?: Position;
 
-	constructor(group: number, largest?: Position) {
+	/**
+	 * The group each range's start resolved to, in turn, `undefined` for one that is empty
+	 * or unresolved. Draft-07+ only; empty before.
+	 */
+	starts: (number | undefined)[];
+
+	constructor(group: number, largest?: Position, starts: (number | undefined)[] = []) {
 		this.group = group;
 		this.largest = largest;
+		this.starts = starts;
 	}
 
 	async encode(w: Writer, version: Version): Promise<void> {
@@ -633,6 +662,9 @@ export class SubscribeStart {
 				await w.u53(this.largest.group + 1);
 				await w.u53(this.largest.frame);
 			}
+			if (!hasRanges(version)) return;
+			await w.u53(this.starts.length);
+			for (const start of this.starts) await w.u53(start === undefined ? 0 : start + 1);
 		});
 	}
 
@@ -640,9 +672,16 @@ export class SubscribeStart {
 		return Message.decode(r, async (r) => {
 			const group = await r.u53();
 			if (!hasLargest(version)) return new SubscribeStart(group);
-			const largest = await r.u53();
-			if (largest === 0) return new SubscribeStart(group);
-			return new SubscribeStart(group, { group: largest - 1, frame: await r.u53() });
+			const wire = await r.u53();
+			const largest = wire === 0 ? undefined : { group: wire - 1, frame: await r.u53() };
+			if (!hasRanges(version)) return new SubscribeStart(group, largest);
+			// Not preallocated: each start costs a byte of the bounded message.
+			const starts: (number | undefined)[] = [];
+			for (let count = await r.u53(); count > 0; count--) {
+				const start = await r.u53();
+				starts.push(start === 0 ? undefined : start - 1);
+			}
+			return new SubscribeStart(group, largest, starts);
 		});
 	}
 }

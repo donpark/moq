@@ -466,6 +466,7 @@ mod tests {
 			.buffer(&lite::SubscribeStart {
 				group: 3,
 				largest: None,
+				starts: Vec::new(),
 			})
 			.unwrap();
 		writer.buffer(&lite::AnnounceBroadcast::Synced).unwrap();

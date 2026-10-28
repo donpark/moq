@@ -4082,6 +4082,7 @@ impl TrackRun {
 			writer.buffer(&lite::SubscribeResponse::Start(lite::SubscribeStart {
 				group: start,
 				largest: Some(largest),
+				starts: self.starts(),
 			}))?;
 			self.raise_floor(start);
 			return Poll::Ready(Ok(ControlFlow::Continue(())));
@@ -4301,6 +4302,14 @@ impl TrackRun {
 }
 
 impl TrackRun {
+	/// Where each requested range starts, on versions whose SUBSCRIBE_START says.
+	fn starts(&mut self) -> Vec<Option<u64>> {
+		match self.ctx.version.has_ranges() {
+			true => self.track.starts(),
+			false => Vec::new(),
+		}
+	}
+
 	/// Send SUBSCRIBE_START for the first servable group, then serve it.
 	///
 	/// A relay caches groups in upstream arrival order, and a newer group's stream can
@@ -4337,6 +4346,7 @@ impl TrackRun {
 		writer.buffer(&lite::SubscribeResponse::Start(lite::SubscribeStart {
 			group: start,
 			largest,
+			starts: self.starts(),
 		}))?;
 		// The subscriber now owes itself everything from the start, so a range given up
 		// above it is named as it would have been after the start.
@@ -6084,6 +6094,48 @@ mod serve_group_test {
 		.await;
 	}
 
+	/// SUBSCRIBE_START tells the subscriber where each range's start landed, which a relative
+	/// or time start leaves it no way to work out from the groups it receives.
+	#[moq_clock::test]
+	async fn lite07_start_names_each_resolved_range_start() {
+		use crate::track::{Anchor, Range};
+
+		let mut track = track::Producer::new(
+			Arc::new(broadcast::Info::default()),
+			"test",
+			crate::track::Info::timed(),
+		);
+		for sequence in 0..5 {
+			write_group(&mut track, sequence, sequence * 1000);
+		}
+		let at = |millis| Anchor::Time(Timestamp::from_millis(millis).unwrap());
+		let subscriber = track.subscribe(
+			track::Subscription::default()
+				.with_max_delay(Duration::from_secs(3600))
+				.with_ranges([
+					Range {
+						start: Anchor::Relative(1),
+						end: None,
+					},
+					Range {
+						start: at(1500),
+						end: Some(Anchor::Absolute(2)),
+					},
+					// Empty, so it starts nowhere.
+					Range::groups(3..3),
+				]),
+		);
+		let (mut run, mut writer, log) = lite07_run(SinkSession::new(Log::default()), subscriber);
+		let mut run = std::pin::pin!(kio::wait(move |waiter| run.poll(&mut writer, waiter)));
+		assert!(futures::poll!(run.as_mut()).is_pending());
+
+		let writes = log.writes.lock().unwrap().clone();
+		match lite::SubscribeResponse::decode_slice(&writes, Version::Lite07).unwrap().0 {
+			lite::SubscribeResponse::Start(start) => assert_eq!(start.starts, [Some(3), Some(1), None]),
+			other => panic!("expected SUBSCRIBE_START, got {other:?}"),
+		}
+	}
+
 	/// A skipped sequence is accounted for by DROP rather than a stream count.
 	#[moq_clock::test]
 	async fn lite07_end_drops_skipped_sequences() {
@@ -6102,9 +6154,12 @@ mod serve_group_test {
 		track.finish().unwrap();
 		run.await.unwrap();
 
-		// SUBSCRIBE_START at 0, a DROP for the skipped group 1 with NOT_FOUND (0x33), which
-		// the end gives up on at once, and SUBSCRIBE_END at 3.
-		assert_eq!(*log.writes.lock().unwrap(), [0, 3, 0, 1, 0, 2, 3, 1, 1, 0x33, 1, 1, 3]);
+		// SUBSCRIBE_START at 0 with the range resolved there, a DROP for the skipped group 1
+		// with NOT_FOUND (0x33), which the end gives up on at once, and SUBSCRIBE_END at 3.
+		assert_eq!(
+			*log.writes.lock().unwrap(),
+			[0, 5, 0, 1, 0, 1, 1, 2, 3, 1, 1, 0x33, 1, 1, 3]
+		);
 	}
 
 	/// A relay that holds only the first group of a backlog answers with the largest its
@@ -7240,7 +7295,7 @@ mod serve_group_test {
 		assert_eq!(
 			*log.writes.lock().unwrap(),
 			// The DROP carries OLD (0x34).
-			[0, 3, 0, 1, 0, 2, 3, 0, 0, 0x34, 1, 1, 2],
+			[0, 5, 0, 1, 0, 1, 1, 2, 3, 0, 0, 0x34, 1, 1, 2],
 			"the expired group is dropped and the end precedes stream credit"
 		);
 
@@ -7250,7 +7305,7 @@ mod serve_group_test {
 		*open = true;
 		drop(open);
 		run.await.unwrap();
-		assert_eq!(*log.writes.lock().unwrap(), [0, 3, 0, 1, 0, 2, 3, 0, 0, 0x34, 1, 1, 2]);
+		assert_eq!(*log.writes.lock().unwrap(), [0, 5, 0, 1, 0, 1, 1, 2, 3, 0, 0, 0x34, 1, 1, 2]);
 	}
 }
 
