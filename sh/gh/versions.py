@@ -46,6 +46,7 @@ REPO = "moq-dev/moq"
 # The C and C++ packages' moq-ffi pin.
 FFI_VERSION = "cpp/moq/FFI_VERSION"
 FFI_SHA256 = "cpp/moq/FFI_SHA256.json"
+FFI_CMAKE = "cpp/moq/cmake/moq-ffi.cmake"
 
 
 def load_ffi():
@@ -176,11 +177,12 @@ def packages(rev: str) -> list[Package]:
             paths=["dart/moq", ":(exclude)dart/moq/test", ":(exclude)dart/moq/bench"],
             tag="moq-dart-v",
         ),
-        # The C package links the same pinned moq-ffi input as C++.
+        # The C package links the same pinned moq-ffi input as C++, through C++'s
+        # CMake module.
         Package(
             name="moq (C)",
             manifest=Edit("c/moq/VERSION", version_file),
-            paths=["c/moq", ":(exclude)c/moq/test", FFI_VERSION, FFI_SHA256],
+            paths=["c/moq", ":(exclude)c/moq/test", FFI_VERSION, FFI_SHA256, FFI_CMAKE],
             tag="c-v",
             ffi=True,
         ),
@@ -409,7 +411,9 @@ def push_tags(dry_run: bool = False) -> None:
         if dry_run:
             print(f"would push {tag.name} at {head[:10]}")
             continue
-        git("push", "origin", f"{head}:refs/tags/{tag.name}")
+        result = git("push", "origin", f"{head}:refs/tags/{tag.name}", check=False)
+        if result.returncode:
+            raise RuntimeError(f"pushing {tag.name} failed:\n{result.stderr}")
         print(f"pushed {tag.name} at {head[:10]}")
     if not tags:
         print("nothing to tag")

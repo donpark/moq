@@ -249,6 +249,9 @@ class VersionsTest(unittest.TestCase):
     def test_ffi_pin_change_releases_c_and_cpp(self):
         files, _ = self.pin("0.4.20")
         self.assertEqual(self.backport(files), (["moq (C)", "moq (C++)", "obs-moq (OBS)"], []))
+        # C builds through C++'s moq-ffi CMake module too.
+        self.assertEqual(self.backport({"cpp/moq/cmake/moq-ffi.cmake": "# fix\n"}),
+                         (["moq (C)", "moq (C++)", "obs-moq (OBS)"], []))
 
     def test_untagged_version_awaits_its_tag(self):
         self.commit("chore: bump dart", {"dart/moq/pubspec.yaml": "name: moq\nversion: 0.1.1\n"})
