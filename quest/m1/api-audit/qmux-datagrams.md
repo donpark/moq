@@ -34,15 +34,26 @@ option):
   that throws `NotSupportedError` for a non-default value and accepts the
   default, so code written for the native interface that never changes them
   keeps working.
+- The high-water mark setter follows the WebTransport draft: `NaN` or a
+  negative value throws `RangeError`, and a value below 1 is stored as 1, so
+  no assignment can disable dropping or drop everything. Lowering it applies
+  to later pushes; datagrams already queued stay until read.
 - **The DOM type is the public view** (chosen over a new qmux-owned
   interface). Stop exporting `Datagrams` from
   [js/qmux/src/index.ts](/js/qmux/src/index.ts). Declare `Session.datagrams`
-  as `WebTransportDatagramDuplexStream` and keep the class in a private field
-  that the session's frame handling and parameter negotiation use.
-- Tests: a lowered high-water mark sheds the overflow, a raised one admits
-  more, reads drain and cancel the readable cleanly after a change, and each
-  refused setter throws while its default is accepted.
+  as `WebTransportDatagramDuplexStream`. The restriction must hold at
+  runtime, not only in the types: `push`, the size update, and `close`
+  become `#` private members that the session reaches through module-private
+  functions assigned in a `static {}` block (the `Origin` pattern, as in
+  [no constructible internal handles](/quest/m1/api-audit/internal-constructors.md)),
+  with a private constructor.
+- Tests: a lowered high-water mark sheds later overflow, a raised one admits
+  more, `NaN` and negative values throw, reads drain and cancel the readable
+  cleanly after a change, and each refused setter throws while its default
+  is accepted.
 
 Public API: breaking in `@moq/qmux` (the `Datagrams` export and its mutators
-go, and three setters now throw). The Impact bullet says to use
-`session.datagrams` through the WebTransport interface. Wire: none.
+go, and three setters now throw). The PR's Impact bullet says: stop
+importing `Datagrams` and use `session.datagrams.readable`, `.writable`, and
+`.maxDatagramSize`; the removed mutators have no application replacement.
+Wire: none.

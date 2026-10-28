@@ -4,8 +4,9 @@
 
 No exported JS class can be built from its emitted declarations with
 arguments that skip its factory. `new Rendition()`, `new Lister()`, and
-`new Arrivals()` fail to type-check instead of producing a handle that
-crashes on `close()`. A lint rule rejects any new `@internal` constructor.
+`new Arrivals()` fail to type-check instead of failing at runtime (`Lister`
+throws inside its constructor, `Rendition` on `close()`). A lint rule
+rejects any new `@internal` constructor.
 
 ## Plan
 

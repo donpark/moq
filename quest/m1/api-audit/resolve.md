@@ -49,9 +49,12 @@ and the bindings promote it as a top-level convenience.
   `Broadcast` take a structural read-side origin type (`closed`, `discovery`,
   `request`, `follow`, `announced`), not `Origin.Table`, so both `Table` and
   a read-only `Origin.Consumer` satisfy it. Today
-  `new Player({ origin: producer.consume() })` fails to type-check only
-  because `Table` also requires `createBroadcast`. Do not add an adapter or a
-  parallel player class.
+  `new Player({ origin: producer.consume() })` fails to type-check because
+  `Table` also requires `createBroadcast` and `requests`. Retype every
+  `Moq.Origin.Table` input in `js/watch/src/player.ts` and `broadcast.ts`,
+  and map `broadcast.ts`'s `origin.request(path, { announced })` calls:
+  `announced: true` becomes `follow`, `false` becomes `request`. Do not add
+  an adapter or a parallel player class.
 - Bindings: `request_broadcast(path, epoch)` and `announced_broadcast(path,
   epoch)` map onto the two operations under the same names as Rust, and the
   Kotlin, Dart, Go, and Python top-level shortcuts follow.
