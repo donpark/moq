@@ -58,4 +58,8 @@ Remaining, on `release` (neither publish nor tag by hand here):
      ([moq-dev/moq#5354](https://github.com/moq-dev/moq/pull/5354)) changed
      what it ships.
 
+   It also warns for a dozen JS packages over `js/common/package.ts`; that
+   change ([e44d51fecd](https://github.com/moq-dev/moq/commit/e44d51fecd))
+   only added CI API-report checks, so they need no release.
+
 Public API: none. Wire: none.
