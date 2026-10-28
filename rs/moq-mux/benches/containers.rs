@@ -257,5 +257,38 @@ fn containers(c: &mut Criterion) {
 	}
 }
 
-criterion_group!(benches, containers);
+/// Live WebM framing across transport chunk sizes, including byte-at-a-time metadata.
+fn mkv_chunks(c: &mut Criterion) {
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()
+		.unwrap();
+	let _enter = runtime.enter();
+	let data = include_bytes!("../src/container/mkv/test_data/opus.webm");
+	let mut group = c.benchmark_group("mkv-chunks");
+	group.throughput(Throughput::Bytes(data.len() as u64));
+	for chunk in [1, 7, 64, data.len()] {
+		group.bench_function(BenchmarkId::from_parameter(chunk), |b| {
+			b.iter_batched(
+				|| {
+					let mut broadcast = moq_net::broadcast::Info::new().produce();
+					let catalog = moq_mux::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+					let import = moq_mux::container::mkv::Import::new(broadcast, catalog.reserve());
+					(catalog, import)
+				},
+				|(catalog, mut import)| {
+					for bytes in std::hint::black_box(data).chunks(chunk) {
+						import.decode(bytes).unwrap();
+					}
+					import.finish().unwrap();
+					(catalog, import)
+				},
+				BatchSize::PerIteration,
+			);
+		});
+	}
+	group.finish();
+}
+
+criterion_group!(benches, containers, mkv_chunks);
 criterion_main!(benches);

@@ -1,15 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::io::Cursor;
 
 use crate::Result;
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use hang::catalog::{AAC, AudioCodec, AudioConfig, H264, H265, VP9, VideoCodec, VideoConfig};
 use moq_net::Timestamp;
 use mp4_atom::Atom;
-use webm_iterable::WebmIterator;
-use webm_iterable::errors::TagIteratorError;
-use webm_iterable::iterator::AllowableErrors;
 use webm_iterable::matroska_spec::{Master, MatroskaSpec, SimpleBlock};
 
 use super::Error;
@@ -37,7 +34,7 @@ const DEFAULT_TIMESTAMP_SCALE_NS: u64 = 1_000_000;
 /// - FLAC (`A_FLAC`)
 /// - MP3 (`A_MPEG/L3`)
 ///
-/// Unsupported codecs (e.g. Vorbis, AC3, subtitles) are logged and dropped.
+/// Unsupported track roles are skipped; malformed tracks and unsupported codecs fail the import.
 pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 	broadcast: moq_net::broadcast::Producer,
 	catalog: crate::catalog::Producer<E>,
@@ -49,6 +46,10 @@ pub struct Import<E: crate::catalog::hang::CatalogExt = ()> {
 
 	/// Accumulated unparsed input.
 	buffer: BytesMut,
+	/// Incremental element state preserves hierarchy across transport chunks.
+	decoder: ebml_iterable::TagDecoder<MatroskaSpec>,
+	/// No more input may arrive after finishing, even when finishing failed.
+	finished: bool,
 	/// Whether the Tracks element has been processed.
 	tracks_seen: bool,
 
@@ -82,9 +83,6 @@ struct MkvTrack {
 	kind: TrackKind,
 	track: Media,
 	group: Option<moq_net::group::Producer>,
-	/// Highest block timestamp (Matroska ticks: cluster_ts + block_relative) already emitted.
-	/// Used to dedup re-parsed blocks across decode() calls.
-	last_emitted_ticks: Option<i64>,
 }
 
 enum Media {
@@ -138,6 +136,16 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			container,
 			initial_reservation: Some(reserved),
 			buffer: BytesMut::new(),
+			decoder: ebml_iterable::TagDecoder::new(&[
+				MatroskaSpec::Ebml(Master::Start),
+				MatroskaSpec::Info(Master::Start),
+				MatroskaSpec::Tracks(Master::Start),
+				MatroskaSpec::TrackEntry(Master::Start),
+				MatroskaSpec::Audio(Master::Start),
+				MatroskaSpec::Video(Master::Start),
+				MatroskaSpec::BlockGroup(Master::Start),
+			]),
+			finished: false,
 			tracks_seen: false,
 			timestamp_scale_ns: DEFAULT_TIMESTAMP_SCALE_NS,
 			cluster_timestamp: 0,
@@ -160,75 +168,23 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	/// scratch). Bytes that cannot yet form a complete top-level tag are retained
 	/// for the next call.
 	pub fn decode(&mut self, data: &[u8]) -> Result<()> {
-		// Move the input into our scratch buffer.
+		if self.finished && !data.is_empty() {
+			return Err(Error::MatroskaParse.into());
+		}
 		self.buffer.extend_from_slice(data);
 
 		self.drain()
 	}
 
-	/// Run the iterator over the buffered bytes, processing every fully-parsed top-level tag.
-	///
-	/// On each call, the iterator restarts from the beginning of the retained buffer. Tag
-	/// handling is idempotent (state flags for header/tracks, per-track timestamp dedup for
-	/// blocks). After parsing stops (UnexpectedEOF or end of buffer), bytes up to the start
-	/// of the most-recently emitted top-level tag are discarded so memory does not grow
-	/// unboundedly.
+	/// Decode complete elements, leaving incomplete bytes and master state for the next chunk.
 	fn drain(&mut self) -> Result<()> {
-		// Buffer master tags that are bounded and convenient to handle atomically.
-		let buffered = [
-			MatroskaSpec::Ebml(Master::Start),
-			MatroskaSpec::Info(Master::Start),
-			MatroskaSpec::Tracks(Master::Start),
-			MatroskaSpec::TrackEntry(Master::Start),
-			MatroskaSpec::Audio(Master::Start),
-			MatroskaSpec::Video(Master::Start),
-			MatroskaSpec::BlockGroup(Master::Start),
-		];
-
-		if self.buffer.is_empty() {
-			return Ok(());
+		while let Some(tag) = self
+			.decoder
+			.decode(&mut self.buffer)
+			.map_err(|_| Error::MatroskaParse)?
+		{
+			self.handle_tag(tag.tag)?;
 		}
-
-		let snapshot = self.buffer.clone().freeze();
-		let mut cursor = Cursor::new(snapshot.as_ref());
-		let mut iter = WebmIterator::new(&mut cursor, &buffered);
-		// We restart the iterator from the beginning of the retained buffer on every
-		// drain pass. Once data is replayed mid-Segment, ebml-iterable would otherwise
-		// reject Segment children (Cluster, Tracks, etc.) as appearing without their
-		// parent. Allowing hierarchy problems plus our own dedup logic on emitted
-		// blocks gives us idempotent streaming behavior.
-		iter.allow_errors(&[AllowableErrors::HierarchyProblems]);
-		// Don't synthesize Master::End tags when the buffer ends mid-element.
-		iter.emit_master_end_when_eof(false);
-
-		let mut last_offset: usize = 0;
-
-		loop {
-			match iter.next() {
-				Some(Ok(tag)) => {
-					last_offset = iter.last_emitted_tag_offset();
-					self.handle_tag(tag)?;
-				}
-				Some(Err(TagIteratorError::UnexpectedEOF { .. })) => break,
-				Some(Err(_e)) => {
-					return Err(Error::MatroskaParse.into());
-				}
-				None => {
-					last_offset = snapshot.len();
-					break;
-				}
-			}
-		}
-
-		drop(iter);
-
-		// Retain bytes from the start of the last emitted tag (safe replay point) onward.
-		// At the very least, this lets us reuse partially-read tags as more data arrives.
-		// If we never emitted anything (very first call with too few bytes), keep everything.
-		if last_offset > 0 {
-			self.buffer.advance(last_offset);
-		}
-
 		Ok(())
 	}
 
@@ -244,13 +200,14 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 			MatroskaSpec::Info(Master::Full(children)) => {
 				for c in &children {
 					if let MatroskaSpec::TimestampScale(v) = c {
+						if *v == 0 {
+							return Err(Error::MatroskaParse.into());
+						}
 						self.timestamp_scale_ns = *v;
 					}
 				}
 			}
-			// Idempotency: if the parser restarts mid-stream and `last_offset`
-			// happens to point at Tracks (i.e. Tracks was the last fully-emitted
-			// tag), we'll see it again. Process once.
+			// A repeated Tracks element does not replace the published track set.
 			MatroskaSpec::Tracks(Master::Full(children)) if !self.tracks_seen => {
 				self.handle_tracks(children)?;
 				self.tracks_seen = true;
@@ -291,17 +248,16 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 	}
 
 	fn handle_tracks(&mut self, entries: Vec<MatroskaSpec>) -> Result<()> {
+		let mut numbers = HashSet::new();
 		for entry in entries {
-			if let MatroskaSpec::TrackEntry(Master::Full(children)) = entry
-				&& let Err(e) = self.add_track(children)
-			{
-				tracing::warn!(error = ?e, "skipping MKV track");
+			if let MatroskaSpec::TrackEntry(Master::Full(children)) = entry {
+				self.add_track(children, &mut numbers)?;
 			}
 		}
 		Ok(())
 	}
 
-	fn add_track(&mut self, children: Vec<MatroskaSpec>) -> Result<()> {
+	fn add_track(&mut self, children: Vec<MatroskaSpec>, numbers: &mut HashSet<u64>) -> Result<()> {
 		let mut track_number: Option<u64> = None;
 		let mut track_type: Option<u64> = None;
 		let mut codec_id: Option<String> = None;
@@ -311,7 +267,11 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 		for c in children {
 			match c {
-				MatroskaSpec::TrackNumber(v) => track_number = Some(v),
+				MatroskaSpec::TrackNumber(v) => {
+					if track_number.replace(v).is_some() {
+						return Err(moq_net::Error::Duplicate.into());
+					}
+				}
 				MatroskaSpec::TrackType(v) => track_type = Some(v),
 				MatroskaSpec::CodecID(v) => codec_id = Some(v),
 				MatroskaSpec::CodecPrivate(v) => codec_private = Some(Bytes::from(v)),
@@ -322,6 +282,12 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 		}
 
 		let track_number = track_number.ok_or(Error::MissingTrackNumber)?;
+		if track_number == 0 {
+			return Err(Error::MatroskaParse.into());
+		}
+		if !numbers.insert(track_number) {
+			return Err(moq_net::Error::Duplicate.into());
+		}
 		let track_type = track_type.ok_or(Error::MissingTrackType)?;
 		let codec_id = codec_id.ok_or(Error::MissingCodecId)?;
 
@@ -374,7 +340,6 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 				kind,
 				track: media,
 				group: None,
-				last_emitted_ticks: None,
 			},
 		);
 
@@ -414,20 +379,16 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 		// Compute PTS in MKV's native nanosecond units and stamp it on the
 		// timestamp at NANO scale so a passthrough re-emit preserves precision.
-		let block_ticks = (self.cluster_timestamp as i64) + (rel_ts as i64);
-		if block_ticks < 0 {
-			return Err(Error::NegativeBlockTimestamp.into());
-		}
+		let block_ticks = self
+			.cluster_timestamp
+			.checked_add_signed(i64::from(rel_ts))
+			.ok_or(if rel_ts < 0 {
+				Error::NegativeBlockTimestamp
+			} else {
+				Error::TimestampOverflow
+			})?;
 
-		// Skip blocks we've already emitted on a previous decode() pass (buffer replay).
-		if let Some(last) = track.last_emitted_ticks
-			&& block_ticks <= last
-		{
-			return Ok(());
-		}
-		track.last_emitted_ticks = Some(block_ticks);
-
-		let pts_ns = (block_ticks as u64)
+		let pts_ns = block_ticks
 			.checked_mul(self.timestamp_scale_ns)
 			.ok_or(Error::TimestampOverflow)?;
 		let timestamp = Timestamp::from_nanos(pts_ns)?;
@@ -472,6 +433,16 @@ impl<E: crate::catalog::hang::CatalogExt> Import<E> {
 
 	/// Finish all tracks, flushing current groups.
 	pub fn finish(&mut self) -> Result<()> {
+		self.finished = true;
+		while let Some(tag) = self
+			.decoder
+			.decode_eof(&mut self.buffer)
+			.map_err(|_| Error::MatroskaParse)?
+		{
+			self.handle_tag(tag.tag)?;
+		}
+		self.buffer = BytesMut::new();
+		self.initial_reservation = None;
 		for track in self.tracks.values_mut() {
 			if let Some(g) = track.group.take() {
 				g.finish()?;

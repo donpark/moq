@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Refuse malformed MKV hierarchy, incomplete elements, zero timestamp scales, duplicate or zero track numbers, and block timestamp overflow.
+- MKV audio/video tracks and FLV tags with unsupported codecs now fail the import instead of being silently dropped. Transcode or remove unsupported tracks before importing.
+- Preserve VP9 keyframe dimensions up to 65536 instead of wrapping them to zero.
+
 ## [0.10.17](https://github.com/moq-dev/moq/compare/moq-mux-v0.10.16...moq-mux-v0.10.17) - 2026-10-22
 
 ### Other

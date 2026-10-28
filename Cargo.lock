@@ -4474,6 +4474,7 @@ dependencies = [
  "bytes",
  "crc",
  "criterion",
+ "ebml-iterable",
  "futures",
  "h264-parser",
  "hang",
