@@ -260,3 +260,38 @@ test("Consumer moves past a stalled backlog group below the cursor once the max 
 		warn.mockRestore();
 	}
 });
+
+test("Consumer reads what a promoted head already holds before skipping it under pressure", async () => {
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format: new Format("data"),
+		maxDelay: Milli(5_000),
+		maxBuffer: 1024,
+	});
+	try {
+		const stalled = track.createGroup(0);
+		write(stalled, 0);
+		expect(await consumer.next()).toMatchObject({ kind: "frame", group: 0 });
+
+		// A later group's large frame fills the max buffer, then a frame lands in the group between,
+		// stamped on the wire before the later group's.
+		const between = track.createGroup(1);
+		const later = track.createGroup(2);
+		const early = Time.Timestamp.now();
+		later.writeFrame({
+			payload: encodeFrame(new Uint8Array(2_000), 20_000 as Micro),
+			timestamp: Time.Timestamp.now(),
+		});
+		await flush();
+		between.writeFrame({ payload: encodeFrame(PAYLOAD, 10_000 as Micro), timestamp: early });
+
+		// Group 0 is skipped, but group 1 is read once promoted rather than skipped before its task runs.
+		expect(await consumer.next()).toMatchObject({ kind: "gap" });
+		expect(await consumer.next()).toMatchObject({ kind: "frame", group: 1, frame: { timestamp: 10_000 } });
+	} finally {
+		consumer.close();
+		track.close();
+		warn.mockRestore();
+	}
+});

@@ -85,6 +85,7 @@ interface Group {
 	done?: boolean; // Set when #runGroup finishes reading all frames
 	truncated?: boolean; // The missing tail becomes a gap after the buffered frames are delivered.
 	fault?: Error; // The payload that failed to decode, an error after the buffered frames are delivered.
+	index: number; // Media frames decoded so far: the first is a keyframe by protocol invariant
 	charged: number; // What this group holds against the max buffer
 	released?: boolean; // Dropped from #groups, with what it held refunded
 }
@@ -235,6 +236,7 @@ export class Consumer {
 					frames: [],
 					empty: true,
 					media: false,
+					index: 0,
 					charged: 0,
 				};
 				this.#charge(group, GROUP_COST);
@@ -264,117 +266,19 @@ export class Consumer {
 
 	async #runGroup(group: Group) {
 		try {
-			let index = 0;
-
 			for (;;) {
 				// Wait for a frame without taking it, so a group parked on the max buffer holds nothing.
 				await group.consumer.readable();
 				while (!this.#stopped(group) && !this.#admits(group)) await this.#park();
 				if (this.#stopped(group)) return;
-				// Nothing yields between the check above and the charge below, or every task woken together
-				// would spend the same room. A buffered frame is taken synchronously; only an end or a
-				// failure, which carries no frame, is left for readFrame to report.
-				const next = group.consumer.tryReadFrame() ?? (await group.consumer.readFrame());
-				if (!next) break;
-				if (this.#stopped(group)) return;
-				group.empty = false;
-				const arrival = Nano.toMilli(Nano(now()));
-
-				// A malformed payload is not loss: it ends the reader where it sits, rather than truncating the group.
-				let decoded: Frame[];
-				try {
-					decoded = this.#format.decode(next.payload, next.timestamp);
-				} catch (err) {
-					group.fault = err instanceof Error ? err : new Error(String(err));
-					return;
+				if (this.#decodeBuffered(group)) {
+					if (group.fault) return;
+					continue;
 				}
-				if (this.#format.kind === "data") {
-					// A data track's marker is one object with no bytes, alone in its group.
-					if (group.bare || (decoded.length === 0 && group.media)) {
-						group.fault = new Error("a data track's discontinuity marker shares its group");
-						return;
-					}
-					group.bare = decoded.length === 0;
-				}
-
-				for (const sample of decoded) {
-					const marker = this.#format.end?.(sample) !== undefined;
-
-					// Observed here, before any gap handling or age budget: a target derived from
-					// what survives the budget would only ever confirm the budget it was cut to.
-					if (!marker) {
-						this.#jitter.observe(arrival, Milli.fromMicro(sample.timestamp));
-						this.#spread.set(this.#jitter.measured);
-					}
-					const frame: ReceivedFrame = {
-						arrival,
-						payload: sample.payload,
-						timestamp: sample.timestamp,
-						// Protocol invariant: groups always start at a keyframe.
-						// For index 0, we enforce this regardless of what the format reports.
-						// For index > 0, we trust the format's keyframe detection.
-						keyframe: !marker && index === 0 ? true : sample.keyframe,
-						// Carry the container's per-sample duration through so group.end is the real
-						// presentation end (ts + duration), not just the last frame's ts. This is what
-						// makes the PTS-contiguity check (next.firstPTS <= group.end) work; without it a
-						// contiguous next group looks one frame past the end. Undefined for Legacy (no duration).
-						duration: sample.duration,
-					};
-
-					if (!marker) {
-						index++;
-						group.media = true;
-						if (group.minMedia === undefined || frame.timestamp < group.minMedia) {
-							group.minMedia = frame.timestamp;
-						}
-					}
-
-					group.start ??= frame.timestamp;
-					group.frames.push(frame);
-					this.#charge(group, FRAME_COST + frame.payload.byteLength);
-
-					if (group.latest === undefined || frame.timestamp > group.latest) {
-						group.latest = frame.timestamp;
-					}
-
-					const end = (frame.timestamp + (frame.duration ?? 0)) as Micro;
-					if (group.end === undefined || end > group.end) {
-						group.end = end;
-					}
-				}
-
-				if (decoded.length === 0) continue;
-
-				// Skip and wake only once the whole batch is in its group: a skip that drops this group
-				// checks it for a rewind, which must see every sample one fragment decoded to.
-				this.#updateBuffered();
-
-				let skipped = false;
-				if (group.consumer.sequence !== this.#active) {
-					// A non-active group can also be too slow to wait for. This runs even when
-					// the group is the delivery head, because that is exactly the stalled case
-					// (#active sits below every buffered group) where the max delay budget is
-					// what eventually breaks the stall.
-					this.#checkMaxDelay();
-
-					// A newer group reaching back to where the stalled active group has
-					// already presented means we can advance now instead of waiting.
-					skipped = this.#tryDurationSkip();
-				}
-
-				// Wake next() for the current delivery head so its frames surface as they
-				// arrive. Gating only on `=== #active` assumed +1 group numbering: with
-				// non-sequential group ids (large jumps between groups) #active lags one group
-				// behind as a stale `+1` phantom, so the real head never matched and its whole
-				// group was held until completion, then flushed in a burst. The earliest
-				// buffered group is the delivery head regardless of id scheme; next()'s
-				// promotion guard advances #active to it. Works for sequential and
-				// non-sequential ids alike.
-				// Once the max buffer fills, next() may have to skip the stalled head it is waiting on.
-				if (skipped || group.consumer.sequence === this.#active || group === this.#groups[0] || this.#full()) {
-					this.#notify?.();
-					this.#notify = undefined;
-				}
+				// Nothing buffered: next() took the frame, or the group ended or failed, which readFrame
+				// reports without carrying a frame.
+				if (!group.consumer.done) continue;
+				if (!(await group.consumer.readFrame())) break;
 			}
 		} catch (err) {
 			if (this.#error) return;
@@ -414,6 +318,114 @@ export class Consumer {
 
 			group.consumer.close();
 		}
+	}
+
+	// Take and decode `group`'s next wire frame if the transport already holds one, charging what it
+	// decodes to. Synchronous, so it shares one step with the admission check before it: nothing yields
+	// between them, or every task woken together would spend the same room. Returns false when nothing
+	// is buffered; a payload that fails to decode sets the group's fault.
+	#decodeBuffered(group: Group): boolean {
+		const next = group.consumer.tryReadFrame();
+		if (!next) return false;
+		group.empty = false;
+		const arrival = Nano.toMilli(Nano(now()));
+
+		// A malformed payload is not loss: it ends the reader where it sits, rather than truncating the group.
+		let decoded: Frame[];
+		try {
+			decoded = this.#format.decode(next.payload, next.timestamp);
+		} catch (err) {
+			group.fault = err instanceof Error ? err : new Error(String(err));
+			return true;
+		}
+		if (this.#format.kind === "data") {
+			// A data track's marker is one object with no bytes, alone in its group.
+			if (group.bare || (decoded.length === 0 && group.media)) {
+				group.fault = new Error("a data track's discontinuity marker shares its group");
+				return true;
+			}
+			group.bare = decoded.length === 0;
+		}
+
+		for (const sample of decoded) {
+			const marker = this.#format.end?.(sample) !== undefined;
+
+			// Observed here, before any gap handling or age budget: a target derived from
+			// what survives the budget would only ever confirm the budget it was cut to.
+			if (!marker) {
+				this.#jitter.observe(arrival, Milli.fromMicro(sample.timestamp));
+				this.#spread.set(this.#jitter.measured);
+			}
+			const frame: ReceivedFrame = {
+				arrival,
+				payload: sample.payload,
+				timestamp: sample.timestamp,
+				// Protocol invariant: groups always start at a keyframe.
+				// For index 0, we enforce this regardless of what the format reports.
+				// For index > 0, we trust the format's keyframe detection.
+				keyframe: !marker && group.index === 0 ? true : sample.keyframe,
+				// Carry the container's per-sample duration through so group.end is the real
+				// presentation end (ts + duration), not just the last frame's ts. This is what
+				// makes the PTS-contiguity check (next.firstPTS <= group.end) work; without it a
+				// contiguous next group looks one frame past the end. Undefined for Legacy (no duration).
+				duration: sample.duration,
+			};
+
+			if (!marker) {
+				group.index++;
+				group.media = true;
+				if (group.minMedia === undefined || frame.timestamp < group.minMedia) {
+					group.minMedia = frame.timestamp;
+				}
+			}
+
+			group.start ??= frame.timestamp;
+			group.frames.push(frame);
+			this.#charge(group, FRAME_COST + frame.payload.byteLength);
+
+			if (group.latest === undefined || frame.timestamp > group.latest) {
+				group.latest = frame.timestamp;
+			}
+
+			const end = (frame.timestamp + (frame.duration ?? 0)) as Micro;
+			if (group.end === undefined || end > group.end) {
+				group.end = end;
+			}
+		}
+
+		if (decoded.length === 0) return true;
+
+		// Skip and wake only once the whole batch is in its group: a skip that drops this group
+		// checks it for a rewind, which must see every sample one fragment decoded to.
+		this.#updateBuffered();
+
+		let skipped = false;
+		if (group.consumer.sequence !== this.#active) {
+			// A non-active group can also be too slow to wait for. This runs even when
+			// the group is the delivery head, because that is exactly the stalled case
+			// (#active sits below every buffered group) where the max delay budget is
+			// what eventually breaks the stall.
+			this.#checkMaxDelay();
+
+			// A newer group reaching back to where the stalled active group has
+			// already presented means we can advance now instead of waiting.
+			skipped = this.#tryDurationSkip();
+		}
+
+		// Wake next() for the current delivery head so its frames surface as they
+		// arrive. Gating only on `=== #active` assumed +1 group numbering: with
+		// non-sequential group ids (large jumps between groups) #active lags one group
+		// behind as a stale `+1` phantom, so the real head never matched and its whole
+		// group was held until completion, then flushed in a burst. The earliest
+		// buffered group is the delivery head regardless of id scheme; next()'s
+		// promotion guard advances #active to it. Works for sequential and
+		// non-sequential ids alike.
+		// Once the max buffer fills, next() may have to skip the stalled head it is waiting on.
+		if (skipped || group.consumer.sequence === this.#active || group === this.#groups[0] || this.#full()) {
+			this.#notify?.();
+			this.#notify = undefined;
+		}
+		return true;
 	}
 
 	// Record where a group's content ends as the cursor advances past it. next()'s promotion guard
@@ -516,16 +528,20 @@ export class Consumer {
 	// waits behind, to the next group even with nothing of it read yet: that one reads as the head, and
 	// each such skip refunds what the group left behind held. The head may be the active group or a
 	// backlog group admitted below it. Only fires when the head is fully consumed and still open, so we
-	// never drop frames the consumer hasn't seen. Returns true if a group was skipped.
+	// never drop frames the consumer hasn't seen. Returns true if it skipped a group or read one.
 	#tryPressureSkip(): boolean {
 		if (this.#active === undefined || !this.#full()) return false;
 
 		const head = this.#groups[0];
 		if (!head || head.consumer.sequence > this.#active) return false;
-		if (head.done || head.frames.length > 0) return false;
+		if (head.done || head.fault || head.frames.length > 0) return false;
 
 		const next = this.#groups[1];
 		if (!next) return false;
+
+		// Its task may not have run since it became the head, so read what the transport already holds
+		// before calling it stalled, as its own task would: the head decodes past a full max buffer.
+		if (this.#decodeBuffered(head)) return true;
 
 		this.#groups.shift();
 		console.warn(
