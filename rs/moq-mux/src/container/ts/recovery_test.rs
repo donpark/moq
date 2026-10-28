@@ -1619,7 +1619,7 @@ async fn a_late_catalog_starts_on_the_group_in_flight() {
 	.await;
 	let video = run.ledger(true);
 	let first = video.units.iter().find(|unit| unit.output).unwrap().group;
-	assert_eq!(first, 4, "the export starts on the group in flight when the catalog lands");
+	assert_eq!(first, 4, "the export starts on the group in flight");
 	assert_eq!(run.stats.release.dropped, 0);
 }
 
