@@ -1,5 +1,12 @@
 import type * as Epoch from "../epoch.ts";
-import { fromTransport, ProtocolViolation, StreamCode, StreamError, TimestampMismatch, toStreamCode } from "../error.ts";
+import {
+	fromTransport,
+	ProtocolViolation,
+	StreamCode,
+	StreamError,
+	TimestampMismatch,
+	toStreamCode,
+} from "../error.ts";
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
 import { type Timescale, Timestamp } from "../time.ts";

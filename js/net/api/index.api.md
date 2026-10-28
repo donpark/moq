@@ -540,6 +540,19 @@ export interface Timed<T> {
 }
 
 export namespace Track {
+	export type Anchor = {
+		absolute: number;
+		relative?: never;
+		time?: never;
+	} | {
+		absolute?: never;
+		relative: number;
+		time?: never;
+	} | {
+		absolute?: never;
+		relative?: never;
+		time: Time.Timestamp;
+	};
 	export type Bound = {
 		excluded?: never;
 		included: number;
@@ -626,6 +639,10 @@ export namespace Track {
 		get subscription(): Signals.Getter<Track.Subscription | undefined>;
 		writeFrame(frame: Group.Frame): void;
 	}
+	export interface Range {
+		end?: Track.Anchor;
+		start?: Track.Anchor;
+	}
 	export class Request {
 		accept(info?: Partial<Track.Info>): Track.Producer;
 		demand(): Track.Demand;
@@ -650,10 +667,10 @@ export namespace Track {
 		withRange(groups: Track.Groups): this;
 	}
 	export interface Subscription {
-		groups?: Track.Groups;
-		maxDelay?: Milli;
+		maxDelay?: Milli | null;
 		order?: Track.Order;
 		priority?: number;
+		ranges?: Track.Range[];
 	}
 	export function infoDefaults(info?: Partial<Track.Info>): Track.Info;
 }

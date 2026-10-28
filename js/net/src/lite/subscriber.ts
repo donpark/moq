@@ -949,7 +949,15 @@ export class Subscriber {
 			try {
 				if (valid?.aborted) retire();
 				state.cancel.signal.throwIfAborted();
-				entry = this.#registerSubscribe(id, msg, ranges, producer, entry.compress, entry.timescale, entry.scale);
+				entry = this.#registerSubscribe(
+					id,
+					msg,
+					ranges,
+					producer,
+					entry.compress,
+					entry.timescale,
+					entry.scale,
+				);
 				stream = await this.#sendSubscribe(state, msg, new Deadline());
 				current = { id, msg };
 			} catch (err) {
@@ -957,7 +965,9 @@ export class Subscriber {
 				this.#subscribes.delete(id);
 				state.stream?.abort(e);
 				producer.abort(e);
-				console.warn(`subscribe error: id=${id} broadcast=${broadcast} track=${producer.name} error=${reason(e)}`);
+				console.warn(
+					`subscribe error: id=${id} broadcast=${broadcast} track=${producer.name} error=${reason(e)}`,
+				);
 				return;
 			} finally {
 				valid?.removeEventListener("abort", retire);

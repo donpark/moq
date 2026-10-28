@@ -297,7 +297,8 @@ covering them. A relative or time anchor resolves on the hop that publishes the
 track, and over moq-lite-07, which carries a relative or time start upstream and
 reports the live edge and media time, so a copy resolves the ends itself. A Rust
 moq-transport copy accepts anchors its cache can already
-resolve and sends group bounds upstream; it refuses an unknown time end. Older
+resolve and sends group bounds upstream; it refuses an unknown time end. A
+JavaScript one refuses every time anchor. Older
 moq-lite versions accept absolute anchors but refuse time anchors and relative anchors other
 than the live and default starts. An untimed track refuses a time anchor. At the live
 edge, a time end

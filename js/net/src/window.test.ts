@@ -165,7 +165,13 @@ const covered = (window: Window, upto: number) =>
 	Array.from({ length: upto }, (_, sequence) => sequence).filter((sequence) => window.contains(sequence));
 
 test("a time start is the group containing it, and an end stops past it once a later group starts after it", () => {
-	const groups = new Groups([[2, started(2000)], [3, started(3000)], [4, started(4000)], [5, started(5000)], [6, "pending"]]);
+	const groups = new Groups([
+		[2, started(2000)],
+		[3, started(3000)],
+		[4, started(4000)],
+		[5, started(5000)],
+		[6, "pending"],
+	]);
 	let window = new Window([{ start: time(3500), end: time(4500) }], 6, groups);
 	expect(covered(window, 8)).toEqual([3, 4]);
 	expect(window.settled).toBe(true);
@@ -195,7 +201,10 @@ test("a time start is the group containing it, and an end stops past it once a l
 });
 
 test("a time end settles once nothing below its end can arrive", () => {
-	const groups = new Groups([[3, started(3000)], [6, started(6000)]]);
+	const groups = new Groups([
+		[3, started(3000)],
+		[6, started(6000)],
+	]);
 	const window = new Window([{ start: time(3000), end: time(4000) }], 6, groups);
 	// 4 and 5 may still arrive inside the end: only 4 is read, on speculation, and never 6.
 	expect(window.settled).toBe(false);
@@ -213,14 +222,22 @@ test("a time end settles once nothing below its end can arrive", () => {
 	expect(covered(window, 8)).toEqual([3, 4, 5]);
 
 	// A group that never starts proves nothing, so it never holds the end open.
-	const never = new Groups([[3, started(3000)], [4, "never"], [5, started(5000)]]);
+	const never = new Groups([
+		[3, started(3000)],
+		[4, "never"],
+		[5, started(5000)],
+	]);
 	const settled = new Window([{ start: time(3000), end: time(4000) }], 5, never);
 	expect(settled.settled).toBe(true);
 	expect(covered(settled, 8)).toEqual([3, 4]);
 });
 
 test("an unsettled time end reads one group on speculation", () => {
-	const groups = new Groups([[3, "pending"], [4, "pending"], [5, "pending"]]);
+	const groups = new Groups([
+		[3, "pending"],
+		[4, "pending"],
+		[5, "pending"],
+	]);
 	const window = new Window([{ start: { absolute: 3 }, end: time(3500) }], 5, groups);
 	expect(covered(window, 8)).toEqual([3]);
 
@@ -246,7 +263,11 @@ test("an unsettled time end reads one group on speculation", () => {
 	expect(covered(window, 9)).toEqual([3, 4, 5, 6]);
 
 	// Nothing more can arrive or start: uncapped.
-	const complete = new Groups([[3, started(3000)], [4, "pending"], [5, "pending"]]);
+	const complete = new Groups([
+		[3, started(3000)],
+		[4, "pending"],
+		[5, "pending"],
+	]);
 	complete.done = true;
 	expect(covered(new Window([{ start: time(3000), end: time(3500) }], 5, complete), 7)).toEqual([3, 4, 5, 6]);
 });
@@ -278,7 +299,10 @@ test("a datagram is judged by its own timestamp, one range at a time", () => {
 	expect(waiting.admitsDatagram(3, Timestamp.fromMillis(3600))).toBe(false);
 
 	// Group 1 arrived only as a datagram: the end settles before 2 by sequence, but 1 presents past it.
-	const groups = new Groups([[0, started(0)], [2, started(10_000)]]);
+	const groups = new Groups([
+		[0, started(0)],
+		[2, started(10_000)],
+	]);
 	groups.gones.push({ start: 1, end: 2 });
 	const settled = new Window([{ start: time(0), end: time(5000) }], undefined, groups);
 	expect(settled.resolved()).toEqual([{ start: 0, end: 2 }]);
@@ -300,7 +324,10 @@ test("a time anchor needs moq-lite-07, is resolved by the copy, and clamps to it
 	expect(joinsLive([{ start: time(1) }])).toBe(false);
 	// A time can't be placed against the others without the hop's groups.
 	expect(union([{ start: time(5) }, {}])).toEqual([{}]);
-	expect(union([{ start: time(5) }, { start: { relative: 2 } }])).toEqual([{ start: { relative: 2 } }, { start: time(5) }]);
+	expect(union([{ start: time(5) }, { start: { relative: 2 } }])).toEqual([
+		{ start: { relative: 2 } },
+		{ start: time(5) },
+	]);
 	// Resolved anchors become their groups; an unresolved time end stays so the cap applies apart.
 	expect(clamped([{ start: time(1), end: time(5) }], 2, 9, [{ start: 3, end: 7 }])).toEqual([
 		{ start: { absolute: 3 }, end: { absolute: 7 } },

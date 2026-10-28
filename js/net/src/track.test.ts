@@ -636,7 +636,9 @@ test("a time range reads the groups containing its times, settling its end as gr
 test("a datagram is judged against a time range by its own timestamp", () => {
 	const producer = new TrackProducer("test");
 	producer.accept({ timescale: Timescale.MILLI });
-	const reader = producer.subscribe({ ranges: [{ start: { absolute: 0 }, end: { time: Timestamp.fromMillis(3500) } }] });
+	const reader = producer.subscribe({
+		ranges: [{ start: { absolute: 0 }, end: { time: Timestamp.fromMillis(3500) } }],
+	});
 	producer.insertDatagram(0, Timestamp.fromMillis(3600), enc.encode("late"));
 	producer.insertDatagram(1, Timestamp.fromMillis(3400), enc.encode("in"));
 	const recv = hooks.tryRecvDatagram(reader);
@@ -644,12 +646,17 @@ test("a datagram is judged against a time range by its own timestamp", () => {
 	expect(hooks.tryRecvDatagram(reader)).toEqual({ kind: "idle" });
 });
 
-test("an untimed track refuses a time anchor", () => {
-	const producer = new TrackProducer("test");
-	producer.accept({});
-	const reader = producer.subscribe({ ranges: [{ start: { time: Timestamp.fromMillis(0) } }] });
-	producer.createGroup(0).finish();
+test("an untimed track or a moq-transport copy refuses a time anchor", () => {
+	const ranges = [{ start: { time: Timestamp.fromMillis(0) } }];
+	const untimed = new TrackProducer("test");
+	untimed.accept({});
+	const reader = untimed.subscribe({ ranges });
+	untimed.createGroup(0).finish();
 	expect(() => reader.tryRecvGroup()).toThrow(TimestampMismatch);
+
+	const copy = new TrackProducer("test");
+	copy.accept({ timescale: Timescale.MILLI, ietf: IetfVersion.DRAFT_18 });
+	expect(() => copy.subscribe({ ranges }).tryRecvGroup()).toThrow("moq-transport");
 });
 
 // A resume floor above the live edge must not hide the latest group from a reader that

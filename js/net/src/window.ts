@@ -27,7 +27,9 @@ function anchorOf(field: string, anchor: Anchor): Anchor {
 	const value = keys.length === 1 ? (anchor as Record<string, unknown>)[keys[0]] : undefined;
 	if (keys[0] === "time" && value instanceof Timestamp) return { time: value };
 	if ((keys[0] !== "absolute" && keys[0] !== "relative") || !Number.isSafeInteger(value) || (value as number) < 0) {
-		throw new TypeError(`${field} must be {absolute} or {relative}, a non-negative safe integer, or {time}, a Timestamp`);
+		throw new TypeError(
+			`${field} must be {absolute} or {relative}, a non-negative safe integer, or {time}, a Timestamp`,
+		);
 	}
 	return keys[0] === "absolute" ? { absolute: value as number } : { relative: value as number };
 }
@@ -93,7 +95,10 @@ function anchorKey(anchor: Anchor | undefined, none: [number, number]): [number,
  * back the farthest), and times; then by end, open last.
  */
 function compare(a: Range, b: Range): number {
-	const [x, y] = [anchorKey(a.start, [1, Number.POSITIVE_INFINITY]), anchorKey(b.start, [1, Number.POSITIVE_INFINITY])];
+	const [x, y] = [
+		anchorKey(a.start, [1, Number.POSITIVE_INFINITY]),
+		anchorKey(b.start, [1, Number.POSITIVE_INFINITY]),
+	];
 	const [p, q] = [anchorKey(a.end, [3, 0]), anchorKey(b.end, [3, 0])];
 	return x[0] - y[0] || x[1] - y[1] || p[0] - q[0] || p[1] - q[1];
 }
@@ -676,7 +681,7 @@ export class Window {
 		this.#spans = [];
 		this.#pending = false;
 		this.#waiting = [];
-		this.ranges.forEach((_, index) => this.#span(index, latest, holdings));
+		for (let index = 0; index < this.ranges.length; index++) this.#span(index, latest, holdings);
 		this.#rebuild();
 	}
 
@@ -755,7 +760,10 @@ function startOf(
  * Where a range stops, exclusive, or undefined while it waits on a latest group. A time end's
  * walk starts once its start is known.
  */
-function endOf(anchor: Anchor | undefined, latest: number | undefined): { before: number } | "open" | { pts: Timestamp } | undefined {
+function endOf(
+	anchor: Anchor | undefined,
+	latest: number | undefined,
+): { before: number } | "open" | { pts: Timestamp } | undefined {
 	if (anchor === undefined) return "open";
 	const end = absolute(anchor);
 	if (end !== undefined) return { before: end };

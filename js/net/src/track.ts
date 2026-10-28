@@ -243,7 +243,7 @@ export interface Groups {
  * below that one is accounted for; until then reads stop at the first held group that may still
  * start, so at most that one group past the end is read before its first frame shows where it
  * starts. A datagram is judged by its own timestamp. A time anchor on an untimed track is refused
- * with {@link TimestampMismatch}.
+ * with {@link TimestampMismatch}, and on a moq-transport copy, whose timestamps may rewind.
  *
  * Older moq-lite versions carry only absolute anchors, the live start, and the oldest start,
  * refusing any other.
@@ -2249,6 +2249,10 @@ export class Subscriber {
 		}
 		const info = this.#state.info.peek();
 		if (info && info.timescale == null && hasTime(ranges)) return new TimestampMismatch();
+		// Its timestamps may rewind, so its group starts are never checked or indexed.
+		if (info?.ietf !== undefined && hasTime(ranges)) {
+			return new Error("a time anchor needs timestamps that never rewind, which moq-transport does not promise");
+		}
 		if (this.#resume || this.#window.settled) return undefined;
 		// The live feed had no group when the ranges resolved, so the newest one then was the first.
 		const latest = this.#window.pending ? this.#state.first : this.#latestGroup();

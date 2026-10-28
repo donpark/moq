@@ -1,31 +1,24 @@
-# [L] JS ranges
+# [M] JS ranges
 
 ## Goal
 
-`@moq/net` matches Rust: `Subscription` ranges take `Time(pts)` anchors too,
-`fetchGroup` becomes a one-range subscription or is removed, and a JavaScript
-publisher serves requested ranges that are no longer in its live cache.
+`@moq/net` matches Rust: `fetchGroup` becomes a one-range subscription or is
+removed, and a JavaScript publisher serves requested ranges that are no longer
+in its live cache.
 
 ## Plan
 
 Landed in [moq-dev/moq#6949](https://github.com/moq-dev/moq/pull/6949):
-`Subscription.ranges` of `absolute` and `relative` anchors in place of
-`groups`, a per-reader window (`js/net/src/window.ts`), the union aggregate,
-lite-07 SUBSCRIBE carrying the list (older wires the covering span, refusing
-other relative anchors per reader), `maxDelay: null`, and the lite-07 publisher
-FINning a covered bounded subscription without SUBSCRIBE_END.
+`Subscription.ranges` of `absolute`, `relative`, and `time` anchors in place of
+`groups`, a per-reader window (`js/net/src/window.ts`) with the Rust time-end
+walk, the union aggregate, lite-07 SUBSCRIBE carrying the list with times in
+the track's timescale (older wires the covering span, refusing other relative
+and time anchors per reader), `maxDelay: null`, the lite-07 publisher FINning a
+covered bounded subscription without SUBSCRIBE_END, and the subscriber opening
+a fresh SUBSCRIBE on the same track when that FIN leaves the demand uncovered.
 
 What remains:
 
-- **Time anchors.** Mirror Rust's `Anchor::Time(pts)`: resolved from the
-  cache's group starts (the time-end settle walk in Rust's `window.rs`),
-  refused on an untimed track with `TimestampMismatch`, sent upstream on
-  lite-07, and a datagram judged by its own timestamp. Today a JS publisher
-  decoding a time anchor serves from the oldest group or through the live edge.
-- **Reopen uncovered demand.** When a lite-07 FIN leaves the demand uncovered
-  because an update moved the ranges, the JS subscriber fails the track
-  (`#settleTail`). Reopen that demand on the same track instead, as the Rust
-  copy does.
 - **On-demand request surface.** Decided in the 2026-10-05 audit: the producer
   half of [JavaScript FETCH](/quest/m1/js-fetch.md) folds in here, so
   `@moq/net`'s on-demand request surface takes range requests from the start
