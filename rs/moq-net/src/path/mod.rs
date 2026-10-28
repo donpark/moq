@@ -1045,10 +1045,7 @@ mod tests {
 		let half = Path::new(&"a".repeat(Path::MAX_BYTES / 2)).unwrap();
 		let rest = Path::new(&"b".repeat(Path::MAX_BYTES / 2 - 1)).unwrap();
 		assert_eq!(half.join(&rest).unwrap().len(), Path::MAX_BYTES);
-		assert_eq!(
-			half.join(&Path::new(&format!("{rest}b")).unwrap()),
-			Err(Error::TooLong)
-		);
+		assert_eq!(half.join(&Path::new(&format!("{rest}b")).unwrap()), Err(Error::TooLong));
 		let rel = Relative::new(&format!("x/{rest}b")).unwrap();
 		assert_eq!(
 			Path::new(&format!("{half}/y")).unwrap().resolve(&rel),

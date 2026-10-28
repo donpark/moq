@@ -968,7 +968,10 @@ mod tests {
 		};
 
 		for root in ["/room", "room/", "a//b", r"a\b"] {
-			assert!(matches!(key.sign(&claims(root)), Err(crate::Error::InvalidRoot(_))), "{root:?}");
+			assert!(
+				matches!(key.sign(&claims(root)), Err(crate::Error::InvalidRoot(_))),
+				"{root:?}"
+			);
 			assert!(
 				matches!(key.clone().with_scope(scope(root)), Err(crate::Error::InvalidRoot(_))),
 				"{root:?}"
@@ -976,7 +979,10 @@ mod tests {
 		}
 
 		let legacy = sign_raw(&key, serde_json::json!({"root": "/room/", "publish": ["**"]}));
-		assert_eq!(key.verify(&legacy).unwrap().authorize("room").unwrap().publish, patterns(&["**"]));
+		assert_eq!(
+			key.verify(&legacy).unwrap().authorize("room").unwrap().publish,
+			patterns(&["**"])
+		);
 	}
 
 	/// A key's crypto material is derived once and cached, so the fields it was derived from must

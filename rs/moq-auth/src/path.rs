@@ -77,10 +77,7 @@ mod tests {
 		}
 		let long = "a".repeat(MAX_BYTES + 1);
 		for root in ["/", "/foo", "foo/", "foo//bar", r"a\b", r"a\", long.as_str()] {
-			assert!(
-				matches!(validate(root), Err(crate::Error::InvalidRoot(_))),
-				"{root:?}"
-			);
+			assert!(matches!(validate(root), Err(crate::Error::InvalidRoot(_))), "{root:?}");
 		}
 		assert!(validate(&long[1..]).is_ok());
 	}
