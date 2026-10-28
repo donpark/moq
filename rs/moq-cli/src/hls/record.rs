@@ -465,8 +465,8 @@ impl Playlist {
 	/// Append `entry`, returning how many entries overran the target when this one does.
 	///
 	/// RFC 8216 4.3.3.1 requires every EXTINF, rounded to the nearest second, to fit the target
-	/// duration. An entry past it is listed anyway, as the exporter does: refusing it loses
-	/// content, and raising the target would rewrite a header players already read.
+	/// duration. An entry past it is listed anyway: refusing it loses content, and raising the
+	/// target would rewrite a header players already read.
 	fn push(&mut self, mut entry: Entry) -> Option<u64> {
 		self.version = self.version.max(if entry.gap { VERSION_GAP } else { VERSION });
 		let overrun = entry.duration.as_secs_f64().round() as u64 > self.target;
