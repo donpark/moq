@@ -450,8 +450,9 @@ impl Window {
 		self.spans.iter().map(|span| span.start).min()
 	}
 
-	/// Each range resolved, in the order given: `None` for one that is empty or still
-	/// waits on a first group. An unsettled time end is reported open, never at its cap.
+	/// Each range resolved, in the order given: `None` for one empty as given or still
+	/// waiting on a first group. One that only resolves empty keeps its span, ending at or
+	/// below its start. An unsettled time end is reported open, never at its cap.
 	pub fn resolved(&self) -> Vec<Option<Resolved>> {
 		let mut resolved = vec![None; self.ranges.len()];
 		for span in &self.spans {
@@ -464,6 +465,15 @@ impl Window {
 			});
 		}
 		resolved
+	}
+
+	/// Where each range starts, in the order given: `None` for one that is empty, even only
+	/// once resolved, or still waits on a first group.
+	pub fn starts(&self) -> Vec<Option<u64>> {
+		self.resolved()
+			.into_iter()
+			.map(|r| r.filter(|r| r.end.is_none_or(|end| end > r.start)).map(|r| r.start))
+			.collect()
 	}
 
 	/// The exclusive end past every group in range, `None` when one stays open. An

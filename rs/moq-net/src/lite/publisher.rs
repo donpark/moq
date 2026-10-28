@@ -6123,6 +6123,11 @@ mod serve_group_test {
 					},
 					// Empty, so it starts nowhere.
 					Range::groups(3..3),
+					// Empty only once its start resolves to group 4.
+					Range {
+						start: Anchor::Relative(0),
+						end: Some(Anchor::Absolute(2)),
+					},
 				]),
 		);
 		let (mut run, mut writer, log) = lite07_run(SinkSession::new(Log::default()), subscriber);
@@ -6134,7 +6139,7 @@ mod serve_group_test {
 			.unwrap()
 			.0
 		{
-			lite::SubscribeResponse::Start(start) => assert_eq!(start.starts, [Some(3), Some(1), None]),
+			lite::SubscribeResponse::Start(start) => assert_eq!(start.starts, [Some(3), Some(1), None, None]),
 			other => panic!("expected SUBSCRIBE_START, got {other:?}"),
 		}
 	}
