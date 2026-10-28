@@ -31,7 +31,7 @@ import { Group as GroupMessage } from "./group.ts";
 import { Probe } from "./probe.ts";
 import {
 	encodeSubscribeResponse,
-	exclusiveGroupEnd,
+	requestedRanges,
 	type Subscribe,
 	SubscribeDrop,
 	SubscribeEnd,
@@ -178,7 +178,7 @@ type FrameBounds = {
  * The frames of `sequence` a subscription asked for, as a start index and an inclusive end.
  *
  * The frame bounds qualify the start and end group only; every other group is served whole.
- * Which groups are served at all is the subscriber's read cursor (`withRange`),
+ * Which groups are served at all is the serving subscriber's ranges and floor,
  * applied when a group is popped rather than re-checked here.
  *
  * The serving loop calls this synchronously after the pop, before any SUBSCRIBE_UPDATE can
@@ -847,22 +847,16 @@ export class Publisher {
 			return;
 		}
 
-		const endGroup = exclusiveGroupEnd(msg.endGroup);
 		const track = front.track(msg.track).subscribe({
 			priority: msg.priority,
 			order: msg.order,
 			maxDelay: servingMaxDelay(this.version, msg.maxDelay),
-			groups: {
-				start: msg.startGroup === undefined ? undefined : { included: msg.startGroup },
-				end: endGroup === undefined ? undefined : { excluded: endGroup },
-			},
+			ranges: requestedRanges(msg),
 		});
 		serving(track);
 		const floor = cursorFloor(this.version, msg.startGroup, hooks.latestSequence(track));
-		track.withRange({
-			start: { included: floor },
-			end: endGroup === undefined ? undefined : { excluded: endGroup },
-		});
+		// The ranges cap what is served; the floor only pins where an older wire starts.
+		track.withRange({ start: { included: floor } });
 
 		// The best-effort datagram loop, started once serving begins. It parks when the
 		// track finishes (recvDatagram returns undefined), so #runTrack alone ends the
@@ -942,15 +936,11 @@ export class Publisher {
 					const largest = hooks.peekLargest(track).largest?.group;
 					if (update.wantedGroup !== undefined && (largest === undefined || update.wantedGroup > largest))
 						hooks.joinSubscriber(track);
-					const end = exclusiveGroupEnd(update.endGroup);
 					track.update({
 						priority: update.priority,
 						order: update.order,
 						maxDelay: servingMaxDelay(this.version, update.maxDelay),
-						groups: {
-							start: update.startGroup === undefined ? undefined : { included: update.startGroup },
-							end: end === undefined ? undefined : { excluded: end },
-						},
+						ranges: requestedRanges(update),
 					});
 				},
 			});
@@ -1130,13 +1120,9 @@ export class Publisher {
 		},
 	): Promise<boolean> {
 		const { sub, broadcast, stamp, publisher, compress, served, bounds } = serving;
-		// The read cursor's floor, assigned with the cap in {@link bounds} on every move.
+		// The read cursor's floor; the subscription's ranges cap it.
 		let floor = serving.floor;
-		const moveCursor = () =>
-			track.withRange({
-				start: { included: floor },
-				end: bounds.endGroup === undefined ? undefined : { included: bounds.endGroup },
-			});
+		const moveCursor = () => track.withRange({ start: { included: floor } });
 		// Raise the floor to `start`, keeping any higher floor already set.
 		const raiseFloor = (start: number) => {
 			if (start <= floor) return;
@@ -1188,6 +1174,16 @@ export class Publisher {
 			return controls.response(
 				encodeSubscribeResponse(stream, { end: new SubscribeEnd(boundary()) }, this.version),
 			);
+		};
+
+		// The FIN tells the subscriber every group is accounted for, so it waits until each group
+		// stream finished or reset. False once the subscriber left instead, which cancels whatever
+		// is still queued. `race`, since this repeats per batch of drops against the subscription's end.
+		const drained = async (): Promise<boolean> => {
+			const done = Symbol("drained");
+			const end = await race([Promise.all(groups).then(() => done), controls.ended]);
+			if (end instanceof Error) throw end;
+			return end === done;
 		};
 
 		// One ranking for the whole subscription, shared by every group it serves.
@@ -1327,6 +1323,23 @@ export class Publisher {
 							if (!(await sendEnd())) return false;
 							continue;
 						}
+						// Lite-07 ends a subscription whose every range has an end once it accounted for
+						// each group in them, without SUBSCRIBE_END: the FIN ends the subscription, not the
+						// track. What lies below SUBSCRIBE_START was accounted for by it.
+						if (waitsForSubscriberFin(this.version) && served && startSequence !== undefined) {
+							const end = hooks.servingEnd(track);
+							const covered =
+								end !== undefined &&
+								hooks
+									.servingRuns(track, startSequence, end)
+									.every((run) => runGaps(served, run.start, run.end).length === 0);
+							if (covered) {
+								if (!(await drained())) return false;
+								if (pendingDrops.length > 0) continue;
+								finished = true;
+								return true;
+							}
+						}
 						await waitForSubscription(controls, track, drops);
 						continue;
 					case "boundary":
@@ -1342,23 +1355,17 @@ export class Publisher {
 						// Name every sequence from the start to the end this subscription never
 						// got. A cap below the end bounds what the subscriber is owed, as on its side.
 						if (startSequence !== undefined) {
-							const end =
-								bounds.endGroup === undefined ? boundary() : Math.min(boundary(), bounds.endGroup + 1);
 							const unserved = new StreamError(StreamCode.NotFound, { message: "group not served" });
-							if (!(await drop(startSequence, end, unserved))) return false;
+							// Only the groups inside the ranges are owed.
+							for (const run of hooks.servingRuns(track, startSequence, boundary())) {
+								if (!(await drop(run.start, run.end, unserved))) return false;
+							}
 						}
 						if (!endSent) {
 							if (!(await sendEnd())) return false;
 							continue;
 						}
-						// The FIN tells the subscriber every group is accounted for, so it waits
-						// until each group stream finished or reset. The subscriber leaving
-						// instead cancels whatever is still queued.
-						const drained = Symbol("drained");
-						// `race`, since this repeats per batch of drops against the subscription's end.
-						const end = await race([Promise.all(groups).then(() => drained), controls.ended]);
-						if (end instanceof Error) throw end;
-						if (end !== drained) return false;
+						if (!(await drained())) return false;
 						if (pendingDrops.length > 0) continue;
 						finished = true;
 						return true;

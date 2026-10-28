@@ -9,6 +9,14 @@ import { Getter } from '@moq/signals';
 import { Milli } from '@moq/clock';
 import type * as z from '@zod/mini';
 
+type Anchor = {
+    absolute: number;
+    relative?: never;
+} | {
+    relative: number;
+    absolute?: never;
+};
+
 type Bound = {
     included: number;
     excluded?: never;
@@ -165,6 +173,11 @@ class Producer_2 {
     writeFrame(frame: Frame): void;
 }
 
+interface Range_2 {
+    end?: Anchor;
+    start?: Anchor;
+}
+
 export function read<T = unknown>(source: track.Ordered | group.Consumer, schema: z.ZodMiniType<T>): Promise<T | undefined>;
 
 interface ReadOptions {
@@ -197,10 +210,10 @@ class Subscriber {
 }
 
 interface Subscription {
-    groups?: Groups;
-    maxDelay?: Milli;
+    maxDelay?: Milli | null;
     order?: Order;
     priority?: number;
+    ranges?: Range_2[];
 }
 
 type Timescale = number & {
@@ -235,6 +248,8 @@ declare namespace track {
         Info,
         Bound,
         Groups,
+        Anchor,
+        Range_2 as Range,
         Subscription,
         Order,
         Request_2 as Request,

@@ -93,7 +93,7 @@ try {
 			}
 			const track = broadcast
 				.track("tail")
-				.subscribe({ maxDelay: Milli(drop ? 60_000 : 5000), groups: { start: { included: 0 } } });
+				.subscribe({ maxDelay: Milli(drop ? 60_000 : 5000), ranges: [{ start: { absolute: 0 } }] });
 			if (compress) assert.equal((await track.info()).compress, version === "moq-lite-07-wip");
 			const seen: number[] = [];
 			try {

@@ -15,9 +15,20 @@ const BTree = (btree.default as unknown as { default?: typeof btree.default }).d
  */
 export const GRACE = Milli(1000);
 
-/** The grace for a subscription with `maxDelay`: how long it was willing to wait for a late group anyway, or {@link GRACE} without one. */
-export function grace(maxDelay: Milli): Milli {
-	return maxDelay > 0 ? maxDelay : GRACE;
+/**
+ * How long idle cached content is kept, matching Rust `cache::DEFAULT_EXPIRY`: a group older
+ * than this is evicted, so nothing waits for one longer.
+ */
+export const CACHE_EXPIRY = Milli(30_000);
+
+/**
+ * The grace for a subscription with a `maxDelay` budget in milliseconds: how long it was willing
+ * to wait for a late group anyway, {@link GRACE} without one, and {@link CACHE_EXPIRY} for an
+ * unbounded one.
+ */
+export function grace(budget: number): Milli {
+	if (budget <= 0) return GRACE;
+	return Number.isFinite(budget) ? Milli(budget) : CACHE_EXPIRY;
 }
 
 // A run of accounted sequences `[start, end)`, and when the gap below it opened, which is

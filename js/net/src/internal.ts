@@ -424,6 +424,12 @@ export const hooks: {
 	 * as the Rust `request_start`.
 	 */
 	startTrack: (producer: Producer, served: { start?: number; requested?: number }) => void;
+	/**
+	 * Mark a track as a copy received over a wire without ranges, which cannot carry a relative
+	 * anchor other than the live start, so its readers refuse one rather than guess from a
+	 * partial copy. Mirrors the Rust `Holdings::drops_anchors`; assigned by `track.ts`.
+	 */
+	dropAnchors: (producer: Producer) => void;
 	/** Mint a track {@link Request}; assigned by `track.ts`. */
 	makeRequest: (options: TrackRequestOptions) => Request;
 	/**
@@ -469,6 +475,16 @@ export const hooks: {
 	 * kept for it, so a resumed reader takes groups the plain way and drops from here.
 	 */
 	tryDrop: (subscriber: Subscriber) => (Recv & { kind: "drop" }) | undefined;
+	/**
+	 * The runs of `[start, end)` a subscriber reads: inside its ranges and its local bounds.
+	 * Assigned by `track.ts`.
+	 */
+	servingRuns: (subscriber: Subscriber, start: number, end: number) => Run[];
+	/**
+	 * The exclusive end past every group a subscriber reads, or undefined while one of its ranges
+	 * stays open. Assigned by `track.ts`.
+	 */
+	servingEnd: (subscriber: Subscriber) => number | undefined;
 	/** The sequence {@link tryNextGroup} (`ordered`) or {@link tryRecvGroup} would take next, without taking it. */
 	peekGroup: (subscriber: Subscriber, ordered: boolean) => number | undefined;
 	/** Take the next group in sequence order without waiting, as {@link tryRecvGroup} does in arrival order. */
@@ -624,6 +640,15 @@ export const hooks: {
 		throw new Error("track.ts not loaded");
 	},
 	startTrack: () => {
+		throw new Error("track.ts not loaded");
+	},
+	dropAnchors: () => {
+		throw new Error("track.ts not loaded");
+	},
+	servingRuns: () => {
+		throw new Error("track.ts not loaded");
+	},
+	servingEnd: () => {
 		throw new Error("track.ts not loaded");
 	},
 	makeRequest: () => {

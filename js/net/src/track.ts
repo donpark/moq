@@ -40,8 +40,9 @@ import {
 	type StagedTrack,
 	type TrackRequestOptions,
 } from "./internal.ts";
-import { grace, Ledger } from "./ledger.ts";
+import { CACHE_EXPIRY, grace, Ledger } from "./ledger.ts";
 import { Timescale, type Timestamp } from "./time.ts";
+import { isWire, joinsLive, rangesOf, union, Window, wireSpan } from "./window.ts";
 import { type Broadcast as BroadcastWire, registerTrackConsumer } from "./wire.ts";
 
 export type { Datagram } from "./datagram.ts";
@@ -57,9 +58,8 @@ function taken(read: () => Recv): GroupConsumer | undefined {
 	}
 }
 
-// Wall-clock bound for idle cached content, matching Rust cache::DEFAULT_EXPIRY.
 // Media maxDelay only bounds how far behind the live edge a reader may fall.
-const CACHE_WINDOW = Nano.fromMilli(Milli(30_000));
+const CACHE_WINDOW = Nano.fromMilli(CACHE_EXPIRY);
 
 // The cache scans at most this many times per idle cache window.
 const PRUNE_SLICES = 8;
@@ -207,12 +207,40 @@ function refreshRatio(value: number): number {
 /** An explicitly included or excluded group sequence. */
 export type Bound = { included: number; excluded?: never } | { excluded: number; included?: never };
 
-/** Group limits; an omitted endpoint is unbounded. */
+/** Group limits for {@link Subscriber.withRange}; an omitted endpoint is unbounded. */
 export interface Groups {
 	/** The first group boundary. */
 	start?: Bound;
 	/** The last group boundary. */
 	end?: Bound;
+}
+
+/**
+ * Where one end of a {@link Range} falls: a fixed group (`absolute`), or a count of groups back
+ * from the latest one (`relative`, clamped to group 0, so `{ relative: 0 }` is the latest group).
+ * Mirrors the Rust `Anchor`.
+ *
+ * Every anchor names a whole group: a subscription always starts at a group's first frame. A
+ * relative anchor resolves at the hop that serves it, when it starts serving and again whenever
+ * the subscriber replaces its ranges. Before any group exists it resolves at the first one, so
+ * `{ start: { relative: 0 } }` starts there. Older moq-lite versions carry only absolute anchors,
+ * the live start, and the oldest start, refusing any other relative anchor.
+ */
+export type Anchor = { absolute: number; relative?: never } | { relative: number; absolute?: never };
+
+/**
+ * A span of a track to deliver: from `start` up to `end`. Mirrors the Rust `Range`.
+ *
+ * An omitted start is the oldest group still around (Rust's `Range::oldest`), and an omitted end
+ * keeps following the live edge. An absolute end is exclusive, so `{absolute: 2}..{absolute: 6}`
+ * delivers groups 2 through 5; a relative end includes its group, so `{absolute: 0}..{relative: 0}`
+ * delivers through the latest group.
+ */
+export interface Range {
+	/** Where delivery starts, or the oldest group when omitted. */
+	start?: Anchor;
+	/** Where delivery stops, or onward when omitted. */
+	end?: Anchor;
 }
 
 /**
@@ -236,14 +264,19 @@ export interface Subscription {
 	 */
 	maxDelay?: Milli | null;
 	/**
-	 * The groups this reader may receive, with an optional floor and cap.
+	 * The spans of the track to deliver; see {@link Range}.
 	 *
-	 * Only {@link maxDelay} asks for data; these bounds limit which groups it may reach.
-	 * An omitted start means 0, and an omitted end leaves the range open. A floor above
-	 * the live edge waits there (a resumed subscription naming where it left off).
-	 * The latency budget uses the latest eligible group within these bounds.
+	 * Defaults to `[{}]`: everything {@link maxDelay} still considers fresh.
+	 * `[{ start: { relative: 0 } }]` starts at the latest group instead, and an empty list asks
+	 * for nothing. {@link maxDelay} caps every range: a range names what may be delivered, and
+	 * the budget skips what inside it has gone stale.
+	 *
+	 * A request to the publisher, aggregated across every live subscriber as the union of their
+	 * ranges, and this subscriber's read filter: it reads only the groups its own ranges cover,
+	 * whatever another subscriber widens the union to. {@link Subscriber.withRange} narrows the
+	 * reads further.
 	 */
-	groups?: Groups;
+	ranges?: Range[];
 	/**
 	 * Which pending group the publisher sends first. Defaults to `"descending"`.
 	 *
@@ -272,15 +305,12 @@ export type Order = "ascending" | "descending";
 // subscription rather than interpreting an omitted field differently.
 function subscriptionDefaults(subscription: Subscription = {}): Subscription {
 	if ("maxAge" in subscription) throw new TypeError("Subscriber maxAge is unsupported; use maxDelay");
-	const bounds = groupBounds(subscription.groups ?? {});
+	if ("groups" in subscription) throw new TypeError("Subscription groups is unsupported; use ranges");
 	return {
 		priority: priorityValue(subscription.priority ?? DEFAULT_PRIORITY),
 		maxDelay: subscription.maxDelay === null ? null : wireMillis("maxDelay", subscription.maxDelay ?? Milli.zero),
 		order: orderOf(subscription.order),
-		groups: {
-			start: subscription.groups?.start === undefined ? undefined : { included: bounds.start },
-			end: bounds.end === undefined ? undefined : { excluded: bounds.end },
-		},
+		ranges: subscription.ranges === undefined ? [{}] : rangesOf(subscription.ranges),
 	};
 }
 
@@ -311,18 +341,10 @@ function combineSubscriptions(states: Iterable<TrackState>): Subscription | unde
 		combined.order =
 			combined.order === "ascending" && subscription.order === "ascending" ? "ascending" : "descending";
 
-		// A floor only restricts, so a subscriber without one clears the aggregate:
-		// its budget may reach below any floor the others set.
-		const a = groupBounds(combined.groups ?? {});
-		const b = groupBounds(subscription.groups ?? {});
-		combined.groups = {
-			start:
-				combined.groups?.start === undefined || subscription.groups?.start === undefined
-					? undefined
-					: { included: Math.min(a.start, b.start) },
-			end: a.end === undefined || b.end === undefined ? undefined : { excluded: Math.max(a.end, b.end) },
-		};
+		// A range above the live edge never hides the latest group from a merged live subscriber.
+		combined.ranges = [...(combined.ranges ?? []), ...(subscription.ranges ?? [])];
 	}
+	if (combined) combined.ranges = union(combined.ranges ?? []);
 	return combined;
 }
 
@@ -515,6 +537,8 @@ class TrackState {
 	// First timestamps mutate group state rather than track state, so held groups
 	// watch this revision as well as arrivals when enforcing latency after handoff.
 	timelineChanged = new Signal(0);
+	// A copy received over a wire without ranges: see `hooks.dropAnchors`.
+	dropsAnchors = new Signal(false);
 	// Bumped when a wire subscription declares or resolves where its live feed starts, so a
 	// publisher holding its first group for that answer wakes.
 	startChanged = new Signal(0);
@@ -542,6 +566,9 @@ class TrackState {
 	info = new Signal<Info | undefined>(undefined);
 	/** Newest group head, datagram, frame, or location reported by the publisher. */
 	largest = new Signal<Position | undefined>(undefined);
+	// The group {@link largest} first named, where a relative anchor resolved before any group
+	// existed starts.
+	first?: number;
 	// Set once {@link largest} can no longer advance while the track stays open.
 	largestEnded = new Signal(false);
 
@@ -634,11 +661,6 @@ let ordered_: {
 	readBool(subscriber: Subscriber): Promise<boolean | undefined>;
 	recvDatagram(subscriber: Subscriber): Promise<Datagram | undefined>;
 };
-
-// Whether a subscription joins at the live edge rather than resuming from a fixed group.
-function joinsLive(subscription: Subscription | undefined): boolean {
-	return subscription?.groups?.start === undefined && subscription?.groups?.end === undefined;
-}
 
 // Constructs a Demand from within this module; assigned in the class's static block.
 let makeDemand: (name: string, wanted: Getter<number | undefined>, state: TrackState) => Demand;
@@ -790,6 +812,9 @@ export class Producer {
 		hooks.trackReleased = (producer) => producer.#state.closed;
 		hooks.trackFinished = (producer) => producer.#state.end.peek() !== undefined;
 		hooks.dropTrackGroups = (producer, start, end, error) => producer.#drop(start, end, error, true);
+		hooks.dropAnchors = (producer) => {
+			for (const state of [producer.#state, ...producer.#sinks]) state.dropsAnchors.set(true);
+		};
 		hooks.startTrack = (producer, served) => {
 			producer.#settle();
 			producer.#served = served;
@@ -1010,11 +1035,13 @@ export class Producer {
 		const info = this.#state.info.peek();
 		if (info) sink.info.set(info);
 		sink.largest.set(this.#state.largest.peek());
+		sink.first = this.#state.largest.peek()?.group;
 		sink.largestEnded.set(this.#state.largestEnded.peek());
+		sink.dropsAnchors.set(this.#state.dropsAnchors.peek());
 
 		const closed = this.#state.closed.peek();
 		if (closed === undefined) {
-			if (joinsLive(sink.update.peek())) this.#join();
+			if (joinsLive(sink.update.peek()?.ranges)) this.#join();
 			this.#sinks.add(sink);
 			this.#reportWanted();
 
@@ -1213,8 +1240,10 @@ export class Producer {
 		const current = this.#state.largest.peek();
 		if (current && !after(largest, current)) return;
 		this.#largestOpen = true;
-		this.#state.largest.set(largest);
-		for (const sink of this.#sinks) sink.largest.set(largest);
+		for (const state of [this.#state, ...this.#sinks]) {
+			state.first ??= largest.group;
+			state.largest.set(largest);
+		}
 	}
 
 	#advanceObject(largest: Position | undefined): void {
@@ -1566,7 +1595,7 @@ export class Producer {
 
 	// The grace the session's tail uses, from the max delay the track's subscribers ask for.
 	#grace(): Milli {
-		return grace(Milli(delayBudget(this.#state.update.peek())));
+		return grace(delayBudget(this.#state.update.peek()));
 	}
 
 	// Tell every reader whether the pending tail still owes a group below the end.
@@ -1594,8 +1623,8 @@ export class Producer {
 	// back restores the START. Without either, the first arrival stands in for it.
 	// Until the START arrives, the feed start is pending; the requested floor still bounds it.
 	#feedStart(): number | "pending" | undefined {
-		const groups = this.#state.update.peek()?.groups;
-		const requested = groups?.start === undefined ? undefined : groupBounds(groups).start;
+		const ranges = this.#state.update.peek()?.ranges;
+		const requested = ranges && wireSpan(ranges).start;
 		const served = this.#served;
 		if (!served || served.requested !== requested) return requested;
 		if (served.start !== undefined) return served.start;
@@ -1789,6 +1818,13 @@ export class Subscriber {
 	#largestSeen?: Position;
 	#largestDone = false;
 	#nextSequence = 0;
+	// The local bounds {@link withRange} set.
+	#local: { start: number; end?: number } = { start: 0 };
+	// This reader's own ranges resolved to the groups it reads, whatever another subscriber
+	// widens the aggregate to. Assigned in the constructor.
+	#window!: Window;
+	// The hull of what this reader reads now: its local bounds narrowed to the window's floor
+	// and end. A group inside it is read only if the window contains it too.
 	#cursor = new Signal<{ start: number; end?: number }>({ start: 0 });
 	// A FETCH's own budget in place of the subscription's; unlike SUBSCRIBE's zero
 	// default, an omitted one is unbounded, leaving publisher retention alone.
@@ -1802,7 +1838,7 @@ export class Subscriber {
 	// the track's drops last folded in, and every sequence already reported. Drops are
 	// persistent track state, so they are tracked here rather than removed for everyone.
 	#pending: DropRun[] = [];
-	#dropsSeen?: { drops: readonly DropRun[]; start: number; end?: number };
+	#dropsSeen?: { drops: readonly DropRun[]; start: number; end?: number; window: Window };
 	#reported: Run[] = [];
 	// The group the frame-level helpers are currently draining, acquired through the
 	// sequence cursor so frame reads and {@link Ordered.nextGroup} share one floor.
@@ -1830,7 +1866,7 @@ export class Subscriber {
 			// stamped group's latest frame: walk back from the cap to the first one.
 			for (let i = (end === undefined ? timeline.length : timelineIndex(timeline, end)) - 1; i >= 0; i--) {
 				const group = timeline[i];
-				if (group.closed.peek() instanceof Error) continue;
+				if (group.closed.peek() instanceof Error || !this.#window.contains(group.sequence)) continue;
 				const timestamp = hooks.groupTimestamp(group);
 				if (timestamp === undefined) continue;
 				presentation = { sequence: group.sequence, timestamp: hooks.groupLatest(group) ?? timestamp };
@@ -1877,7 +1913,7 @@ export class Subscriber {
 		for (let i = timelineIndex(timeline, sequence + 1); i < timeline.length; i++) {
 			const successor = timeline[i];
 			if (end !== undefined && successor.sequence >= end) break;
-			if (successor.closed.peek() instanceof Error) continue;
+			if (successor.closed.peek() instanceof Error || !this.#window.contains(successor.sequence)) continue;
 			if (counts(successor)) return successor;
 		}
 		return undefined;
@@ -2112,7 +2148,47 @@ export class Subscriber {
 		this.name = name;
 		this.#state = state;
 		// Each reader filters locally even when another reader widens upstream demand.
-		this.#cursor.set(groupBounds(state.update.peek()?.groups));
+		this.#resolve();
+	}
+
+	// The latest group to count relative anchors back from. A reader following route copies
+	// leaves them to the copies, which hold the groups.
+	#latestGroup(): number | undefined {
+		return this.#resume ? undefined : this.#state.largest.peek()?.group;
+	}
+
+	// Resolve this reader's ranges again, as when they are replaced.
+	#resolve(): void {
+		this.#window = new Window(this.#state.update.peek()?.ranges ?? [{}], this.#latestGroup());
+		this.#bound();
+	}
+
+	// Resolve a relative anchor still waiting on a first group, once one exists. Returns the
+	// refusal of ranges this copy's wire cannot carry, which every read reports.
+	#settle(): Error | undefined {
+		if (this.#state.dropsAnchors.peek() && !this.#window.ranges.every(isWire)) {
+			return new Error("a relative anchor other than the live start needs moq-lite-07");
+		}
+		// The live feed had no group when the ranges resolved, so the newest one then was the first.
+		if (this.#window.pending && !this.#resume && this.#window.settle(this.#state.first)) this.#bound();
+		return undefined;
+	}
+
+	// Narrow the local bounds to the window into the hull every read starts from.
+	#bound(): void {
+		const end = this.#window.end();
+		const local = this.#local;
+		this.#cursor.set({
+			start: Math.max(local.start, this.#window.floor() ?? 0),
+			end: end === undefined ? local.end : Math.min(local.end ?? end, end),
+		});
+	}
+
+	// Whether a held group waits on the local cap rising: one past it may still be read. A
+	// group outside the window alone never holds a finished track open.
+	#parked(groups: readonly GroupConsumer[]): boolean {
+		const cap = this.#local.end;
+		return cap !== undefined && (groups.at(-1)?.sequence ?? -1) >= cap;
 	}
 
 	static {
@@ -2132,6 +2208,12 @@ export class Subscriber {
 		};
 		hooks.tryRecvGroup = (subscriber, dispositions) => subscriber.#tryRecvGroup(dispositions);
 		hooks.tryDrop = (subscriber) => subscriber.#tryDrop();
+		hooks.servingRuns = (subscriber, start, end) => {
+			const cursor = subscriber.#cursor.peek();
+			return subscriber.#window.runs(Math.max(start, cursor.start), Math.min(end, cursor.end ?? end));
+		};
+		hooks.servingEnd = (subscriber) =>
+			subscriber.#window.end() === undefined ? undefined : subscriber.#cursor.peek().end;
 		hooks.tryNextGroup = (subscriber) => subscriber.#tryNextGroup();
 		hooks.peekGroup = (subscriber, ordered) => subscriber.#peekGroup(ordered);
 		hooks.forgetPastBudget = (subscriber, delivered) => subscriber.#forgetPastBudget(delivered);
@@ -2174,7 +2256,8 @@ export class Subscriber {
 				.some(
 					(datagram) =>
 						datagram.sequence >= cursor.start &&
-						(cursor.end === undefined || datagram.sequence < cursor.end),
+						(cursor.end === undefined || datagram.sequence < cursor.end) &&
+						subscriber.#window.contains(datagram.sequence),
 				);
 			return (
 				(state.closed.peek() !== undefined || subscriber.#complete()) &&
@@ -2412,14 +2495,21 @@ export class Subscriber {
 	 * the route that delivered them may be gone. {@link largest} reports within these bounds.
 	 */
 	withRange(groups: Groups): this {
-		const { start, end } = groupBounds(groups);
 		const before = this.#cursor.peek();
-		this.#cursor.set({ start, end });
+		this.#local = groupBounds(groups);
+		this.#bound();
+		const { start } = this.#cursor.peek();
 		const producer = this.#state.producer;
 		if (!this.#resume && !this.#closed && producer && start < before.start) {
 			// The ordered cursor let go of what it passed below the old floor; the arrival
 			// cursor keeps it buffered, which this skips.
-			reofferCached(producer, this.#state, start, before.start, (sequence) => !this.#delivered.has(sequence));
+			reofferCached(
+				producer,
+				this.#state,
+				start,
+				before.start,
+				(sequence) => !this.#delivered.has(sequence) && this.#window.contains(sequence),
+			);
 		}
 		return this;
 	}
@@ -2506,6 +2596,8 @@ export class Subscriber {
 	// control state, popping the group, and positioning its frames are one JavaScript turn.
 	#tryRecvGroup(dispositions = false): Recv {
 		if (this.#resume) return this.#tryResumed(false, dispositions);
+		const refused = this.#settle();
+		if (refused) return { kind: "error", error: refused };
 		const groups = this.#state.groups.peek();
 		const { start, end } = this.#cursor.peek();
 		const old = () => new StreamError(StreamCode.Old, { message: "group is past the budget" });
@@ -2519,13 +2611,18 @@ export class Subscriber {
 		// Keep unread groups below the floor until cache eviction: replacing the
 		// subscription can lower it, just as raising the cap re-offers held groups. Found
 		// after the re-offer, which may insert below the floor.
-		const index = timelineIndex(groups, start);
+		let index = timelineIndex(groups, start);
 
 		for (;;) {
 			// The buffer is sequence-sorted, so an in-range group that arrives behind a
 			// beyond-cap one sorts in front of it and is never blocked by it.
 			const group = groups[index];
 			if (!group || (end !== undefined && group.sequence >= end)) break;
+			// Kept, like a group below the floor: replacing the ranges can take it in.
+			if (!this.#window.contains(group.sequence)) {
+				index++;
+				continue;
+			}
 			groups.splice(index, 1);
 			// A sequence this cursor already reported dropped stays dropped: the subscriber
 			// accounted for it, so a group re-created under it is not served.
@@ -2561,22 +2658,24 @@ export class Subscriber {
 			return { kind: "group", group: this.#guard(group) };
 		}
 
-		const group = groups[index];
 		const closed = this.#state.closed.peek();
 		if (closed instanceof Error) return { kind: "error", error: closed };
 		if (closed === undefined && !this.#complete()) return { kind: "idle" };
 		// A group beyond the cap outlives a clean close: it becomes deliverable if
 		// the cap rises, so the track isn't over while any are held.
-		return group ? { kind: "boundary" } : { kind: "done" };
+		return this.#parked(groups) ? { kind: "boundary" } : { kind: "done" };
 	}
 
 	// The first part of `[from, to)` this cursor has not reported yet, now reported, with why.
 	#report(from: number, to: number, error: Error): (Recv & { kind: "drop" }) | undefined {
 		const { start, end } = this.#cursor.peek();
-		const [gap] = runGaps(this.#reported, Math.max(from, start), Math.min(to, end ?? to));
-		if (!gap) return undefined;
-		insertRun(this.#reported, gap.start, gap.end);
-		return { kind: "drop", ...gap, error };
+		for (const run of this.#window.runs(Math.max(from, start), Math.min(to, end ?? to))) {
+			const [gap] = runGaps(this.#reported, run.start, run.end);
+			if (!gap) continue;
+			insertRun(this.#reported, gap.start, gap.end);
+			return { kind: "drop", ...gap, error };
+		}
+		return undefined;
 	}
 
 	// The next run this cursor gave up and has not reported, without taking a group. From the
@@ -2589,13 +2688,15 @@ export class Subscriber {
 			if (dropped) this.#delivered.addRun(dropped.start, dropped.end);
 			return dropped;
 		}
+		this.#settle();
 		const { start, end } = this.#cursor.peek();
 		// Rescanned only after it changed, so an idle poll costs nothing per drop held.
 		// Out-of-window runs were skipped, so a moved window rescans too.
 		const drops = this.#state.drops.peek();
+		const window = this.#window;
 		const seen = this.#dropsSeen;
-		if (!seen || seen.drops !== drops || seen.start !== start || seen.end !== end) {
-			this.#dropsSeen = { drops, start, end };
+		if (!seen || seen.drops !== drops || seen.start !== start || seen.end !== end || seen.window !== window) {
+			this.#dropsSeen = { drops, start, end, window };
 			for (const run of drops) this.#pending = insertDrop(this.#pending, run.start, run.end, run.error);
 		}
 		for (let run = this.#pending.shift(); run; run = this.#pending.shift()) {
@@ -2642,6 +2743,7 @@ export class Subscriber {
 			this.#state.groups.changed(fn),
 			this.#state.drops.changed(fn),
 			this.#state.startChanged.changed(fn),
+			this.#state.dropsAnchors.changed(fn),
 			this.#cursor.changed(fn),
 			// A widened budget re-offers the groups it skipped as stale.
 			this.#state.update.changed(fn),
@@ -2716,9 +2818,13 @@ export class Subscriber {
 		if (this.#resume && closed instanceof Error) return { kind: "error", error: closed };
 		// The group range bounds datagrams too, judged when each is read. One outside it is
 		// gone for good: nothing holds it for a later raise, unlike a group past the cap.
+		const refused = this.#settle();
+		if (refused) return { kind: "error", error: refused };
 		const { start, end } = this.#cursor.peek();
 		const inRange = (datagram: Datagram) =>
-			datagram.sequence >= start && (end === undefined || datagram.sequence < end);
+			datagram.sequence >= start &&
+			(end === undefined || datagram.sequence < end) &&
+			this.#window.contains(datagram.sequence);
 		if (this.#resume) {
 			for (;;) {
 				const recv = this.#resume.tryDatagram(this.#delivered);
@@ -2753,11 +2859,12 @@ export class Subscriber {
 	// The sequence #tryNextGroup (`ordered`) or #tryRecvGroup would take next: the lowest buffered
 	// group in range, not yet handed out, that the budget spares.
 	#peekGroup(ordered: boolean): number | undefined {
+		this.#settle();
 		const cursor = this.#cursor.peek();
 		const start = ordered ? Math.max(cursor.start, this.#nextSequence) : cursor.start;
 		const drift = this.#drift();
 		for (const group of this.#state.groups.peek()) {
-			if (group.sequence < start) continue;
+			if (group.sequence < start || !this.#window.contains(group.sequence)) continue;
 			if (cursor.end !== undefined && group.sequence >= cursor.end) return undefined;
 			if (!this.#delivered.has(group.sequence) && !this.#staleAt(group.sequence, drift)) return group.sequence;
 		}
@@ -2777,6 +2884,8 @@ export class Subscriber {
 	}
 
 	#tryNextBuffered(): Recv {
+		const refused = this.#settle();
+		if (refused) return { kind: "error", error: refused };
 		const groups = this.#state.groups.peek();
 		const cursor = this.#cursor.peek();
 		const start = Math.max(cursor.start, this.#nextSequence);
@@ -2788,6 +2897,11 @@ export class Subscriber {
 			const group = groups[0];
 			if (!group || (cursor.end !== undefined && group.sequence >= cursor.end)) break;
 			groups.shift();
+			// Out of range for now: an update taking it in offers it again from the cache.
+			if (!this.#window.contains(group.sequence)) {
+				group.close();
+				continue;
+			}
 			this.#nextSequence = group.sequence + 1;
 			// Every frame this group could still hold is past the budget, so keep
 			// scanning: one pass walks a whole backlog off rather than replaying it.
@@ -2806,7 +2920,7 @@ export class Subscriber {
 		// drained track reports finished.
 		const end = this.#state.end.peek();
 		if (
-			!groups[0] &&
+			!this.#parked(groups) &&
 			(closed !== undefined || this.#complete() || (end !== undefined && start >= finalSequence(end)))
 		) {
 			return { kind: "done" };
@@ -2910,8 +3024,9 @@ export class Subscriber {
 	 */
 	update(options: Subscription) {
 		const subscription = subscriptionDefaults(options);
-		this.#cursor.set(groupBounds(subscription.groups));
+		const replaced = JSON.stringify(subscription.ranges) !== JSON.stringify(this.#window.ranges);
 		this.#state.update.set(subscription);
+		if (replaced) this.#resolve();
 	}
 }
 

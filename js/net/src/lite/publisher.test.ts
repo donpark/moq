@@ -929,8 +929,8 @@ test.each([Version.DRAFT_06, Version.DRAFT_07])("lite %s: datagrams honor group 
 	// The publisher applies an update's datagram bounds before forwarding its group range, and
 	// each update here moves the range's end.
 	const applied = async (end: number) => {
-		let groups = sub.track.subscription.peek()?.groups;
-		while (groups?.end?.excluded !== end) groups = (await sub.track.subscription.changed())?.groups;
+		let ranges = sub.track.subscription.peek()?.ranges;
+		while (ranges?.[0]?.end?.absolute !== end) ranges = (await sub.track.subscription.changed())?.ranges;
 	};
 	try {
 		send([0, 2, 1]);
@@ -1285,7 +1285,7 @@ test("lite draft-05: a group popped before a cap update is still served", async 
 		expect(await sub.servedSequence()).toBe(1);
 		while (ranges.mock.calls.length === 0) await flush();
 		// Dropping the named floor re-pins to the latest group, as an unfloored SUBSCRIBE does.
-		expect(lastGroups(ranges)).toEqual({ start: { included: 1 }, end: { included: 0 } });
+		expect(lastGroups(ranges)).toEqual({ start: { included: 1 } });
 	} finally {
 		ranges.mockRestore();
 		sub.release();
@@ -1463,7 +1463,7 @@ test("lite draft-06: a burst of updates coalesces before the next group pop", as
 			expect(await sub.servedGroup()).toEqual({ sequence: 1, frameStart: 0, payloads: ["a"] });
 			expect(ranges).toHaveBeenCalledTimes(1);
 			// Draft-06 encodes a floor of group 0 as no floor, which assigns 0.
-			expect(lastGroups(ranges)).toEqual({ start: { included: 0 }, end: { included: 1 } });
+			expect(lastGroups(ranges)).toEqual({ start: { included: 0 } });
 		} finally {
 			ranges.mockRestore();
 		}
@@ -1532,14 +1532,14 @@ test("lite draft-06: scheduling updates apply while SUBSCRIBE_START is blocked",
 			priority: 9,
 			maxDelay: TEST_MAX_DELAY_MS,
 			order: "descending",
-			groups: { start: undefined, end: { excluded: 6 } },
+			ranges: [{ end: { absolute: 6 } }],
 		});
 		expect(ranges).not.toHaveBeenCalled();
 
 		sub.release();
 		expect(await sub.servedSequence()).toBe(0);
 		while (ranges.mock.calls.length === 0) await flush();
-		expect(lastGroups(ranges)).toEqual({ start: { included: 0 }, end: { included: 5 } });
+		expect(lastGroups(ranges)).toEqual({ start: { included: 0 } });
 	} finally {
 		ranges.mockRestore();
 		sub.release();

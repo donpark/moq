@@ -43,7 +43,7 @@
  *
  * @module
  */
-import { Instant, Milli, now, sleepUntil } from "@moq/clock";
+import { Instant, type Milli, now, sleepUntil } from "@moq/clock";
 import { type Dispose, type Getter, race, Signal } from "@moq/signals";
 import * as broadcast from "./broadcast.ts";
 import { Delivered } from "./delivered.ts";
@@ -51,10 +51,9 @@ import { NotFound, SessionError, StreamCode, StreamError, sessionClosed } from "
 import type { Consumer as GroupConsumer } from "./group.ts";
 import {
 	type DropRun,
-	finalSequence,
 	delayBudget,
+	finalSequence,
 	type GroupRecover,
-	groupBounds,
 	hooks,
 	insertDrop,
 	insertRun,
@@ -70,6 +69,7 @@ import {
 import { grace } from "./ledger.ts";
 import type { Lister, Tracks, TracksEvent } from "./listing.ts";
 import * as track from "./track.ts";
+import { clamped } from "./window.ts";
 import { type Broadcast as BroadcastWire, registerWire, wireOf } from "./wire.ts";
 
 // Stream codes that report the route failing to deliver rather than judging what it carried:
@@ -464,17 +464,9 @@ class Reader implements ResumeSource {
 	/** What `copy` is asked for: the reader's own preferences, from its floor and through its replacement. */
 	#wire(copy: Pick<Copy, "floor" | "until">): track.Subscription {
 		const preferences = this.#shell.subscription.peek() ?? {};
-		const bounds = groupBounds(preferences.groups);
-		const start = Math.max(bounds.start, copy.floor ?? 0);
-		const replaced = copyEnd(copy);
-		const end = replaced === undefined ? bounds.end : Math.min(bounds.end ?? replaced, replaced);
-		return {
-			...preferences,
-			groups: {
-				start: start > 0 ? { included: start } : undefined,
-				end: end === undefined ? undefined : { excluded: end },
-			},
-		};
+		const floor = copy.floor ? copy.floor : undefined;
+		// The copies resolve relative anchors against the groups they hold.
+		return { ...preferences, ranges: clamped(preferences.ranges ?? [{}], floor, copyEnd(copy), []) };
 	}
 
 	#update(copy: Copy): void {
@@ -912,15 +904,15 @@ class Reader implements ResumeSource {
 	}
 
 	/** The reader's budget: how far behind a group may fall before it is skipped. */
-	#budget(): Milli {
-		return Milli(delayBudget(this.#shell.subscription.peek()));
+	#budget(): number {
+		return delayBudget(this.#shell.subscription.peek());
 	}
 
 	/**
 	 * Whether `within` passed since `copy` was superseded; see {@link Copy.since}. Arms a wakeup
 	 * for then, so a read waiting on the copy looks again.
 	 */
-	#expired(copy: Copy, within: Milli): boolean {
+	#expired(copy: Copy, within: number): boolean {
 		if (copy.since === undefined) return false;
 		// Plain arithmetic: an unenforced budget is infinite, which no duration brand holds.
 		const at = copy.since + within * 1_000_000;

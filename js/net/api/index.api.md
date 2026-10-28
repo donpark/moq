@@ -37,6 +37,14 @@ class Allocator implements Handle_2 {
     static unlimited(): Allocator;
 }
 
+type Anchor = {
+    absolute: number;
+    relative?: never;
+} | {
+    relative: number;
+    absolute?: never;
+};
+
 declare namespace Announce {
     export {
         Announce_2 as Announce,
@@ -630,6 +638,11 @@ class Publication {
     unannounce(): void;
 }
 
+interface Range_2 {
+    end?: Anchor;
+    start?: Anchor;
+}
+
 interface ReadOptions {
     from?: number;
 }
@@ -822,10 +835,10 @@ class Subscriber {
 }
 
 interface Subscription {
-    groups?: Groups;
-    maxDelay?: Milli;
+    maxDelay?: Milli | null;
     order?: Order;
     priority?: number;
+    ranges?: Range_2[];
 }
 
 interface Table {
@@ -894,6 +907,8 @@ declare namespace Track {
         Info,
         Bound,
         Groups,
+        Anchor,
+        Range_2 as Range,
         Subscription,
         Order,
         Request_2 as Request,

@@ -2160,7 +2160,7 @@ test("a lite-07 publisher FIN ends a covered bounded subscription", async () => 
 	const { quic, streams, opened, closes } = fakeSession();
 	const subscriber = new Subscriber(quic, version, HopSchema.parse(1n));
 	const broadcast = subscriber.consume(Path.from("room"));
-	const track = broadcast.track("video").subscribe({ groups: { start: { included: 0 }, end: { excluded: 2 } } });
+	const track = broadcast.track("video").subscribe({ ranges: [{ start: { absolute: 0 }, end: { absolute: 2 } }] });
 	try {
 		await opened(0);
 		await answerTrackInfo(streams[0], version);
@@ -2193,17 +2193,17 @@ test("a lite-07 publisher FIN ends a covered bounded subscription", async () => 
 // The FIN may answer the bounded range before the publisher read an update that widened it,
 // so the track fails rather than ending clean short of the demand.
 test.each([
-	["an open widening after SUBSCRIBE_START", { start: { included: 0 } }, true, false],
-	["a bounded widening without SUBSCRIBE_START", { start: { included: 0 }, end: { excluded: 5 } }, false, false],
-	["a widening the publisher stopped reading", { start: { included: 0 }, end: { excluded: 5 } }, false, true],
-] as const)("a lite-07 FIN short of %s fails the track", async (_, groups, start, stopped) => {
+	["an open widening after SUBSCRIBE_START", { start: { absolute: 0 } }, true, false],
+	["a bounded widening without SUBSCRIBE_START", { start: { absolute: 0 }, end: { absolute: 5 } }, false, false],
+	["a widening the publisher stopped reading", { start: { absolute: 0 }, end: { absolute: 5 } }, false, true],
+] as const)("a lite-07 FIN short of %s fails the track", async (_, range, start, stopped) => {
 	const clock = new Manual();
 	const installed = clock.install();
 	const version = Version.DRAFT_07;
 	const { quic, streams, opened, closes } = fakeSession();
 	const subscriber = new Subscriber(quic, version, HopSchema.parse(1n));
 	const broadcast = subscriber.consume(Path.from("room"));
-	const track = broadcast.track("video").subscribe({ groups: { start: { included: 0 }, end: { excluded: 1 } } });
+	const track = broadcast.track("video").subscribe({ ranges: [{ start: { absolute: 0 }, end: { absolute: 1 } }] });
 	try {
 		await opened(0);
 		await answerTrackInfo(streams[0], version);
@@ -2217,7 +2217,7 @@ test.each([
 					}),
 				)
 			: undefined;
-		track.update({ groups });
+		track.update({ ranges: [range] });
 		await refused;
 		await drainReactions();
 
@@ -2313,7 +2313,7 @@ test("an update whose bound the wire can't carry fails the track", async () => {
 		await opened(0);
 		await answerTrackInfo(streams[0], Version.DRAFT_05);
 		await (await opened(1)).reading;
-		track.update({ groups: { start: { included: Number.MAX_SAFE_INTEGER } } });
+		track.update({ ranges: [{ start: { absolute: Number.MAX_SAFE_INTEGER } }] });
 		expect(await track.closed).toBeInstanceOf(RangeError);
 	} finally {
 		track.close();

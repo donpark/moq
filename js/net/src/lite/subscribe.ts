@@ -2,7 +2,7 @@ import type * as Epoch from "../epoch.ts";
 import { fromTransport, ProtocolViolation, StreamCode, StreamError, toStreamCode } from "../error.ts";
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
-import type { Order, Position } from "../track.ts";
+import type { Anchor, Order, Position, Range } from "../track.ts";
 import { decodeEpoch, encodeEpoch } from "./epoch.ts";
 import * as Message from "./message.ts";
 import { fromWire, toWire } from "./priority.ts";
@@ -120,11 +120,35 @@ interface Span {
 	endFrame?: number;
 }
 
+/** Encode one lite-07 range end, `undefined` for none: an absolute end names a group's first frame. */
+async function encodeAnchor(w: Writer, anchor: Anchor | undefined) {
+	if (anchor?.absolute !== undefined) {
+		await w.u53(1);
+		await w.u53(anchor.absolute);
+		await w.u53(0);
+	} else if (anchor?.relative !== undefined) {
+		await w.u53(2);
+		await w.u53(anchor.relative);
+	} else {
+		await w.u53(0);
+	}
+}
+
 /**
  * Encode the span after the max delay. Before lite-07 that is `Group Start`, `Group End`,
- * and the frame bounds; lite-07 carries a list of ranges, and this span is its only one.
+ * and the frame bounds; lite-07 carries a list of ranges, which is `ranges` when given and
+ * otherwise this span as its only one.
  */
-async function encodeSpan(w: Writer, version: Version, span: Span) {
+async function encodeSpan(w: Writer, version: Version, span: Span, ranges?: readonly Range[]) {
+	if (ranges !== undefined && hasRanges(version)) {
+		if (ranges.length === 0) throw new Error(EMPTY_RANGE);
+		await w.u53(ranges.length);
+		for (const range of ranges) {
+			await encodeAnchor(w, range.start);
+			await encodeAnchor(w, range.end);
+		}
+		return;
+	}
 	if (!hasRanges(version)) {
 		await encodeStartGroup(w, version, span.startGroup);
 		await w.u53(span.endGroup !== undefined ? span.endGroup + 1 : 0);
@@ -155,6 +179,18 @@ async function encodeSpan(w: Writer, version: Version, span: Span) {
 	}
 }
 
+/**
+ * The model ranges a decoded SUBSCRIBE or SUBSCRIBE_UPDATE asks for: its lite-07 list, or the one
+ * span an older wire carries, whole groups either way.
+ */
+export function requestedRanges(msg: Span & { ranges?: Range[] }): Range[] {
+	if (msg.ranges) return msg.ranges;
+	const range: Range = {};
+	if (msg.startGroup !== undefined) range.start = { absolute: msg.startGroup };
+	if (msg.endGroup !== undefined) range.end = { absolute: msg.endGroup + 1 };
+	return [range];
+}
+
 /** A position as a comparable pair, group then frame. */
 type Point = [group: number, frame: number];
 
@@ -163,31 +199,35 @@ function before(a: Point, b: Point): boolean {
 }
 
 /**
- * Decode one lite-07 range end, `undefined` for none. A relative or time anchor is also
- * `undefined`: this publisher resolves neither, so it serves from the oldest group its
- * budget allows, or through the live edge, and the subscriber keeps what it asked for.
+ * Decode one lite-07 range end: its absolute position, if any, and the model anchor, `undefined`
+ * for none. An absolute end past frame 0 includes its group. A time anchor is also `undefined`:
+ * this publisher does not resolve one, so it serves from the oldest group its budget allows, or
+ * through the live edge, and the subscriber keeps what it asked for.
  */
-async function decodeAnchor(r: Reader): Promise<Point | undefined> {
+async function decodeAnchor(r: Reader, end: boolean): Promise<{ point?: Point; anchor?: Anchor }> {
 	const kind = await r.u53();
 	switch (kind) {
 		case 0:
-			return undefined;
-		case 1:
-			return [await r.u53(), await r.u53()];
+			return {};
+		case 1: {
+			const point: Point = [await r.u53(), await r.u53()];
+			return { point, anchor: { absolute: end && point[1] > 0 ? point[0] + 1 : point[0] } };
+		}
 		case 2:
+			return { anchor: { relative: await r.u53() } };
 		case 3:
 			await r.u53();
-			return undefined;
+			return {};
 		default:
 			throw new ProtocolViolation(`unknown range anchor: ${kind}`);
 	}
 }
 
 /**
- * The inverse of {@link encodeSpan}. A lite-07 list decodes as the one span covering every
- * range in it, which the subscriber narrows again.
+ * The inverse of {@link encodeSpan}. A lite-07 list decodes as its ranges and as the one span
+ * covering every range in it, which the subscriber narrows again.
  */
-async function decodeSpan(r: Reader, version: Version): Promise<Span> {
+async function decodeSpan(r: Reader, version: Version): Promise<Span & { ranges?: Range[] }> {
 	if (!hasRanges(version)) {
 		const startGroup = await decodeStartGroup(r, version);
 		const endGroup = (await r.u53()) || undefined;
@@ -202,13 +242,18 @@ async function decodeSpan(r: Reader, version: Version): Promise<Span> {
 	let end: Point | undefined;
 	let floor = true;
 	let live = false;
+	const ranges: Range[] = [];
 	for (let i = 0; i < count; i++) {
-		const from = await decodeAnchor(r);
-		const to = await decodeAnchor(r);
-		if (from === undefined) floor = false;
-		else if (start === undefined || before(from, start)) start = from;
-		if (to === undefined) live = true;
-		else if (end === undefined || before(end, to)) end = to;
+		const from = await decodeAnchor(r, false);
+		const to = await decodeAnchor(r, true);
+		const range: Range = {};
+		if (from.anchor) range.start = from.anchor;
+		if (to.anchor) range.end = to.anchor;
+		ranges.push(range);
+		if (from.point === undefined) floor = false;
+		else if (start === undefined || before(from.point, start)) start = from.point;
+		if (to.point === undefined) live = true;
+		else if (end === undefined || before(end, to.point)) end = to.point;
 	}
 	if (!floor) start = undefined;
 	if (live) end = undefined;
@@ -217,6 +262,7 @@ async function decodeSpan(r: Reader, version: Version): Promise<Span> {
 
 	const startFrame = start?.[1] ?? 0;
 	return {
+		ranges,
 		startGroup: canonicalStartGroup(version, start?.[0], startFrame),
 		startFrame,
 		endGroup: end === undefined ? undefined : end[1] === 0 ? end[0] - 1 : end[0],
@@ -266,41 +312,19 @@ async function encodeOrder(w: Writer, version: Version, order: Order) {
 	await w.u8(order === "ascending" ? 1 : 0);
 }
 
-/**
- * Exclusive model/local cap from a decoded inclusive last group.
- *
- * The wire's `Group End` is inclusive once decoded; the track model and `withRange` are
- * exclusive. `undefined` stays unbounded.
- */
-export function exclusiveGroupEnd(inclusive?: number): number | undefined {
-	return inclusive === undefined ? undefined : inclusive + 1;
-}
-
-/** The error for a requested range the wire cannot carry; see {@link emptyRange}. */
+/** The error for a requested range the wire cannot carry: one asking for nothing. */
 export const EMPTY_RANGE = "empty subscription range cannot be encoded";
 
 /**
  * Inclusive last group a Subscribe message carries, from an exclusive model end.
  *
  * Empty (`0`) cannot be encoded: the wire's 0 means unbounded. Callers refuse an empty
- * requested range with {@link emptyRange} before reaching here.
+ * requested range before reaching here.
  */
 export function inclusiveGroupEnd(exclusive?: number): number | undefined {
 	if (exclusive === undefined) return undefined;
 	if (exclusive === 0) throw new Error(EMPTY_RANGE);
 	return exclusive - 1;
-}
-
-/**
- * Whether a requested range asks for nothing.
- *
- * The wire has no encoding for one: its bounds are inclusive, so flooring the end would
- * either hand back the group the caller excluded (0 means unbounded) or invert the
- * range once the two bounds meet. An absent start is the live edge, so it only empties
- * the range when the end is 0.
- */
-export function emptyRange({ startGroup, endGroup }: { startGroup?: number; endGroup?: number }): boolean {
-	return endGroup !== undefined && (startGroup ?? 0) >= endGroup;
 }
 
 export class SubscribeUpdate {
@@ -317,6 +341,8 @@ export class SubscribeUpdate {
 	startFrame: number;
 	/** See {@link Subscribe.endFrame}. */
 	endFrame?: number;
+	/** See {@link Subscribe.ranges}. */
+	ranges?: Range[];
 
 	constructor(props: {
 		priority: number;
@@ -327,6 +353,7 @@ export class SubscribeUpdate {
 		endGroup?: number;
 		startFrame?: number;
 		endFrame?: number;
+		ranges?: Range[];
 	}) {
 		if (props.wantedGroup !== undefined && (!Number.isSafeInteger(props.wantedGroup) || props.wantedGroup < 0))
 			throw new RangeError("wanted group must be a safe non-negative integer");
@@ -338,6 +365,7 @@ export class SubscribeUpdate {
 		this.endGroup = props.endGroup;
 		this.startFrame = props.startFrame ?? 0;
 		this.endFrame = props.endFrame;
+		this.ranges = props.ranges;
 	}
 
 	async #encode(w: Writer, version: Version) {
@@ -350,7 +378,7 @@ export class SubscribeUpdate {
 				await w.u8(toWire(this.priority));
 				await encodeOrder(w, version, this.order);
 				await w.u53(this.maxDelay);
-				await encodeSpan(w, version, this);
+				await encodeSpan(w, version, this, this.ranges);
 				if (hasRefresh(version))
 					await w.u62(this.wantedGroup === undefined ? 0n : BigInt(this.wantedGroup) + 1n);
 				break;
@@ -427,6 +455,12 @@ export class Subscribe {
 	 */
 	endFrame?: number;
 
+	/**
+	 * Every range. Lite-07 encodes these in place of the span when given, and older versions
+	 * the span alone; decoding a lite-07 list fills them alongside the span covering them all.
+	 */
+	ranges?: Range[];
+
 	constructor(props: {
 		id: bigint;
 		broadcast: Path.Valid;
@@ -439,6 +473,7 @@ export class Subscribe {
 		endGroup?: number;
 		startFrame?: number;
 		endFrame?: number;
+		ranges?: Range[];
 	}) {
 		this.id = props.id;
 		this.broadcast = props.broadcast;
@@ -451,6 +486,7 @@ export class Subscribe {
 		this.endGroup = props.endGroup;
 		this.startFrame = props.startFrame ?? 0;
 		this.endFrame = props.endFrame;
+		this.ranges = props.ranges;
 	}
 
 	async #encode(w: Writer, version: Version) {
@@ -467,7 +503,7 @@ export class Subscribe {
 			default:
 				await encodeOrder(w, version, this.order);
 				await w.u53(this.maxDelay);
-				await encodeSpan(w, version, this);
+				await encodeSpan(w, version, this, this.ranges);
 				break;
 		}
 	}

@@ -196,7 +196,7 @@ test("integration: lite subscription options and updates reach the publisher", a
 			const producer = request.accept({ timescale: Timescale.MILLI });
 			// The TRACK lookup opens the request and the SUBSCRIBE joins it, so its options land after.
 			const check = (subscription = producer.subscription.peek()) => {
-				if (subscription?.groups?.start?.included === 1) resolveProducer?.(producer);
+				if (subscription?.ranges?.[0]?.start?.absolute === 1) resolveProducer?.(producer);
 			};
 			check();
 			producer.subscription.subscribe(check);
@@ -208,27 +208,27 @@ test("integration: lite subscription options and updates reach the publisher", a
 	const subscriber = remote.track("video").subscribe({
 		priority: 3,
 		maxDelay: Milli(250),
-		groups: { start: { included: 1 }, end: { excluded: 9 } },
+		ranges: [{ start: { absolute: 1 }, end: { absolute: 9 } }],
 	});
 	const producer = await accepted;
 	expect(producer.subscription.peek()).toEqual({
 		priority: 3,
 		maxDelay: Milli(250),
 		order: "descending",
-		groups: { start: { included: 1 }, end: { excluded: 9 } },
+		ranges: [{ start: { absolute: 1 }, end: { absolute: 9 } }],
 	});
 
 	const updated = producer.subscription.changed();
 	subscriber.update({
 		priority: 8,
 		maxDelay: Milli(500),
-		groups: { start: { included: 2 }, end: { excluded: 12 } },
+		ranges: [{ start: { absolute: 2 }, end: { absolute: 12 } }],
 	});
 	expect(await updated).toEqual({
 		priority: 8,
 		maxDelay: Milli(500),
 		order: "descending",
-		groups: { start: { included: 2 }, end: { excluded: 12 } },
+		ranges: [{ start: { absolute: 2 }, end: { absolute: 12 } }],
 	});
 
 	subscriber.close();
@@ -294,7 +294,7 @@ test("integration: lite carries a fractional maxDelay as a whole millisecond", a
 			const producer = request.accept({ timescale: Timescale.MILLI });
 			// The TRACK lookup opens the request and the SUBSCRIBE joins it, so its options land after.
 			const check = (subscription = producer.subscription.peek()) => {
-				if (subscription?.groups?.start?.included === 1) resolveProducer?.(producer);
+				if (subscription?.ranges?.[0]?.start?.absolute === 1) resolveProducer?.(producer);
 			};
 			check();
 			producer.subscription.subscribe(check);
@@ -304,7 +304,9 @@ test("integration: lite carries a fractional maxDelay as a whole millisecond", a
 	const remote = wireOf(client).consume(Path.from("test"));
 	// A varint cannot encode 38.75, so an unrounded value fails the SUBSCRIBE outright and
 	// nothing resubscribes. The publisher must see the budget rounded up instead.
-	const subscriber = remote.track("video").subscribe({ maxDelay: Milli(38.75), groups: { start: { included: 1 } } });
+	const subscriber = remote
+		.track("video")
+		.subscribe({ maxDelay: Milli(38.75), ranges: [{ start: { absolute: 1 } }] });
 
 	// A failed subscribe never reaches the publisher, so race its closure to report the
 	// encode error rather than block until the suite times out.
@@ -316,7 +318,7 @@ test("integration: lite carries a fractional maxDelay as a whole millisecond", a
 	expect(producer.subscription.peek()?.maxDelay).toBe(Milli(39));
 
 	const updated = producer.subscription.changed();
-	subscriber.update({ maxDelay: Milli(500.25), groups: { start: { included: 1 } } });
+	subscriber.update({ maxDelay: Milli(500.25), ranges: [{ start: { absolute: 1 } }] });
 	expect((await Promise.race([updated, failed]))?.maxDelay).toBe(Milli(501));
 
 	subscriber.close();
@@ -354,7 +356,7 @@ test("integration: lite applies initial and updated group bounds", async () => {
 		.track("video")
 		.subscribe({
 			maxDelay: Milli(REPLAY_LATENCY_MS),
-			groups: { start: { included: INITIAL_START_GROUP }, end: { excluded: INITIAL_END_GROUP } },
+			ranges: [{ start: { absolute: INITIAL_START_GROUP }, end: { absolute: INITIAL_END_GROUP } }],
 		})
 		.ordered();
 	try {
@@ -366,7 +368,7 @@ test("integration: lite applies initial and updated group bounds", async () => {
 
 		subscriber.update({
 			maxDelay: Milli(REPLAY_LATENCY_MS),
-			groups: { start: { included: UPDATED_GROUP }, end: { excluded: UPDATED_END_GROUP } },
+			ranges: [{ start: { absolute: UPDATED_GROUP }, end: { absolute: UPDATED_END_GROUP } }],
 		});
 		expect(
 			(await withTimeout(pending, Nano.fromMilli(Milli(UPDATE_TIMEOUT_MS)), "updated group bound timed out"))
@@ -406,7 +408,7 @@ test("integration: lite refuses an empty requested range on open and on update",
 		// Bounds that meet cannot go on the wire: the nearest encoding inverts the range.
 		const empty = video.subscribe({
 			maxDelay: Milli(REPLAY_LATENCY_MS),
-			groups: { start: { included: 2 }, end: { excluded: 2 } },
+			ranges: [{ start: { absolute: 2 }, end: { absolute: 2 } }],
 		});
 		await expect(
 			withTimeout(empty.recvGroup(), Nano.fromMilli(Milli(TIMEOUT_MS)), "empty open never settled"),
@@ -417,18 +419,57 @@ test("integration: lite refuses an empty requested range on open and on update",
 		const live = video
 			.subscribe({
 				maxDelay: Milli(REPLAY_LATENCY_MS),
-				groups: { start: { included: 1 }, end: { excluded: 2 } },
+				ranges: [{ start: { absolute: 1 }, end: { absolute: 2 } }],
 			})
 			.ordered();
 		expect((await live.nextGroup())?.sequence).toBe(1);
 		live.update({
 			maxDelay: Milli(REPLAY_LATENCY_MS),
-			groups: { start: { included: 3 }, end: { excluded: 3 } },
+			ranges: [{ start: { absolute: 3 }, end: { absolute: 3 } }],
 		});
 		await expect(
 			withTimeout(live.nextGroup(), Nano.fromMilli(Milli(TIMEOUT_MS)), "empty update never settled"),
 		).rejects.toThrow("empty subscription range cannot be encoded");
 		live.close();
+	} finally {
+		remote.close();
+		broadcast.close();
+		client.abort();
+		server.abort();
+	}
+});
+
+// Lite-07 carries every range, so a sparse request counting back from the latest group delivers
+// just its groups, and the publisher ends it once they are accounted for.
+test("integration: lite-07 serves sparse and relative ranges", async () => {
+	const pair = createMockTransportPair(Lite.ALPN_07_WIP);
+	const origin = new OriginProducer();
+	const [client, server] = await Promise.all([
+		connect(url, { transport: pair.client }),
+		accept(pair.server, url, { publish: origin.consume() }),
+	]);
+
+	const broadcast = publish(origin, Path.from("test"));
+	const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
+	for (let sequence = 0; sequence < 10; sequence++) producer.appendGroup().finish();
+
+	const remote = wireOf(client).consume(Path.from("test"));
+	try {
+		const reader = remote
+			.track("video")
+			.subscribe({
+				maxDelay: null,
+				order: "ascending",
+				ranges: [
+					{ start: { absolute: 1 }, end: { absolute: 3 } },
+					{ start: { relative: 2 }, end: { absolute: 9 } },
+				],
+			})
+			.ordered();
+		const got: number[] = [];
+		for (let group = await reader.nextGroup(); group; group = await reader.nextGroup()) got.push(group.sequence);
+		expect(got).toEqual([1, 2, 7, 8]);
+		reader.close();
 	} finally {
 		remote.close();
 		broadcast.close();
