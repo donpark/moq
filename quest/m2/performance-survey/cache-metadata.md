@@ -20,8 +20,8 @@ grow/drain cycles to expose reclamation CPU, copies and allocation churn.
 Preserve arrival cursors, live-edge protection and useful cache retention.
 Correct the accounting explanation with the chosen implementation.
 
-Coordinate with [Front eviction](/quest/m1/unbounded-groups/front-eviction.md) if
-its representation has changed. Land the benchmark now, but any shrink of the
+Account for the frames front eviction holds below a group's log
+(`GroupState::below` in `model/group.rs`). Land the benchmark now, but any shrink of the
 `arrival`/`evict` deques waits on
 [log adoption](/quest/m2/perf/kio-channel-contention/log-adoption.md)'s verdict,
 since that quest may move `TrackState` arrival order onto the kio log.

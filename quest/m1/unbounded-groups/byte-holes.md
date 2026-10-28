@@ -16,7 +16,7 @@ version (lite-07-wip today); the lite-07 cut does not wait on it. This follows
 whichever wip is current when they land, and its Required list is not a
 closed freeze set. If lite-07 is cut first, the offset goes on the next wip
 and lite-07 peers refill only at frame boundaries, like older lite versions.
-This waits only on Front eviction and stays in m1.
+It builds on plain-group front eviction and stays in m1.
 
 - Segments are `frame::SEGMENT` (1 MiB) long, so segment `i` always holds
   bytes from `i * SEGMENT`, and a completed chain is `frame::Payload::Chain`.
@@ -55,7 +55,3 @@ This waits only on Front eviction and stays in m1.
 Public API: `Position` gains a byte field, frames gain a chunked read, and
 `MAX_CACHE_BYTES` is removed.
 Wire: a byte offset on the current lite wip's range ends and group header.
-
-## Required
-
-- [Front eviction](/quest/m1/unbounded-groups/front-eviction.md) - run-based group state and in-place refill

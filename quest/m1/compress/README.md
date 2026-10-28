@@ -85,4 +85,4 @@ This README owns the end-to-end proof and the guide once every child lands:
 
 ## Related
 
-- [Front eviction](/quest/m1/unbounded-groups/front-eviction.md) - a compressed group's evicted prefix must refill before a reader can inflate past it
+- [Compressed front eviction](/quest/m1/unbounded-groups/compressed-eviction.md) - a compressed group's evicted prefix must refill before a reader can inflate past it

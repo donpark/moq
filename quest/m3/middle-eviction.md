@@ -19,8 +19,8 @@ only its front, from a base that only advances, plus refilled runs below it.
 So a kept head moves into a run below the base before the base advances past
 the middle, rather than splitting the tail.
 
-- This reuses the storage and refill from
-  [Front eviction](/quest/m1/unbounded-groups/front-eviction.md). The new
+- This reuses front eviction's storage and refill (`GroupState::below` and
+  `Handle::adopt_refill` in `model/group.rs`). The new
   part is choosing what to keep.
 - Decide how much head to keep from what a join needs (e.g. the first frame,
   or what a fast join reads), not from a fixed constant. Within a group,
@@ -30,7 +30,3 @@ the middle, rather than splitting the tail.
   cached head with no upstream request, and a live reader is unaffected.
 
 Public API: none beyond Front eviction. Wire: none.
-
-## Required
-
-- [Front eviction](/quest/m1/unbounded-groups/front-eviction.md) - run-based group state and in-place refill

@@ -19,7 +19,7 @@ Decided 2026-10-25 (maintainer, mesh planning interview), reopening the
   the publisher or its other readers. Rejected: pacing by the slowest reader
   (TCP fanout semantics), and an opt-in flow-controlled track flag.
 - Propagate with QUIC stream flow control per hop. No new wire messages, so it
-  lands in the m1 cut beside [Front eviction](/quest/m1/unbounded-groups/front-eviction.md).
+  lands in the m1 cut beside front eviction.
   Rejected: explicit MoQ-level credit messages.
 - A reader past the window gets no new mechanism: it is an ordinary front
   eviction victim. Tracks without a fill handler, such as
@@ -42,7 +42,3 @@ record any regression.
 
 Docs: the moq-lite concept page's congestion section and the relay cache docs
 change inline.
-
-## Required
-
-- [Front eviction](/quest/m1/unbounded-groups/front-eviction.md) - the eviction this pacing bounds

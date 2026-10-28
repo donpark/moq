@@ -24,9 +24,8 @@ Group stitching across two streams drew repeated fixes:
 and its handoff (`rs/moq-net/src/ietf/subscriber.rs` about lines 273-396
 and 4712-4862) exist only because the model has one producer per group.
 
-Once [front eviction](/quest/m1/unbounded-groups/front-eviction.md) lets a
-group be refilled in place, the head is a refill of the group's leading
-hole, which also keeps a tail whose head never arrives, as the headless
+Front eviction lets a group be refilled in place (`Handle::adopt_refill` in
+`model/group.rs`), so the head is a refill of the group's leading hole, which also keeps a tail whose head never arrives, as the headless
 group quest decided. Joining at the next group instead was considered and
 rejected: it costs a GOP of startup and drops objects already received.
 
@@ -34,5 +33,4 @@ Public API: none. Wire: none.
 
 ## Required
 
-- [Front eviction](/quest/m1/unbounded-groups/front-eviction.md) - in-place refill of a group's holes
 - [moq-transport requests end through one lease](/quest/m2/ietf-request-lease.md) - restructures the same files first

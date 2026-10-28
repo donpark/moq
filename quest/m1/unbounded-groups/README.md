@@ -36,8 +36,8 @@ edge is paced by its fastest reader (decided 2026-10-25, superseding
 2026-10-24's "never paced by readers"; see
 [Fastest-reader pacing](/quest/m1/unbounded-groups/fastest-reader.md)), so a
 byte stream over MoQ loses nothing to a reader that keeps up. Groups are bounded by bytes, with each
-frame's slot charged to the pool. Details are in
-[Front eviction](/quest/m1/unbounded-groups/front-eviction.md).
+frame's slot charged to the pool. Plain groups
+shed and refill this way (`GroupState::shed` in `model/group.rs`).
 
 Decided 2026-10-16 (maintainer interview):
 
@@ -73,7 +73,7 @@ Decided 2026-10-16 (maintainer interview):
   the lock-free append-only log (`kio::log`) is the
   tail run, from a base that only advances, and refilled runs sit below it.
   It landed in [moq-dev/moq#6782](https://github.com/moq-dev/moq/pull/6782)
-  (d854bf98b1), ahead of Front eviction, including `log::Writer::evict`
+  (d854bf98b1), ahead of front eviction, including `log::Writer::evict`
   advancing the base (`rs/kio/src/log.rs`). A ring buffer was rejected: an
   uncapped group has no size to give it. Numbers are in #6782 and the
   [kio contention epic](/quest/m2/perf/kio-channel-contention/README.md).
@@ -112,7 +112,9 @@ moq-transport, with memory held near the pool size.
 
 ## Required
 
-- [Front eviction](/quest/m1/unbounded-groups/front-eviction.md) - groups shed whole frames from their front under pressure and refill them in place; the group caps go
+- [Compressed front eviction](/quest/m1/unbounded-groups/compressed-eviction.md) - a compressed group sheds its front and refills its prefix before inflating; its 32 MiB budget goes
+- [Head refill](/quest/m1/unbounded-groups/head-refill.md) - a live group's fetched head refills it in place, replacing `Slot.head`
+- [Refill runs](/quest/m1/unbounded-groups/refill-runs.md) - a hole far longer than the pool refills without refetching its shed tail
 - [Fastest-reader pacing](/quest/m1/unbounded-groups/fastest-reader.md) - every hop buffers at most a window past its fastest reader and pushes back through QUIC flow control
 - [Byte holes](/quest/m1/unbounded-groups/byte-holes.md) - segments inside a frame evict and refill by `(frame, byte)` on the current lite wip; the frame cap goes
 - [JS unbounded groups](/quest/m1/unbounded-groups/js.md) - `@moq/net` drops its caps and matches front eviction
