@@ -352,3 +352,75 @@ fn consumer_without_an_epoch_is_refused() {
 	let result = broadcast::Consumer::new(inner, SecretKey::generate().public(), path);
 	assert!(matches!(result, Err(Error::Epoch)));
 }
+
+/// Runs `test/interop/sign.ts` with a JSON argument, returning its JSON stdout.
+fn bun(input: Value) -> Value {
+	let output = std::process::Command::new("bun")
+		.arg(format!("{}/../../test/interop/sign.ts", env!("CARGO_MANIFEST_DIR")))
+		.arg(input.to_string())
+		.output()
+		.expect("Bun must be installed for the interop tests");
+	assert!(
+		output.status.success(),
+		"sign.ts failed: {}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// Rust-signed groups verify in JS and a relocated one does not; JS-signed groups verify in Rust.
+#[test]
+#[ignore = "requires Bun; run by just test interop"]
+fn sign_interop() {
+	let mut seed = Zeroizing::new([0u8; 32]);
+	aws_lc_rs::rand::fill(seed.as_mut()).unwrap();
+	let key = SecretKey::from_seed(seed.clone());
+	let path = moq_net::Path::new(&format!("mesh/{}/agent", key.public())).unwrap();
+	let epoch = moq_net::Epoch::mint();
+
+	let payloads: [&[u8]; 3] = [b"zero", b"", &[0xff; 300]];
+	let expected: Vec<String> = payloads.iter().map(hex::encode).collect();
+	// A group's bodies as Rust signs them at `signed_as`, delivered at `group`.
+	let sign_group = |group: u64, signed_as: u64| {
+		let scope = Scope::new(&path, &epoch, "video");
+		let bodies: Vec<String> = payloads
+			.iter()
+			.enumerate()
+			.map(|(frame, payload)| hex::encode(scope.sign(&key, signed_as, frame as u64, payload)))
+			.collect();
+		serde_json::json!({ "track": "video", "group": group, "bodies": bodies })
+	};
+
+	let output = bun(serde_json::json!({
+		"seed": hex::encode(seed.as_ref()),
+		"path": path.as_str(),
+		"epoch": epoch.as_str(),
+		"rust": [sign_group(7, 7), sign_group(8, 7)],
+		"payloads": [expected, ["6a73"]],
+	}));
+
+	assert_eq!(output["public"], key.public().to_string());
+	assert_eq!(output["verified"][0], serde_json::json!(expected));
+	assert_eq!(output["verified"][1], "signature");
+
+	let js_epoch = output["epoch"].as_str().unwrap().parse().unwrap();
+	let groups = output["js"].as_array().unwrap();
+	assert_eq!(groups.len(), 2);
+	for (row, payloads) in groups.iter().zip([expected, vec!["6a73".to_string()]]) {
+		let scope = Scope::new(&path, &js_epoch, row["track"].as_str().unwrap());
+		let group = row["group"].as_u64().unwrap();
+		let bodies = row["bodies"].as_array().unwrap();
+		let opened: Vec<String> = bodies
+			.iter()
+			.enumerate()
+			.map(|(frame, body)| {
+				let opened = scope.verify(&key.public(), group, frame as u64, Bytes::from(hex(body)));
+				hex::encode(opened.unwrap())
+			})
+			.collect();
+		assert_eq!(opened, payloads);
+		// The same body does not verify at the neighboring group.
+		let relocated = scope.verify(&key.public(), group + 1, 0, Bytes::from(hex(&bodies[0])));
+		assert!(matches!(relocated, Err(Error::Signature)));
+	}
+}
