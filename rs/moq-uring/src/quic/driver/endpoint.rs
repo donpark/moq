@@ -202,8 +202,8 @@ impl Drop for Endpoint {
 		// Nobody will ever claim the queued connections; close them rather
 		// than leaving their drivers to idle out.
 		if let Some(accepting) = self.inner.accepting.borrow_mut().as_mut() {
-			for mut conn in accepting.queue.drain(..) {
-				web_transport_trait::poll::Session::close(&mut conn, 0, "endpoint closed");
+			for conn in accepting.queue.drain(..) {
+				conn.close_code(0, "endpoint closed");
 			}
 		}
 		self.inner.task_waiters.borrow_mut().wake();
@@ -385,7 +385,7 @@ impl Inner {
 		self.owner.spawn(async move {
 			let outcome = connection::establish(shared, deadline).await;
 			inner.pending.set(inner.pending.get() - 1);
-			let mut conn = match outcome {
+			let conn = match outcome {
 				Ok(conn) => conn,
 				Err(err) => {
 					tracing::debug!(%err, "incoming handshake failed");
@@ -394,7 +394,7 @@ impl Inner {
 			};
 			// The last handle may have left while we handshook; see Drop.
 			if inner.handles.get() == 0 {
-				web_transport_trait::poll::Session::close(&mut conn, 0, "endpoint closed");
+				conn.close_code(0, "endpoint closed");
 				return;
 			}
 			{
