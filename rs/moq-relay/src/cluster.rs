@@ -1579,14 +1579,12 @@ impl Cluster {
 
 		let addrs = moq_tokio::Addrs::collect(urls).context("peer advertised no reachable address")?;
 
-		let base_backoff = tokio::time::Duration::from_secs(1);
-		let max_backoff = tokio::time::Duration::from_secs(300);
 		// Sessions shorter than this are treated as churn: we keep backing off
 		// instead of resetting, otherwise a peer that rejects us instantly would
 		// turn into a tight reconnect loop.
-		let stable_threshold = tokio::time::Duration::from_secs(10);
+		let stable_threshold = std::time::Duration::from_secs(10);
 
-		let mut backoff = base_backoff;
+		let mut redial = Redial::default();
 
 		loop {
 			let started = tokio::time::Instant::now();
@@ -1596,18 +1594,13 @@ impl Cluster {
 			let elapsed = started.elapsed();
 
 			match result {
-				Ok(()) if elapsed >= stable_threshold => backoff = base_backoff,
-				Ok(()) => {
-					tracing::warn!(?elapsed, "cluster peer session closed cleanly but quickly; backing off");
-					backoff = (backoff * 2).min(max_backoff);
-				}
-				Err(err) => {
-					tracing::warn!(%err, "cluster peer error; will retry");
-					backoff = (backoff * 2).min(max_backoff);
-				}
+				Ok(()) if elapsed >= stable_threshold => redial = Redial::default(),
+				Ok(()) => tracing::warn!(?elapsed, "cluster peer session closed cleanly but quickly; backing off"),
+				Err(err) => tracing::warn!(%err, "cluster peer error; will retry"),
 			}
 
-			tokio::time::sleep(backoff).await;
+			let wait = redial.next(&mut rand::rng());
+			tokio::time::sleep(wait).await;
 		}
 	}
 
@@ -1672,7 +1665,16 @@ impl Cluster {
 		// relay's own upstream dial, and a cluster peer link that stopped following
 		// GOAWAY would break rolling handoff, redialing the drained URL after the
 		// old session finally closed instead of migrating to the replacement.
-		let mut reconnect = client.with_reconnect(true).connect(addrs.clone());
+		//
+		// A GOAWAY naming no URI is a relay draining to restart. A peer URL names
+		// that one node, so a redial would only reach the draining process again
+		// and replay both announce tables there for the rest of its window. Its
+		// routes are already re-priced to the maximum, so the session serves on
+		// until the node closes it, and the redial after that finds the replacement.
+		let mut reconnect = client
+			.with_reconnect(true)
+			.with_restart(moq_tokio::Restart::Wait)
+			.connect(addrs.clone());
 		let mut connection = None;
 		loop {
 			match reconnect.status().await? {
@@ -1890,6 +1892,33 @@ pub(crate) fn canonicalize_peer_key(peer: &str) -> String {
 	}
 }
 
+/// The wait between dials of one cluster peer: exponential with full jitter, so a
+/// mesh recovering from one outage spreads its redials instead of sending them in
+/// lockstep, and capped low enough that a peer back from a long outage is picked
+/// up within tens of seconds.
+struct Redial {
+	/// The longest the next wait may be.
+	ceiling: std::time::Duration,
+}
+
+impl Redial {
+	const FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+	const CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+	/// A wait drawn uniformly below the ceiling, which then doubles up to [`Self::CAP`].
+	fn next(&mut self, rng: &mut impl rand::RngExt) -> std::time::Duration {
+		let wait = self.ceiling.mul_f64(rng.random());
+		self.ceiling = (self.ceiling * 2).min(Self::CAP);
+		wait
+	}
+}
+
+impl Default for Redial {
+	fn default() -> Self {
+		Self { ceiling: Self::FIRST }
+	}
+}
+
 /// Deserialize a field that accepts either a TOML boolean or string into an
 /// `Option<String>` (booleans become `"true"` / `"false"`). Lets the removed
 /// `cluster.mesh` parse in both its released forms, `mesh = true` and
@@ -2022,6 +2051,28 @@ mod tests {
 			 the publish task stopped while the cluster kept serving"
 		);
 		drop(broadcast);
+	}
+
+	/// Each wait is drawn across the whole range below a ceiling that doubles to the
+	/// cap, so peers that failed together spread out instead of redialing in step.
+	#[test]
+	fn redial_waits_spread_below_a_doubling_capped_ceiling() {
+		use rand::SeedableRng;
+		let mut rng = rand::rngs::StdRng::seed_from_u64(0x7265_6469_616c);
+		let ceilings = [1, 2, 4, 8, 16, 30, 30].map(std::time::Duration::from_secs);
+		let mut redials: Vec<Redial> = (0..1000).map(|_| Redial::default()).collect();
+		for ceiling in ceilings {
+			let waits: Vec<_> = redials.iter_mut().map(|redial| redial.next(&mut rng)).collect();
+			assert!(waits.iter().all(|wait| *wait <= ceiling), "a wait passed {ceiling:?}");
+			// Uniform over the range: every tenth of it is hit, so none is a lockstep.
+			for tenth in 0..10 {
+				let (low, high) = (ceiling * tenth / 10, ceiling * (tenth + 1) / 10);
+				assert!(
+					waits.iter().any(|wait| (low..high).contains(wait)),
+					"no wait in {low:?}..{high:?} below {ceiling:?}"
+				);
+			}
+		}
 	}
 
 	/// `?cost=` is read and stripped (it rides SETUP, not the URL), other
