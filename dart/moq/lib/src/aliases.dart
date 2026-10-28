@@ -3,7 +3,8 @@ import 'package:moq_ffi/moq_ffi.dart';
 // Re-export the UniFFI types without their `Moq` prefix, so consumers spell
 // them the way the Rust API does. These are type aliases, not wrappers: the
 // values are the exact same objects, so every generated method applies
-// unchanged and the prefixed names stay valid.
+// unchanged and the prefixed names stay valid. `Subscription` is the one
+// subclass, since only Dart code can give its `maxDelay` a duration default.
 //
 // Four types are deliberately not aliased, because the unprefixed name is
 // already taken where this package is used:
@@ -124,7 +125,18 @@ typedef Datagram = MoqDatagram;
 typedef Frame = MoqFrame;
 
 /// Tunes how a track subscription is delivered: priority, latency budget, ranges, and group ordering.
-typedef Subscription = MoqSubscription;
+///
+/// [maxDelay] defaults to zero, skipping a superseded group at once; pass null for no
+/// subscriber limit, leaving the publisher's max age alone to bound it.
+class Subscription extends MoqSubscription {
+  /// A subscription with moq-net's defaults for every field left out.
+  Subscription({
+    super.priority,
+    super.maxDelay = Duration.zero,
+    super.ranges,
+    super.order,
+  });
+}
 
 /// A span of a track to deliver: from `start` up to `end`, or onward when `end` is null.
 typedef Range = MoqRange;

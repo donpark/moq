@@ -1,4 +1,4 @@
-# [S] Bindings default to zero max delay
+# [XS] Bindings default to zero max delay
 
 ## Goal
 
@@ -13,34 +13,26 @@ Decided 2026-10-27 (maintainer), from an external release-to-main audit
 that found the regression in Dart; it reaches every binding that exposes
 the generated record directly.
 
-- Release generated `MoqSubscription(maxAgeUs: 0)`. Today
-  `MoqSubscription.max_delay` is `Option<Duration>` with no UniFFI default,
-  because UniFFI cannot spell a duration literal
-  (`rs/moq-ffi/src/consumer.rs`), so a bare constructor sends `None`. moq-net
-  reads `None` as a `Duration::MAX` budget
-  (`rs/moq-net/src/model/subscription.rs`), while its own
-  `Subscription::default()` is `Some(Duration::ZERO)`. An unchanged
-  `Subscription()` therefore compiles and silently trades latency for
-  delivery of every retained superseded group.
-- Keep both meanings: zero is the default, `None` is no subscriber limit.
-  Rejected: making `None` the default everywhere, since it changes Rust and
-  JS live readers too and adds latency after congestion.
-- Python already wraps the record with `max_delay = timedelta(0)`
-  (`py/moq-rs/moq/_records.py`); follow it. Dart
-  (`dart/moq/lib/src/aliases.dart`), Swift (`swift/Sources/Moq/Aliases.swift`),
-  and Kotlin (`kt/moq/src/jvmAndAndroidMain/kotlin/dev/moq/Aliases.kt`)
-  alias the generated record, so each gets a hand-written `Subscription`
-  whose default is zero. Go's `Subscription` (`go/wrapper/records.go`) is a
-  struct whose zero value leaves `MaxDelay` nil; pick a Go shape whose zero
-  value means zero delay and name the no-limit spelling, and raise that
-  shape in the PR as the API decision. Check C++ aggregate initialization
-  in `cpp/moq` and the `moq-c` subscription the same way.
-- Audit the other binding records whose `max_delay` mirrors a moq-net
-  default (fetch options, decoder outputs) against release and fix any that
-  drifted the same way.
-- Test that each wrapper's no-argument subscription reaches moq-net as
-  `Some(0)`.
+`MoqSubscription.max_delay` is `Option<Duration>` with no UniFFI default,
+because UniFFI cannot spell a duration literal (`uniffi_meta` refuses an
+integer default on a `Duration` field), so a bare generated record carries
+`None`, which moq-net reads as a `Duration::MAX` budget, while its own
+`Subscription::default()` is `Some(Duration::ZERO)`.
 
-Public API: breaking for Dart, Swift, Kotlin, and Go, whose `Subscription`
-changes type or default; the Impact bullet says a reader that wants no
-subscriber limit now passes it explicitly. Wire: none.
+Python already wrapped the record with a zero default. Dart (a `Subscription`
+subclass), Swift and Kotlin (an initializer or factory without `maxDelay`),
+and Go (`MaxDelay time.Duration` with a `NoMaxDelay` sentinel) now default
+to zero too. The other `max_delay` records (fetch options, decoder outputs)
+match their moq-net and moq-mux defaults.
+
+Remaining: the generated-only C++ (`cpp/moq`) and C (`c/moq`) packages.
+`moq::Subscription{}` and `moq_subscription_default()` leave `max_delay`
+unset, so they still mean no subscriber limit. Those packages hand-write
+nothing by design, so the fix needs a maintainer call: document that
+`max_delay` must be set there, teach the `kixelated/uniffi-bindgen-cpp`
+fork a per-field default, or land a duration default literal in UniFFI
+itself, which would also let the other wrappers drop their hand-written
+defaults.
+
+Public API: breaking for Dart and Go, whose `Subscription` changes type or
+default; additive for Swift and Kotlin. Wire: none.

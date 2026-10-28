@@ -105,6 +105,14 @@ typealias AnnounceRoute = uniffi.moq.MoqAnnounceRoute
 typealias Route = uniffi.moq.MoqRoute
 /** Tunes how a track subscription is delivered: priority, latency budget, ranges, and group ordering. */
 typealias Subscription = uniffi.moq.MoqSubscription
+
+/**
+ * A [Subscription] whose `maxDelay` is zero, skipping a superseded group at once. The
+ * generated record has no duration default, so pass `maxDelay` to it for any other budget,
+ * or null for no subscriber limit, leaving the publisher's max age alone to bound it.
+ */
+fun Subscription(priority: Byte = 0, ranges: List<Range>? = null, order: Order? = null): Subscription =
+    Subscription(priority, java.time.Duration.ZERO, ranges, order)
 /** A span of a track to deliver: from `start` up to `end`, or onward when `end` is null. */
 typealias Range = uniffi.moq.MoqRange
 /** Where one end of a [Range] falls: [AnchorAbsolute], [AnchorRelative], or [AnchorTime]. */

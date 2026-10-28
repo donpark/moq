@@ -126,4 +126,12 @@ extension Subscription {
     public typealias Anchor = MoqFFI.MoqAnchor
     /// Which pending group the publisher sends first: `.ascending` or `.descending`.
     public typealias Order = MoqFFI.MoqOrder
+
+    /// A subscription whose `maxDelay` is zero, skipping a superseded group at once. The
+    /// generated initializer has no duration default, so pass `maxDelay:` to it for any
+    /// other budget, or `nil` for no subscriber limit, leaving the publisher's max age
+    /// alone to bound it.
+    public init(priority: Int8 = 0, ranges: [Range]? = nil, order: Order? = nil) {
+        self.init(priority: priority, maxDelay: 0, ranges: ranges, order: order)
+    }
 }

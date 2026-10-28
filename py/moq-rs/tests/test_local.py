@@ -458,6 +458,12 @@ def test_track_info_keeps_native_default_priority():
     assert moq.TrackInfo(timescale=90_000)._ffi().priority == native
 
 
+def test_bare_subscription_skips_superseded_groups_at_once():
+    """moq-ffi's record has no duration default, so the wrapper supplies moq-net's zero."""
+    assert moq.Subscription()._ffi().max_delay == timedelta(0)
+    assert moq.Subscription(max_delay=None)._ffi().max_delay is None
+
+
 def test_string_sequences_refuse_a_bare_string():
     """A bare str would split into characters, so the config refuses it up front."""
     with pytest.raises(TypeError, match="roots"):

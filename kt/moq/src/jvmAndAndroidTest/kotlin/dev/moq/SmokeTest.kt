@@ -280,6 +280,12 @@ class SmokeTest {
     }
 
     @Test
+    fun `a bare subscription skips superseded groups at once`() {
+        assertEquals(java.time.Duration.ZERO, Subscription().maxDelay)
+        assertNull(Subscription(maxDelay = null).maxDelay)
+    }
+
+    @Test
     fun `an ascending subscription reads a cached backlog oldest first`() = runTest {
         BroadcastProducer().use { broadcast ->
             val track = broadcast.publishTrack("backlog", TrackInfo(timescale = 1_000_000uL))

@@ -62,15 +62,19 @@ func datagramFromFFI(d *ffi.MoqDatagram) *Datagram {
 	return &Datagram{Sequence: d.Sequence, Timestamp: optFromMicros(d.TimestampUs), Payload: d.Payload}
 }
 
+// NoMaxDelay as a Subscription's MaxDelay sets no subscriber limit, leaving the
+// publisher's max age alone to bound how stale a group may get.
+const NoMaxDelay = time.Duration(math.MaxInt64)
+
 // Subscription holds subscriber-side delivery preferences: priority, the max delay
-// a non-latest group may fall behind before it is skipped (zero skips at once, nil
-// leaves the publisher's max age alone to bound it, and it caps every range), the
-// ranges of the track to deliver (nil for everything MaxDelay still allows, while an
-// empty non-nil slice asks for nothing), and the order the publisher sends pending
-// groups in (nil for newest first).
+// a non-latest group may fall behind before it is skipped (the zero value skips at
+// once, NoMaxDelay leaves the publisher's max age alone to bound it, and it caps every
+// range), the ranges of the track to deliver (nil for everything MaxDelay still allows,
+// while an empty non-nil slice asks for nothing), and the order the publisher sends
+// pending groups in (nil for newest first).
 type Subscription struct {
 	Priority int8
-	MaxDelay *time.Duration
+	MaxDelay time.Duration
 	Ranges   []Range
 	Order    *Order
 }
@@ -80,12 +84,16 @@ func (s Subscription) ffi() (ffi.MoqSubscription, error) {
 	if s.Ranges != nil {
 		ranges = &s.Ranges
 	}
+	var maxDelay *time.Duration
+	if s.MaxDelay != NoMaxDelay {
+		maxDelay = &s.MaxDelay
+	}
 	return ffi.MoqSubscription{
 		Priority: s.Priority,
-		MaxDelay: s.MaxDelay,
+		MaxDelay: maxDelay,
 		Ranges:   ranges,
 		Order:    s.Order,
-	}, bridge.NonNegative(s.MaxDelay, "max delay")
+	}, bridge.NonNegative(maxDelay, "max delay")
 }
 
 func subscriptionFFI(s *Subscription) (*ffi.MoqSubscription, error) {

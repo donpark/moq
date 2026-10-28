@@ -25,3 +25,29 @@ func TestFromMicrosSaturates(t *testing.T) {
 		}
 	}
 }
+
+// The zero Subscription skips superseded groups at once, as moq-net's default does, and
+// only NoMaxDelay asks for no subscriber limit.
+func TestSubscriptionMaxDelay(t *testing.T) {
+	cases := []struct {
+		name string
+		in   time.Duration
+		want *time.Duration
+	}{
+		{name: "zero value", in: 0, want: new(time.Duration)},
+		{name: "budget", in: time.Second, want: ptr(time.Second)},
+		{name: "no limit", in: NoMaxDelay, want: nil},
+	}
+	for _, c := range cases {
+		got, err := Subscription{MaxDelay: c.in}.ffi()
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if (got.MaxDelay == nil) != (c.want == nil) || (got.MaxDelay != nil && *got.MaxDelay != *c.want) {
+			t.Errorf("%s: MaxDelay = %v, want %v", c.name, got.MaxDelay, c.want)
+		}
+	}
+	if _, err := (Subscription{MaxDelay: -time.Millisecond}).ffi(); err == nil {
+		t.Error("a negative max delay was accepted, want an error")
+	}
+}
