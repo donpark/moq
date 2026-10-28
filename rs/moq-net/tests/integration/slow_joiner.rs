@@ -94,7 +94,7 @@ async fn a_stalled_reader_keeps_every_group_its_budget_covers() {
 }
 
 /// The stall backs up the relay: with a budget shorter than it, the groups that waited for
-/// credit past the budget are skipped. Group 0 took the only credit before the stall.
+/// credit past the budget are skipped. Group 0 took the one free credit as the stall began.
 #[moq_clock::test]
 async fn a_budget_shorter_than_the_stall_skips_what_waited_past_it() {
 	for version in VERSIONS {
