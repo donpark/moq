@@ -201,16 +201,26 @@ struct Copy {
 	_broadcast: broadcast::Producer,
 	/// Fetches of groups the copy lacks, which the route forwards to the publisher.
 	fills: track::Requests,
-	/// Frames written per group, with the writer while the group is open.
-	groups: BTreeMap<u64, (usize, Option<group::Producer>)>,
+	/// The cached copies of each group: the live feed's, and any a fetch for its tail filled.
+	groups: BTreeMap<u64, Vec<Part>>,
 	given_up: BTreeSet<u64>,
 }
 
+/// One cached copy of a group, from frame `from`.
+struct Part {
+	from: usize,
+	/// One past the last frame written.
+	written: usize,
+	/// While the copy is open.
+	writer: Option<group::Producer>,
+}
+
 impl Copy {
+	/// Whether the route holds every frame of `group`.
 	fn complete(&self, group: u64) -> bool {
 		self.groups
 			.get(&group)
-			.is_some_and(|(written, _)| *written == frames(group))
+			.is_some_and(|parts| parts.iter().any(|part| part.from == 0 && part.written == frames(group)))
 	}
 }
 
@@ -283,7 +293,7 @@ struct Reader {
 	/// from there, so a group below it that lands only afterwards may be lost.
 	resumed: Option<u64>,
 	end: Option<Result<(), Error>>,
-	/// What every live route carried in full when the track ended cleanly.
+	/// What every live route carried in full, in range, when the track ended cleanly.
 	carried: BTreeSet<u64>,
 }
 
@@ -359,8 +369,8 @@ impl Model {
 					return Ok(());
 				};
 				copy.serving.abort();
-				for (_, (_, writer)) in copy.groups {
-					if let Some(writer) = writer {
+				for part in copy.groups.into_values().flatten() {
+					if let Some(writer) = part.writer {
 						let _ = writer.abort(route_failure());
 					}
 				}
@@ -396,12 +406,13 @@ impl Model {
 				if copy.complete(group) || !copy.given_up.insert(group) {
 					return Ok(());
 				}
-				match copy.groups.get_mut(&group).and_then(|(_, writer)| writer.take()) {
-					Some(writer) => {
-						let _ = writer.abort(Error::Stream(GIVE_UP));
+				match copy.groups.get_mut(&group) {
+					Some(parts) => {
+						for writer in parts.iter_mut().filter_map(|part| part.writer.take()) {
+							let _ = writer.abort(Error::Stream(GIVE_UP));
+						}
 					}
-					None if !copy.groups.contains_key(&group) => copy.track.drop_groups(group..group + 1, GIVE_UP),
-					None => {}
+					None => copy.track.drop_groups(group..group + 1, GIVE_UP),
 				}
 				instance.given_up.insert(group);
 			}
@@ -474,36 +485,52 @@ impl Model {
 		});
 	}
 
+	/// The route's live feed brings up to `more` frames of `group` past what it holds.
 	fn write(&mut self, epoch: usize, slot: usize, group: u64, more: usize) {
+		let Some(copy) = &mut self.instances[epoch].routes[slot] else {
+			return;
+		};
+		if copy.given_up.contains(&group) {
+			return;
+		}
+		let parts = copy.groups.entry(group).or_default();
+		if !parts.iter().any(|part| part.from == 0)
+			&& let Ok(writer) = copy.track.create_group(group::Info { sequence: group })
+		{
+			parts.push(Part {
+				from: 0,
+				written: 0,
+				writer: Some(writer),
+			});
+		}
+		let held = parts.iter().map(|part| part.written).max().unwrap_or(0);
+		self.catch_up(epoch, slot, group, held.saturating_add(more));
+	}
+
+	/// Write every open copy of `group` on the route up to frame `until`.
+	fn catch_up(&mut self, epoch: usize, slot: usize, group: u64, until: usize) {
 		let instance = &mut self.instances[epoch];
-		let Some(copy) = &mut instance.routes[slot] else {
+		let Some(parts) = instance.routes[slot]
+			.as_mut()
+			.and_then(|copy| copy.groups.get_mut(&group))
+		else {
 			return;
 		};
-		if copy.given_up.contains(&group) || copy.complete(group) {
-			return;
+		let until = until.min(frames(group));
+		for part in parts.iter_mut() {
+			let Some(writer) = &mut part.writer else { continue };
+			while part.written < until {
+				let at = Timestamp::from_millis(group * 10 + part.written as u64).unwrap();
+				writer.write_frame(at, payload(epoch, group, part.written)).unwrap();
+				part.written += 1;
+			}
+			if part.written == frames(group) {
+				part.writer.take().unwrap().finish().unwrap();
+				instance.complete.insert(group);
+			}
+			let most = instance.written.entry(group).or_default();
+			*most = (*most).max(part.written);
 		}
-		let (written, writer) = copy.groups.entry(group).or_insert((0, None));
-		if *written == 0 && writer.is_none() {
-			let Ok(created) = copy.track.create_group(group::Info { sequence: group }) else {
-				return;
-			};
-			*writer = Some(created);
-		}
-		let Some(producer) = writer else {
-			return;
-		};
-		let until = written.saturating_add(more).min(frames(group));
-		while *written < until {
-			let at = Timestamp::from_millis(group * 10 + *written as u64).unwrap();
-			producer.write_frame(at, payload(epoch, group, *written)).unwrap();
-			*written += 1;
-		}
-		if *written == frames(group) {
-			writer.take().unwrap().finish().unwrap();
-			instance.complete.insert(group);
-		}
-		let most = instance.written.entry(group).or_default();
-		*most = (*most).max(*written);
 	}
 
 	/// Answer each route's fetches as its publisher would: with what the instance carries
@@ -523,14 +550,19 @@ impl Model {
 						let copy = instance.routes[slot].as_mut().expect("polled above");
 						let from = fill.frame_start(group) as usize;
 						let written = instance.written.get(&group).copied().unwrap_or(0);
+						let held = copy.groups.get(&group).into_iter().flatten();
 						if copy.given_up.contains(&group) {
 							fill.refuse_groups(group..group + 1, Error::Stream(GIVE_UP));
-						} else if written <= from || copy.groups.contains_key(&group) {
+						} else if written == 0 || written < from || held.into_iter().any(|part| part.from <= from) {
 							fill.refuse_groups(group..group + 1, Error::NotFound);
 						} else if let Ok(writer) = fill.accept(group, None) {
-							// The fill starts at the frame its readers want.
-							copy.groups.insert(group, (from, Some(writer)));
-							self.write(epoch, slot, group, written - from);
+							// The fill starts at the frame its readers want, which may not exist yet.
+							copy.groups.entry(group).or_default().push(Part {
+								from,
+								written: from,
+								writer: Some(writer),
+							});
+							self.catch_up(epoch, slot, group, written);
 						}
 					}
 					if end > GROUPS {
@@ -671,7 +703,7 @@ impl Model {
 					}
 					// A group landing below the end afterwards is not owed: a reader stops at it.
 					reader.carried = (0..GROUPS)
-						.filter(|group| instance.live().all(|copy| copy.complete(*group)))
+						.filter(|group| reader.covers(*group) && instance.live().all(|copy| copy.complete(*group)))
 						.collect();
 					reader.end = Some(Ok(()));
 				}
