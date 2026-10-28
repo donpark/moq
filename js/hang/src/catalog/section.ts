@@ -1,4 +1,5 @@
 import * as z from "zod/mini";
+import { u53Schema } from "./integers";
 
 /**
  * Wrap a catalog section so a value that isn't one decodes as absent rather than failing the
@@ -31,6 +32,50 @@ export function section<T extends z.ZodMiniType>(schema: T, map: string) {
 			),
 		]),
 	);
+}
+
+/**
+ * A media section's renditions, skipping each malformed one instead of refusing the catalog.
+ *
+ * A rendition this build cannot read can't be played anyway, so dropping it keeps its siblings
+ * playable, the same as a rendition with an unknown container. The map itself must be an object,
+ * so a section that isn't one is still refused. Mirrors the Rust `deserialize_renditions`.
+ *
+ * @param schema - one rendition's schema.
+ */
+export function renditions<T extends z.ZodMiniType>(schema: T) {
+	return z.pipe(
+		// Not `z.record`, which would drop an ID like `__proto__` that JSON.parse keeps as its own.
+		z.custom<Record<string, unknown>>(
+			(value) => typeof value === "object" && value !== null && !Array.isArray(value),
+		),
+		z.transform((raw) => {
+			const kept: [string, z.infer<T>][] = [];
+			for (const [id, value] of Object.entries(raw)) {
+				const result = schema.safeParse(value);
+				if (result.success) kept.push([id, result.data]);
+				else console.warn(`skipping malformed rendition ${id}: ${result.error.message}`);
+			}
+			// fromEntries defines each key as its own property, so `__proto__` stays an ID.
+			return Object.fromEntries(kept) as Record<string, z.infer<T>>;
+		}),
+	);
+}
+
+/**
+ * A nonzero count that fits in 32 bits, such as a picture dimension or sample rate. Branded `u53`
+ * like the wider counts, since every value fits there too.
+ */
+export const countSchema = u53Schema.check(z.positive(), z.lte(0xffff_ffff));
+
+/**
+ * Whether a codec string field is digits in `radix`, at most `max`. Refuses the empty field and
+ * the sign or whitespace `parseInt` alone would take. Mirrors the Rust `codec_number`.
+ */
+export function codecNumber(field: string | undefined, radix: 10 | 16, max: number): boolean {
+	if (field === undefined) return false;
+	const digits = radix === 10 ? /^[0-9]+$/ : /^[0-9a-fA-F]+$/;
+	return digits.test(field) && Number.parseInt(field, radix) <= max;
 }
 
 /**

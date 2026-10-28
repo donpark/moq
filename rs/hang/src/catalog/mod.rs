@@ -65,6 +65,69 @@ where
 	Ok(value)
 }
 
+/// Parse a codec string field of digits in `radix`, refusing the empty field, sign, and whitespace
+/// `from_str_radix` alone would take.
+pub(crate) fn codec_number<T: TryFrom<u32>>(field: &str, radix: u32) -> Result<T, crate::Error> {
+	if field.is_empty() || !field.chars().all(|c| c.is_digit(radix)) {
+		return Err(crate::Error::InvalidCodec);
+	}
+	let value = u32::from_str_radix(field, radix).map_err(|_| crate::Error::InvalidCodec)?;
+	T::try_from(value).map_err(|_| crate::Error::InvalidCodec)
+}
+
+/// Decode a struct only from a JSON object.
+///
+/// serde also reads a struct from an array of its fields in order, which would let an array section
+/// such as the retired `video: [{track, config}]` form decode as something else entirely.
+pub(crate) fn deserialize_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+	D: serde::Deserializer<'de>,
+	T: serde::de::DeserializeOwned,
+{
+	use serde::Deserialize;
+	let object = serde_json::Map::deserialize(deserializer)?;
+	serde_json::from_value(serde_json::Value::Object(object)).map_err(serde::de::Error::custom)
+}
+
+/// A media rendition config, decoded on its own so a malformed one costs only itself.
+pub(crate) trait Rendition: serde::de::DeserializeOwned {
+	/// Refuse a field out of the range its type allows.
+	fn check(&self) -> crate::Result<()>;
+}
+
+/// Decode a media section's renditions, skipping each malformed one instead of refusing the catalog.
+///
+/// A rendition this build cannot read can't be played anyway, so dropping it keeps its siblings
+/// playable, the same as a rendition with an unknown container. The map itself must decode, so a
+/// section that isn't one is still refused.
+pub(crate) fn deserialize_renditions<'de, D, T>(
+	deserializer: D,
+) -> Result<std::collections::BTreeMap<String, T>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+	T: Rendition,
+{
+	use serde::Deserialize;
+	let renditions = std::collections::BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+
+	let decode = |value: serde_json::Value| -> crate::Result<T> {
+		let config: T = deserialize_object(value)?;
+		config.check()?;
+		Ok(config)
+	};
+
+	Ok(renditions
+		.into_iter()
+		.filter_map(|(id, value)| match decode(value) {
+			Ok(config) => Some((id, config)),
+			Err(err) => {
+				tracing::warn!(%id, %err, "skipping malformed rendition");
+				None
+			}
+		})
+		.collect())
+}
+
 /// A catalog section: a map of track name to config, published under one well-known root key.
 ///
 /// The associated [`MAP`](Self::MAP) is what tells a real section apart from an application's own
