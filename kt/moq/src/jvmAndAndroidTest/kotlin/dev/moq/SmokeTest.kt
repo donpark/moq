@@ -443,8 +443,9 @@ class SmokeTest {
         assertEquals(11_111.nanoseconds, Timestamp(1uL, 90_000uL).toDuration())
         assertEquals(666_666_666.nanoseconds, Timestamp(2uL, 3uL).toDuration())
         assertEquals(0.nanoseconds, Timestamp(1uL, 2_000_000_000uL).toDuration())
-        // The sub-second remainder times a billion overflows 64 bits at the largest scale.
-        assertEquals(500.milliseconds, Timestamp((1uL shl 61) - 1uL, (1uL shl 62) - 1uL).toDuration())
+        // The sub-second remainder times a billion overflows 64 bits at the largest scale, and the
+        // result is just under half a second.
+        assertEquals(499_999_999.nanoseconds, Timestamp((1uL shl 61) - 1uL, (1uL shl 62) - 1uL).toDuration())
         assertFailsWith<IllegalArgumentException> { Timestamp((1uL shl 61) - 1uL, 1uL).toDuration() }
         assertNull(AudioEncoderOutput(codec = AudioCodec.opus()).frameDuration)
     }
