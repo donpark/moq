@@ -29,7 +29,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
-const USAGE: &str = "usage: bench [--transport tcp,tls,ws,wss] [--sessions 1,16,256] [--size 64,1024,16000] [--seconds 2]";
+const USAGE: &str =
+	"usage: bench [--transport tcp,tls,ws,wss] [--sessions 1,16,256] [--size 64,1024,16000] [--seconds 2]";
 
 #[derive(Clone, Copy, Debug)]
 enum Transport {
@@ -163,7 +164,9 @@ async fn accept(transport: Transport, tls: &Tls, socket: TcpStream) -> anyhow::R
 		}
 		Transport::Wss => {
 			socket.set_nodelay(true)?;
-			let socket = tokio_rustls::TlsAcceptor::from(tls.server.clone()).accept(socket).await?;
+			let socket = tokio_rustls::TlsAcceptor::from(tls.server.clone())
+				.accept(socket)
+				.await?;
 			qmux::ws::Server::new().accept(socket).await?
 		}
 	})
@@ -172,7 +175,11 @@ async fn accept(transport: Transport, tls: &Tls, socket: TcpStream) -> anyhow::R
 async fn connect(transport: Transport, tls: &Tls, addr: SocketAddr) -> anyhow::Result<Session> {
 	Ok(match transport {
 		Transport::Tcp => qmux::tcp::connect(addr, qmux::Config::default()).await?,
-		Transport::Tls => qmux::tls::Client::new(tls.client.clone()).connect(addr, "localhost").await?,
+		Transport::Tls => {
+			qmux::tls::Client::new(tls.client.clone())
+				.connect(addr, "localhost")
+				.await?
+		}
 		Transport::Ws => qmux::ws::Client::new().connect(&format!("ws://{addr}")).await?,
 		Transport::Wss => {
 			let connector = qmux::ws::tokio_tungstenite::Connector::Rustls(tls.client.clone());
@@ -201,7 +208,10 @@ async fn drive(mut session: Session, payload: Bytes, done: Arc<AtomicU64>) -> an
 		send.write_chunk(payload.clone()).await?;
 		echoed.clear();
 		while echoed.len() < payload.len() {
-			let chunk = recv.read_chunk(payload.len() - echoed.len()).await?.context("echo ended early")?;
+			let chunk = recv
+				.read_chunk(payload.len() - echoed.len())
+				.await?
+				.context("echo ended early")?;
 			echoed.extend_from_slice(&chunk);
 		}
 		// Checked whole, so skipped work cannot read as a speedup.
@@ -218,7 +228,13 @@ struct Sample {
 	cpu: Duration,
 }
 
-async fn measure(transport: Transport, tls: &Tls, sessions: usize, size: usize, duration: Duration) -> anyhow::Result<Sample> {
+async fn measure(
+	transport: Transport,
+	tls: &Tls,
+	sessions: usize,
+	size: usize,
+	duration: Duration,
+) -> anyhow::Result<Sample> {
 	let listener = TcpListener::bind("127.0.0.1:0").await?;
 	let addr = listener.local_addr()?;
 	// Patterned so a misordered or mixed-up echo fails the comparison.
@@ -256,7 +272,10 @@ async fn measure(transport: Transport, tls: &Tls, sessions: usize, size: usize, 
 	}
 	tasks.shutdown().await;
 	if sample.round_trips == 0 {
-		bail!("{} with {sessions} sessions of {size} B echoed nothing", transport.name());
+		bail!(
+			"{} with {sessions} sessions of {size} B echoed nothing",
+			transport.name()
+		);
 	}
 	Ok(sample)
 }
