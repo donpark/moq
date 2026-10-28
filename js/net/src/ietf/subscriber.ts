@@ -8,6 +8,7 @@ import {
 	error,
 	ProtocolViolation,
 	reason,
+	SessionCode,
 	StreamCode,
 	StreamError,
 	sessionCause,
@@ -804,7 +805,15 @@ export class Subscriber {
 			// Only one alias naming two different tracks is the session's problem. A publisher
 			// sharing an alias between subscriptions to one track is allowed to do that, and
 			// disconnecting over it would drop every other broadcast on the session.
-			if (err instanceof DuplicateTrackAlias) this.#session.close();
+			if (err instanceof DuplicateTrackAlias) {
+				// Send the violation before the session's own close sends a clean code.
+				try {
+					this.#quic?.close({ closeCode: SessionCode.ProtocolViolation, reason: err.message });
+				} catch {
+					// Already closed.
+				}
+				this.#session.close();
+			}
 			throw err;
 		}
 		state.registeredAlias = ok.trackAlias;
