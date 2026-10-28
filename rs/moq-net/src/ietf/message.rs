@@ -21,6 +21,10 @@ pub(crate) fn control(id: u64, version: Version) -> crate::stats::Control {
 	if matches!(version, Version::Draft14 | Version::Draft15) && id == SubscribeUpdate::ID {
 		return Control::Subscribe;
 	}
+	// Draft 14's SUBSCRIBE_ERROR becomes the shared REQUEST_ERROR in draft 15.
+	if version == Version::Draft14 && id == SubscribeError::ID {
+		return Control::Subscribe;
+	}
 	match id {
 		PublishNamespace::ID
 		| PublishNamespaceError::ID
@@ -145,5 +149,14 @@ mod tests {
 		for id in [super::super::RequestOk::ID, super::super::SubscribeUpdate::ID] {
 			assert_eq!(control(id, Version::Draft16), Control::Other);
 		}
+	}
+
+	/// A draft 14 subscription refusal counts as subscribe traffic, but not the
+	/// REQUEST_ERROR that reuses its type ID.
+	#[test]
+	fn draft14_subscribe_error_is_subscribe() {
+		let id = super::super::SubscribeError::ID;
+		assert_eq!(control(id, Version::Draft14), Control::Subscribe);
+		assert_eq!(control(id, Version::Draft15), Control::Other);
 	}
 }
