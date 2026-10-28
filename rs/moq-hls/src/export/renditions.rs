@@ -85,6 +85,10 @@ struct Feed {
 	targets: Vec<Weak<Rendition>>,
 	/// Each rendition's discontinuity count.
 	discontinuities: Discontinuities,
+	/// Each live playlist URI's `EXT-X-TARGETDURATION` (see [`Producer::register`]).
+	target_durations: BTreeMap<Key, u64>,
+	/// The longest duration any rendition has declared this run, in whole seconds rounded up.
+	declared: u64,
 	/// The catalog failed; late-created renditions start failed.
 	failed: Option<crate::Error>,
 	/// The estimated wall-clock time of `pts` 0, anchored when the first segment was listed
@@ -138,6 +142,8 @@ impl Producer {
 				feed: kio::Producer::new(Feed {
 					targets: Vec::new(),
 					discontinuities: Discontinuities::default(),
+					target_durations: BTreeMap::new(),
+					declared: 0,
 					failed: None,
 					anchor: None,
 					generation: None,
@@ -409,26 +415,50 @@ impl Producer {
 		.await
 	}
 
-	/// Enroll a freshly-created rendition with what its siblings share, and start following its
-	/// own records.
-	fn register(&self, rendition: &Arc<Rendition>) {
+	/// Enroll freshly created renditions with what their siblings share, and start following
+	/// their own records.
+	///
+	/// Every playlist URI keeps one `EXT-X-TARGETDURATION` for the run (RFC 8216 6.2.1), so a
+	/// reconfigured rendition's replacement keeps its predecessor's. A new one gets the longest
+	/// duration any rendition has declared this run, these included, so renditions listed together
+	/// agree. One added later that declares longer segments raises only its own target and later
+	/// ones': playlists already served never change theirs.
+	fn register(&self, added: Vec<Rendition>) -> Vec<Arc<Rendition>> {
+		// Most catalog updates only revise estimates; writing the feed would wake every cursor.
+		if added.is_empty() {
+			return Vec::new();
+		}
 		let mut feed = self
 			.fanout
 			.feed
 			.write()
 			.unwrap_or_else(|_| unreachable!("fanout is open"));
-		rendition.label(feed.generation.clone());
-		if let Some(err) = &feed.failed {
-			rendition.fail(err.clone());
-			rendition.close();
-		} else {
-			rendition.watch();
-		}
-		// Pruned here, so a catalog that keeps replacing renditions holds only the live ones. A
-		// replacement shares its predecessor's name, so its count survives.
 		let feed = &mut *feed;
+		// Before any rendition joins, while each target is still its own declared duration.
+		feed.declared = added
+			.iter()
+			.map(Rendition::target_duration)
+			.fold(feed.declared, u64::max);
+		let added: Vec<_> = added
+			.into_iter()
+			.map(|rendition| {
+				let key = (rendition.kind, rendition.name.clone());
+				let target_duration = *feed.target_durations.entry(key).or_insert(feed.declared);
+				let rendition = Arc::new(rendition.pin(target_duration));
+				rendition.label(feed.generation.clone());
+				if let Some(err) = &feed.failed {
+					rendition.fail(err.clone());
+					rendition.close();
+				} else {
+					rendition.watch();
+				}
+				feed.targets.push(Arc::downgrade(&rendition));
+				rendition
+			})
+			.collect();
+		// Pruned here, so a catalog that keeps replacing renditions holds only the live ones. A
+		// replacement shares its predecessor's name, so its count and target survive.
 		feed.targets.retain(|target| target.strong_count() > 0);
-		feed.targets.push(Arc::downgrade(rendition));
 		let live: BTreeSet<Key> = feed
 			.targets
 			.iter()
@@ -436,6 +466,8 @@ impl Producer {
 			.map(|rendition| (rendition.kind, rendition.name.clone()))
 			.collect();
 		feed.discontinuities.renditions.retain(|key, _| live.contains(key));
+		feed.target_durations.retain(|key, _| live.contains(key));
+		added
 	}
 
 	/// Reconcile the rendition set with a complete catalog snapshot. Removed or reconfigured
@@ -498,6 +530,7 @@ impl Producer {
 			}
 		}
 
+		let mut added = Vec::new();
 		for (name, video) in &catalog.video.renditions {
 			if !master::is_path_segment(name) {
 				tracing::warn!(
@@ -517,15 +550,10 @@ impl Producer {
 			let Some(hls) = video.hls.clone() else {
 				continue;
 			};
-			let rendition = match Rendition::video(name.clone(), video, source, hls, clock, self.fanout()) {
-				Ok(rendition) => Arc::new(rendition.after(handoffs.get(&key))),
-				Err(err) => {
-					tracing::warn!(rendition = name, %err, "ignoring unservable video rendition");
-					continue;
-				}
-			};
-			self.register(&rendition);
-			current.renditions.insert(key, rendition);
+			match Rendition::video(name.clone(), video, source, hls, clock, self.fanout()) {
+				Ok(rendition) => added.push(rendition.after(handoffs.get(&key))),
+				Err(err) => tracing::warn!(rendition = name, %err, "ignoring unservable video rendition"),
+			}
 		}
 		for (name, audio) in &catalog.audio.renditions {
 			if !master::is_path_segment(name) {
@@ -543,15 +571,15 @@ impl Producer {
 			let Some(hls) = audio.hls.clone() else {
 				continue;
 			};
-			let rendition = match Rendition::audio(name.clone(), audio, source, hls, clock, self.fanout()) {
-				Ok(rendition) => Arc::new(rendition.after(handoffs.get(&key))),
-				Err(err) => {
-					tracing::warn!(rendition = name, %err, "ignoring unservable audio rendition");
-					continue;
-				}
-			};
-			self.register(&rendition);
-			current.renditions.insert(key, rendition);
+			match Rendition::audio(name.clone(), audio, source, hls, clock, self.fanout()) {
+				Ok(rendition) => added.push(rendition.after(handoffs.get(&key))),
+				Err(err) => tracing::warn!(rendition = name, %err, "ignoring unservable audio rendition"),
+			}
+		}
+		for rendition in self.register(added) {
+			current
+				.renditions
+				.insert((rendition.kind, rendition.name.clone()), rendition);
 		}
 		if current.renditions.is_empty()
 			&& (!catalog.video.renditions.is_empty() || !catalog.audio.renditions.is_empty())
