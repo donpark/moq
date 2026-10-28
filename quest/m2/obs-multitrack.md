@@ -5,10 +5,10 @@
 The obs-moq output publishes OBS's native multitrack video encoders as
 simulcast renditions of one broadcast, one rendition per track, each with
 its own size and bitrate in the catalog. A user configures them the way OBS
-multitrack video is configured, including over obs-websocket. Disabling the
-top renditions as the bandwidth grant falls is
-[simulcast rung disable](/quest/m1/simulcast-rung-disable.md)'s work, not
-this quest's.
+multitrack video is configured, including over obs-websocket. The output
+already disables a rendition above a lower-bitrate encoder while its grant
+cannot fund it (`VideoInit` and `VideoData` in `cpp/obs/src/moq-output.cpp`);
+keep that working for every rendition this configures.
 
 ## Plan
 
@@ -34,6 +34,6 @@ at least two video tracks watched in `<moq-watch>`.
 
 ## Related
 
-- [Simulcast rung disable](/quest/m1/simulcast-rung-disable.md) - the grant-driven rung disable these renditions follow
+- [Simulcast rung disable](/quest/m1/simulcast-rung-disable.md) - the shaped-uplink proof of the rung disable these renditions follow
 - [MoQ in obs-studio](/quest/m2/obs-studio/README.md) - the native output this configuration carries into
 - [OBS native codecs](/quest/m2/obs-moq-video/README.md) - the encoders behind each track when MoQ encoders are chosen

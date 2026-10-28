@@ -2768,8 +2768,8 @@ async fn video_rung_sits_below_its_lower_and_disables() {
 	let named = |name: &str| MoqMediaTarget::Named {
 		name: Some(name.into()),
 	};
-	let low = MoqMediaTrackProducer::video(&broadcast, named("low"), video_init(MoqVideoFormat::Avc3, h264_init()))
-		.unwrap();
+	let low =
+		MoqMediaTrackProducer::video(&broadcast, named("low"), video_init(MoqVideoFormat::Avc3, h264_init())).unwrap();
 	let high = MoqMediaTrackProducer::video(
 		&broadcast,
 		named("high"),

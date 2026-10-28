@@ -41,7 +41,16 @@ from .publish import (
     TrackRequests,
 )
 from .server import Request, Server, Transport
-from .session import Allocator, BandwidthConsumer, GrantConsumer, Reservation, Session, Tokens
+from .session import (
+    Allocator,
+    BandwidthConsumer,
+    GrantConsumer,
+    RateControl,
+    RateTarget,
+    Reservation,
+    Session,
+    Tokens,
+)
 from .subscribe import (
     BroadcastConsumer,
     GroupConsumer,
@@ -126,6 +135,8 @@ __all__ = [
     "OriginProducer",
     "Order",
     "Range",
+    "RateControl",
+    "RateTarget",
     "Request",
     "Reservation",
     "Route",

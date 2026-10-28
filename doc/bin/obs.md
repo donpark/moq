@@ -44,6 +44,13 @@ shows the current video target beside the configured rate. An encoder shared
 with a recording follows too, so record with a separate encoder to keep the
 recording at the full rate.
 
+With several video encoders on the output, each one is a rendition, and one
+above a lower-bitrate encoder stops sending while its share of the estimate
+cannot fund it, advertised as disabled so viewers switch down. It keeps
+encoding, since OBS cannot pause one encoder of a live output, and resumes at
+that encoder's next keyframe once the estimate recovers. This needs the
+session to probe for bandwidth, which takes moq-quic with BBR3.
+
 ## Source quality and moq-transcode
 
 OBS publishes **one** rendition and does not encode a viewer ladder. When a

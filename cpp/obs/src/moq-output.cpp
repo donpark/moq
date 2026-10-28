@@ -810,8 +810,15 @@ void MoQOutput::VideoInit(obs_encoder_t *encoder)
 		obs_encoder_t *other = obs_output_get_video_encoder2(output, idx);
 		if (!other || other == encoder)
 			continue;
-		OBSDataAutoRelease other_settings = obs_encoder_get_settings(other);
-		const int kbps = other_settings ? (int)obs_data_get_int(other_settings, "bitrate") : 0;
+		// An encoder already publishing may have been retuned, so read the bitrate it
+		// was configured with.
+		int kbps = 0;
+		if (auto known = video_tracks.find(other); known != video_tracks.end()) {
+			kbps = (int)(known->second.bitrate_bps / 1000);
+		} else {
+			OBSDataAutoRelease other_settings = obs_encoder_get_settings(other);
+			kbps = other_settings ? (int)obs_data_get_int(other_settings, "bitrate") : 0;
+		}
 		if (kbps > lower_kbps && kbps < video_bitrate_kbps) {
 			lower = other;
 			lower_kbps = kbps;
@@ -854,8 +861,8 @@ void MoQOutput::VideoInit(obs_encoder_t *encoder)
 	video_tracks[encoder] = std::move(entry);
 
 	if (lower_bps)
-		LOG_INFO("Video track initialized (%ux%u, %d kbps, above a %d kbps rendition)", video_width, video_height,
-			 video_bitrate_kbps, lower_kbps);
+		LOG_INFO("Video track initialized (%ux%u, %d kbps, above a %d kbps rendition)", video_width,
+			 video_height, video_bitrate_kbps, lower_kbps);
 	else
 		LOG_INFO("Video track initialized (%ux%u, %d kbps)", video_width, video_height, video_bitrate_kbps);
 }

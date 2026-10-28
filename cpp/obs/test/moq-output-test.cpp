@@ -352,10 +352,11 @@ std::shared_ptr<moq::BroadcastConsumer> relayBroadcast(TestRelay &relay)
 }
 
 // The broadcast's first catalog `ready` accepts, by default one with video and audio.
-std::optional<moq::Catalog> relayCatalog(const std::shared_ptr<moq::BroadcastConsumer> &broadcast,
-					 std::function<bool(const moq::Catalog &)> ready = [](const moq::Catalog &catalog) {
-						 return !catalog.video.empty() && !catalog.audio.empty();
-					 })
+std::optional<moq::Catalog> relayCatalog(
+	const std::shared_ptr<moq::BroadcastConsumer> &broadcast,
+	std::function<bool(const moq::Catalog &)> ready = [](const moq::Catalog &catalog) {
+		return !catalog.video.empty() && !catalog.audio.empty();
+	})
 {
 	if (!broadcast)
 		return std::nullopt;
@@ -713,10 +714,11 @@ int main()
 			o.Data(&resumed);
 			sent += keyframe.size();
 			CHECK(o.GetTotalBytes() == sent);
-			CHECK(relayCatalog(broadcast, [&](const moq::Catalog &catalog) {
+			auto enabled = relayCatalog(broadcast, [&](const moq::Catalog &catalog) {
 				auto it = catalog.video.find(high->first);
 				return it != catalog.video.end() && it->second.enabled;
-			}).has_value());
+			});
+			CHECK(enabled.has_value());
 		}
 		o.Stop();
 	}
