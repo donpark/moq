@@ -45,6 +45,13 @@ and the bindings promote it as a top-level convenience.
   discovery is unavailable. `Producer.request`/`announced` pass-throughs stay
   only if `Table` needs them. moq.pro's five `{announced: true}` sites move
   to `follow`.
+- Read-side input (decided 2026-10-27): `@moq/watch`'s `Player` and
+  `Broadcast` take a structural read-side origin type (`closed`, `discovery`,
+  `request`, `follow`, `announced`), not `Origin.Table`, so both `Table` and
+  a read-only `Origin.Consumer` satisfy it. Today
+  `new Player({ origin: producer.consume() })` fails to type-check only
+  because `Table` also requires `createBroadcast`. Do not add an adapter or a
+  parallel player class.
 - Bindings: `request_broadcast(path, epoch)` and `announced_broadcast(path,
   epoch)` map onto the two operations under the same names as Rust, and the
   Kotlin, Dart, Go, and Python top-level shortcuts follow.

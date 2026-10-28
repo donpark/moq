@@ -74,9 +74,9 @@ connecting to only the first DNS answer, with their own congestion enum) go;
 moq-uring's tests, the bench, and moq-tokio's test use the driver's
 `connect` instead (maintainer, 2026-10-23).
 
-Out of scope: the congestion controller API, which another quest is
-redesigning (maintainer, 2026-10-23); nest whatever it lands in
-`transport::Config`.
+Out of scope: the congestion controller API (maintainer, 2026-10-23); nest
+whatever names [congestion names](/quest/m1/api-audit/congestion-names.md)
+lands in `transport::Config`.
 
 The Impact bullet says how to migrate in moq-quic, moq-tokio, moq-uring, and qmux; update
 moq-tokio's `quic::Config` resolution and moq-relay's limits.

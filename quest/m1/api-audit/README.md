@@ -79,6 +79,9 @@ Rejected in planning:
 - [One meaning for Credential](/quest/m1/api-audit/dial-credential.md) - the internal dial type gets its own name in JS and moq-tokio, and the `Presented` alias goes
 - [One strict path rule](/quest/m1/api-audit/strict-paths.md) - `Relative` refuses empty segments, `Path` refuses non-canonical escapes, the error is `path::Error`, and auth mints only strict paths
 - [Unix sockets accept through the allowlist](/quest/m1/api-audit/unix-accept.md) - the public pre-allowlist `unix::Listener::accept` becomes crate-private
+- [QMux datagrams obey or refuse their policy](/quest/m1/api-audit/qmux-datagrams.md) - `Session.datagrams` is the DOM interface, its high-water mark is live, and the inert settings throw
+- [No constructible internal handles](/quest/m1/api-audit/internal-constructors.md) - `Rendition`, `Lister`, `Arrivals`, and e2ee's generations get private constructors, and a lint rule stops new ones
+- [moq-congestion's first-publish names](/quest/m1/api-audit/congestion-names.md) - `bbr3::Config`, `cubic::Config`, `Metrics`, `Factory`, and no `into_any`
 
 ## Related
 
