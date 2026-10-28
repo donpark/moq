@@ -49,6 +49,12 @@ export function sleep(duration: Nano, options?: { signal?: AbortSignal; ref?: bo
 	return wait(clock, Instant.add(Instant(clock.now()), duration), options).promise;
 }
 
+/** Complete after a later host task, letting queued tasks run; a `Manual` clock won't advance past it. */
+export function yieldNow(): Promise<void> {
+	const clock = backend();
+	return new Promise((resolve) => clock.task(resolve));
+}
+
 /** A timeout expired before its operation completed. */
 export class Elapsed extends Error {
 	/** Build a deadline-elapsed error. */

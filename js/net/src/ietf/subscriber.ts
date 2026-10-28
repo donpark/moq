@@ -842,7 +842,10 @@ export class Subscriber {
 				if (!state.sent && !afterSetup) return;
 				torn = true;
 
-				state.stream.abort(e);
+				// A refusal already ended the request, so end ours cleanly: a reset would tell the
+				// publisher we failed.
+				if (state.rejected) state.stream.close();
+				else state.stream.abort(e);
 			};
 
 			// Tear down what is already open rather than waiting on `setup`. A peer that
