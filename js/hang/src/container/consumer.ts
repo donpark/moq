@@ -327,7 +327,9 @@ export class Consumer {
 	// the group's fault, which next() raises once the frames ahead of it are read.
 	#decode(group: Group, wire: Moq.Group.Frame): void {
 		group.empty = false;
-		const arrival = Nano.toMilli(Nano(now()));
+		// When the frame landed, not when it was decoded: a frame the max buffer left in the transport
+		// would otherwise count the consumer's own wait as network jitter.
+		const arrival = Nano.toMilli(Nano(wire.arrived ?? now()));
 
 		// A malformed payload is not loss: it ends the reader where it sits, rather than truncating the group.
 		let decoded: Frame[];

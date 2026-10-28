@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { Manual } from "@moq/clock";
+import { Manual, Milli, Nano } from "@moq/clock";
 import { Signal } from "@moq/signals";
 import { FrameTooLarge, GroupTooLarge, StreamCode, StreamError } from "./error.ts";
 import { MAX_GROUP_CACHE_BYTES, MAX_GROUP_FRAMES, Producer } from "./group.ts";
@@ -60,6 +60,64 @@ test("reordered frames keep the highest group PTS in live and later mirrors", ()
 		expect(later.tryReadFrame()?.timestamp?.asMillis()).toBe(0);
 		for (const reader of [shared, live, later]) reader.close();
 		producer.finish();
+	} finally {
+		installed.close();
+	}
+});
+
+test("a frame read late keeps the instant it landed, plain, compressed, or resumed", async () => {
+	const clock = new Manual();
+	const installed = clock.install();
+	try {
+		const plain = new Producer(0);
+		const compressed = new Producer(0);
+		// Frame 0 lands before compression binds, so the restored copy must carry its stamp too.
+		compressed.writeFrame(textFrame("a"));
+		hooks.bindGroupCompression(compressed, true);
+		const first = clock.now();
+		plain.writeFrame(textFrame("a"));
+		clock.jump(Nano.fromMilli(Milli(10)));
+		const second = clock.now();
+		plain.writeFrame(textFrame("b"));
+		compressed.writeFrame(textFrame("b"));
+		clock.jump(Nano.fromMilli(Milli(1000)));
+
+		const reader = plain.consume();
+		expect(reader.tryReadFrame()?.arrived).toBe(first);
+		expect((await reader.readFrameSequence())?.arrived).toBe(second);
+		const stored = compressed.consume();
+		expect((await hooks.readGroupFrame(stored, true))?.frame.arrived).toBe(first);
+		expect((await stored.readFrame())?.arrived).toBe(second);
+
+		// A frame written in with a stamp of its own still gets this node's.
+		const forwarded = new Producer(0);
+		forwarded.writeFrame({ payload: new Uint8Array([1]), arrived: first });
+		expect(forwarded.consume().tryReadFrame()?.arrived).toBe(clock.now());
+
+		// A resumed read takes the stamp the replacement copy holds, not when it was adopted.
+		const failing = new Producer(0);
+		const resumed = failing.mirror();
+		const replacement = new Producer(0);
+		replacement.writeFrame(textFrame("a"));
+		const landed = clock.now();
+		replacement.writeFrame(textFrame("b"));
+		hooks.recoverGroup(resumed, {
+			changed: new Signal(0),
+			wants: (failed) => failed !== undefined,
+			replace: async () => ({
+				group: replacement.mirror(),
+				expiry: { expired: () => false, changed: [] },
+				adopt: () => {},
+				discard: () => {},
+			}),
+		});
+		failing.writeFrame(textFrame("a"));
+		await resumed.readFrame();
+		clock.jump(Nano.fromMilli(Milli(1000)));
+		failing.abort(new Error("copy failed"));
+		expect((await resumed.readFrame())?.arrived).toBe(landed);
+
+		for (const producer of [plain, compressed, forwarded, replacement]) producer.finish();
 	} finally {
 		installed.close();
 	}

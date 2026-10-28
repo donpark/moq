@@ -39,6 +39,14 @@ export interface Frame {
 	 * refused with {@link TimestampMismatch}.
 	 */
 	timestamp?: Timestamp;
+	/**
+	 * When the frame landed in this node's group, on the installed clock.
+	 *
+	 * Every frame a group returns carries the instant it was written, received, or fetched
+	 * into it, so a reader judges lateness on that rather than on when it got around to
+	 * reading. A write ignores it and stamps its own.
+	 */
+	arrived?: Instant;
 }
 
 /** Options for a sequence-aware frame read. */
@@ -382,13 +390,15 @@ export class Producer {
 			this.#overflow();
 		}
 
+		const arrived = now();
+		frame = { payload: frame.payload, timestamp: frame.timestamp, arrived };
 		if (this.#state.flate) {
 			frame = this.#state.flate.push(frame, inflated);
 			if (this.#state.flate.stored > MAX_GROUP_CACHE_BYTES) {
 				this.#overflow();
 			}
 		}
-		this.#activity = now();
+		this.#activity = arrived;
 		appendFrame(this.#state, frame);
 		if (commits) {
 			this.#admits = undefined;
@@ -887,7 +897,11 @@ export class Consumer {
 		const slice = compressed ? stored(buffered) : undefined;
 		let frame: Frame;
 		try {
-			frame = { payload: slice?.payload ?? buffered.payload, timestamp: buffered.timestamp };
+			frame = {
+				payload: slice?.payload ?? buffered.payload,
+				timestamp: buffered.timestamp,
+				arrived: buffered.arrived,
+			};
 		} catch (error) {
 			this.#terminal = error instanceof Error ? error : new Error(String(error));
 			if (this.#verdict.peek() === undefined) this.#verdict.set(this.#terminal);
@@ -945,7 +959,7 @@ export class Consumer {
 		if (this.#terminal) return undefined;
 		const read = this.#readBufferedFrame();
 		if (!read) return undefined;
-		return { sequence: read.sequence, payload: read.frame.payload, timestamp: read.frame.timestamp };
+		return { sequence: read.sequence, ...read.frame };
 	}
 
 	/** Resolves once {@link readFrame} would not block. */
@@ -987,7 +1001,7 @@ export class Consumer {
 	async readFrameSequence(options?: ReadOptions): Promise<({ sequence: number } & Frame) | undefined> {
 		const read = await this.#readFrame(options?.from ?? 0);
 		if (!read) return undefined;
-		return { sequence: read.sequence, payload: read.frame.payload, timestamp: read.frame.timestamp };
+		return { sequence: read.sequence, ...read.frame };
 	}
 
 	async #readFrame(from: number, compressed = false): Promise<ReadGroupFrame | undefined> {

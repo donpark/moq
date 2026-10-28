@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import { type Micro, Milli } from "@moq/clock";
+import { Manual, type Micro, Milli, Nano } from "@moq/clock";
 import { Time, Track } from "@moq/net";
 import { Consumer, type Read } from "./consumer.ts";
 import { encodeFrame, Format } from "./legacy.ts";
@@ -202,6 +202,35 @@ test("Consumer admits reads completing together one at a time against the max bu
 	} finally {
 		consumer.close();
 		track.close();
+	}
+});
+
+test("Consumer stamps frames the max buffer held back with when they landed, not when they decoded", async () => {
+	const clock = new Manual();
+	const installed = clock.install();
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format: new Format("data"),
+		maxDelay: Milli(5_000),
+		// One group's overhead and one frame: the second frame waits in the transport until the first is read.
+		maxBuffer: 300,
+	});
+	try {
+		const group = track.createGroup(0);
+		write(group, 0);
+		await clock.advance(Nano.fromMilli(Milli(250)));
+		write(group, 10_000);
+		group.finish();
+		track.finish();
+		// The reader is slow: nothing is read until well after both frames landed.
+		await clock.advance(Nano.fromMilli(Milli(750)));
+
+		expect(await consumer.next()).toMatchObject({ kind: "frame", frame: { timestamp: 0, arrival: 0 } });
+		expect(await consumer.next()).toMatchObject({ kind: "frame", frame: { timestamp: 10_000, arrival: 250 } });
+	} finally {
+		consumer.close();
+		track.close();
+		installed.close();
 	}
 });
 
