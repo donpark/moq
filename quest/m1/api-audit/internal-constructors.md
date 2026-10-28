@@ -37,6 +37,9 @@ option):
   `just check` fails on a recurrence. If Biome cannot see the JSDoc tag,
   write a declaration test that asserts each exported class's constructor
   arity.
+- Verify against the emitted declarations, not the sources: a
+  `@ts-expect-error` fixture compiled against each package's built types
+  shows `new X()` no longer type-checks.
 
 Public API: breaking only for code that called these constructors, which
 always produced broken handles. Wire: none.

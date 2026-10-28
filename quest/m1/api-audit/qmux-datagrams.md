@@ -40,7 +40,8 @@ option):
   as `WebTransportDatagramDuplexStream` and keep the class in a private field
   that the session's frame handling and parameter negotiation use.
 - Tests: a lowered high-water mark sheds the overflow, a raised one admits
-  more, and each refused setter throws while its default is accepted.
+  more, reads drain and cancel the readable cleanly after a change, and each
+  refused setter throws while its default is accepted.
 
 Public API: breaking in `@moq/qmux` (the `Datagrams` export and its mutators
 go, and three setters now throw). The Impact bullet says to use
