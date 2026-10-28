@@ -8,9 +8,7 @@ import "dart:ffi";
 import "dart:io" show Platform, File, Directory;
 import "dart:isolate";
 import "dart:typed_data";
-
 import "package:ffi/ffi.dart";
-
 import "uniffi_runtime.dart";
 export "uniffi_runtime.dart";
 
@@ -11036,7 +11034,7 @@ class FfiConverterMoqMediaCatalogConsumer {
 
 abstract class MoqMediaCatalogProducerInterface {
   void finish();
-  int now();
+  MoqTimestamp now();
   void removeSection({required String name});
   void setSection({required String name, required String json});
   void setVideoProperties({required MoqVideoProperties properties});
@@ -11096,13 +11094,13 @@ class MoqMediaCatalogProducer implements MoqMediaCatalogProducerInterface {
     }, moqExceptionErrorHandler);
   }
 
-  int now() {
+  MoqTimestamp now() {
     return rustCallWithLifter(
       (status) => uniffi_moq_ffi_fn_method_moqmediacatalogproducer_now(
         uniffiClonePointer(),
         status,
       ),
-      FfiConverterUInt64.lift,
+      FfiConverterMoqTimestamp.lift,
       moqExceptionErrorHandler,
     );
   }
@@ -18309,10 +18307,10 @@ external void uniffi_moq_ffi_fn_method_moqmediacatalogproducer_finish(
   Pointer<RustCallStatus> uniffiStatus,
 );
 
-@Native<Uint64 Function(Pointer<Void>, Pointer<RustCallStatus>)>(
+@Native<RustBuffer Function(Pointer<Void>, Pointer<RustCallStatus>)>(
   assetId: _uniffiAssetId,
 )
-external int uniffi_moq_ffi_fn_method_moqmediacatalogproducer_now(
+external RustBuffer uniffi_moq_ffi_fn_method_moqmediacatalogproducer_now(
   Pointer<Void> ptr,
   Pointer<RustCallStatus> uniffiStatus,
 );
@@ -21243,7 +21241,7 @@ void _checkApiChecksums() {
       62353) {
     throw UniffiInternalError.panicked("UniFFI API checksum mismatch");
   }
-  if (uniffi_moq_ffi_checksum_method_moqmediacatalogproducer_now() != 14140) {
+  if (uniffi_moq_ffi_checksum_method_moqmediacatalogproducer_now() != 17945) {
     throw UniffiInternalError.panicked("UniFFI API checksum mismatch");
   }
   if (uniffi_moq_ffi_checksum_method_moqmediacatalogproducer_remove_section() !=

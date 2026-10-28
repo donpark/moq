@@ -6,9 +6,7 @@ use std::sync::{Arc, Weak};
 use bytes::Buf;
 use moq_mux::catalog::hang::Extra;
 
-use crate::consumer::{
-	MoqBroadcastConsumer, MoqFetchGroupOptions, MoqGroupConsumer, MoqSubscription, map_fetch_error,
-};
+use crate::consumer::{MoqBroadcastConsumer, MoqFetchGroupOptions, MoqGroupConsumer, MoqSubscription, map_fetch_error};
 use crate::demand::MoqTrackDemand;
 use crate::error::MoqError;
 use crate::ffi::Task;
@@ -1477,7 +1475,10 @@ mod read_tests {
 		.await
 		.unwrap();
 		let timestamp = |us| moq_net::Timestamp::from_micros(us).unwrap();
-		let micros = |value| MoqTimestamp { value, scale: 1_000_000 };
+		let micros = |value| MoqTimestamp {
+			value,
+			scale: 1_000_000,
+		};
 		let mut first = track.create_group(0u64.into()).unwrap();
 		format()
 			.write(

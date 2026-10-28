@@ -165,7 +165,9 @@ async fn ffi_round(
 				let mut read = Vec::with_capacity(frames);
 				for _ in 0..frames {
 					let frame = group.read_frame().await.unwrap().expect("group ended");
-					let timestamp = frame.timestamp.map(|t| moq_net::Timestamp::try_from(t).unwrap().as_micros() as u64);
+					let timestamp = frame
+						.timestamp
+						.map(|t| moq_net::Timestamp::try_from(t).unwrap().as_micros() as u64);
 					read.push((frame.payload, timestamp));
 				}
 				read

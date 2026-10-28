@@ -759,12 +759,19 @@ async fn audio_raw_publish_from_many_threads() {
 		let frame = match read {
 			MoqAudioRead::Frame { frame } => frame,
 			MoqAudioRead::End { end } => {
-				assert_eq!(micros(end), 250_000 + 8 * 20_000, "the finish ends after the last frame");
+				assert_eq!(
+					micros(end),
+					250_000 + 8 * 20_000,
+					"the finish ends after the last frame"
+				);
 				continue;
 			}
 			MoqAudioRead::Gap { .. } => panic!("nothing was lost"),
 		};
-		assert_eq!(micros(frame.timestamp), 250_000 + pcm.len() as u64 / 2 * 1_000_000 / 48_000);
+		assert_eq!(
+			micros(frame.timestamp),
+			250_000 + pcm.len() as u64 / 2 * 1_000_000 / 48_000
+		);
 		pcm.extend(frame.data.as_chunks::<4>().0.iter().map(|s| f32::from_le_bytes(*s)));
 	}
 	assert_eq!(pcm.len(), 8 * 960 * 2, "finish must preserve the entire PCM duration");
@@ -1258,7 +1265,13 @@ async fn subscribe(broadcast: &MoqBroadcastProducer, name: &str) -> Arc<MoqTrack
 #[tokio::test(start_paused = true)]
 async fn data_writes_preserve_optional_timestamps() {
 	// A 90 kHz tick, which no microsecond count holds exactly.
-	for timestamp in [None, Some(MoqTimestamp { value: 123_457, scale: 90_000 })] {
+	for timestamp in [
+		None,
+		Some(MoqTimestamp {
+			value: 123_457,
+			scale: 90_000,
+		}),
+	] {
 		for kind in ["json snapshot", "json stream", "flate snapshot", "flate stream"] {
 			let broadcast = MoqBroadcastProducer::new().unwrap();
 			let track = broadcast
@@ -1379,7 +1392,7 @@ async fn catalog_now_fixes_the_clock_for_later_media() {
 	)
 	.unwrap();
 	let now = catalog.now().unwrap();
-	assert!(now > 0);
+	assert!(now.value > 0);
 	media
 		.write_frame(MoqFrame {
 			payload: b"opus frame".to_vec(),
@@ -1667,10 +1680,7 @@ async fn json_window_cut_restates_the_window() {
 	for event in events {
 		assert_eq!(
 			next_window(&consumer).await,
-			Some(MoqJsonWindowTimed {
-				event,
-				timestamp: None,
-			})
+			Some(MoqJsonWindowTimed { event, timestamp: None })
 		);
 	}
 
@@ -1751,10 +1761,7 @@ async fn json_window_refreshes_a_bounded_checkpoint_for_a_joiner() {
 	for event in events {
 		assert_eq!(
 			next_window(&consumer).await,
-			Some(MoqJsonWindowTimed {
-				event,
-				timestamp: None,
-			})
+			Some(MoqJsonWindowTimed { event, timestamp: None })
 		);
 	}
 
@@ -2181,7 +2188,10 @@ async fn timestamps_are_exact() {
 			payload: b"frame".to_vec(),
 			timestamp: Some(invalid),
 		};
-		assert!(matches!(track.write_frame(frame), Err(MoqError::TimeOverflow)), "{invalid:?}");
+		assert!(
+			matches!(track.write_frame(frame), Err(MoqError::TimeOverflow)),
+			"{invalid:?}"
+		);
 		let range = MoqRange {
 			start: MoqAnchor::Time { timestamp: invalid },
 			end: None,
