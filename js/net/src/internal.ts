@@ -554,8 +554,11 @@ export const hooks: {
 	recoverGroup: (group: GroupConsumer, recover: GroupRecover) => void;
 	/** Read the next frame, as its stored DEFLATE slice when `compressed`, so a lite-07 publisher forwards it without inflating. */
 	readGroupFrame: (group: GroupConsumer, compressed: boolean) => Promise<ReadGroupFrame | undefined>;
-	/** Make an evicted mirror terminal while its track timeline still contains it. */
-	evictGroup: (group: GroupConsumer) => void;
+	/**
+	 * Make an evicted mirror terminal while its track timeline still contains it. Whether the
+	 * mirror is released too: not when its group reads on, or may yet, from another copy.
+	 */
+	evictGroup: (group: GroupConsumer) => boolean;
 	/** Attach the origin advertisement of a created broadcast. */
 	attachAnnouncer: (
 		producer: BroadcastProducer,

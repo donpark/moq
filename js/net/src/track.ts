@@ -1101,8 +1101,7 @@ export class Producer {
 			EVICTED.add(evicted);
 			entry.group.abort(evicted);
 		}
-		const mirrors = [...entry.mirrors.values()];
-		for (const mirror of mirrors) hooks.evictGroup(mirror);
+		const mirrors = [...entry.mirrors.values()].filter((mirror) => hooks.evictGroup(mirror));
 		this.#unlink(entry);
 		for (const mirror of mirrors) mirror.close();
 	}
@@ -2578,10 +2577,7 @@ export class Subscriber {
 	// one reports what its routes' copies gave up.
 	#tryDrop(): (Recv & { kind: "drop" }) | undefined {
 		if (this.#resume) {
-			const dropped = this.#resume.tryDrop(this.#delivered);
-			// Accounted for as #tryResumed does, so no copy serves it later.
-			if (dropped) this.#delivered.addRun(dropped.start, dropped.end);
-			return dropped;
+			return this.#resume.tryDrop(this.#delivered);
 		}
 		const { start, end } = this.#cursor.peek();
 		// Rescanned only after it changed, so an idle poll costs nothing per drop held.
@@ -2609,8 +2605,6 @@ export class Subscriber {
 		if (closed instanceof Error) return { kind: "error", error: closed };
 		const recv = resume.tryGroup(ordered, this.#delivered, dispositions);
 		if (recv.kind === "group") this.#handOut(recv.group.sequence, ordered);
-		// Accounted for as a group handed out is, so no copy serves it later.
-		else if (recv.kind === "drop") this.#delivered.addRun(recv.start, recv.end);
 		return recv;
 	}
 
