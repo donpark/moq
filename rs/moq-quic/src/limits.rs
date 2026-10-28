@@ -5,7 +5,7 @@ use thiserror::Error;
 use crate::{MAX_STREAM_COUNT, VarInt};
 
 /// Flow-control limits an established connection can change, such as a relay widening them
-/// once it knows the peer is another relay
+/// once it knows the peer is another relay, or capping its bitrate once it knows the peer's grant
 ///
 /// Each limit is `None` to leave it as it is. Each is non-zero because zero streams or a zero
 /// window credits nothing and wedges the connection. Build one from [`Limits::default`] and
@@ -19,6 +19,22 @@ pub struct Limits {
 	pub receive_window: Option<NonZeroU64>,
 	/// Cap on unacknowledged outgoing data, in bytes
 	pub send_window: Option<NonZeroU64>,
+	/// Cap on what the peer sends, held by pacing its connection credit
+	///
+	/// Stream data and datagram payload both count. Credit already granted cannot be withdrawn,
+	/// so a lowered cap is reached once the peer spends it, and a datagram past the cap is dropped.
+	pub receive_rate: Option<Rate>,
+	/// Cap on what this side sends, counting every ack-eliciting packet, retransmissions included
+	pub send_rate: Option<Rate>,
+}
+
+/// A bitrate cap in one direction of a connection, averaged with one second of it as a burst
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rate {
+	/// No cap
+	Unlimited,
+	/// At most this many bytes per second
+	BytesPerSecond(NonZeroU64),
 }
 
 impl Limits {
@@ -59,6 +75,7 @@ mod tests {
 			max_streams: NonZeroU64::new(max_streams),
 			receive_window: NonZeroU64::new(receive_window),
 			send_window: NonZeroU64::new(send_window),
+			..Limits::default()
 		}
 	}
 

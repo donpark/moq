@@ -64,7 +64,7 @@ pub use config::{
 	AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout, MtuDiscoveryConfig, ServerConfig,
 	TransportConfig, ValidationTokenConfig,
 };
-pub use limits::{Limits, LimitsError};
+pub use limits::{Limits, LimitsError, Rate};
 
 pub mod crypto;
 
