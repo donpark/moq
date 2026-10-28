@@ -1090,3 +1090,34 @@ test("closing a broadcast while TRACK_INFO is pending leaves no unhandled reject
 		subscriber.close();
 	}
 });
+
+// A peer can start mid-group, but this release has no way to preserve those frame indices.
+test("a nonzero lite frame start is refused before publishing the group", async () => {
+	const { quic, streams, opened } = fakeSession();
+	const subscriber = new Subscriber(quic, Version.DRAFT_07, HopSchema.parse(1n));
+	const broadcast = subscriber.consume(Path.from("room"));
+	const track = broadcast.track("video").subscribe();
+	const ordered = track.ordered();
+	const reader = new Reader(
+		new ReadableStream({ start: (controller) => controller.close() }),
+		undefined,
+		Version.DRAFT_07,
+	);
+	try {
+		await opened(0);
+		await answerTrackInfo(streams[0], Version.DRAFT_07);
+		await (await opened(1)).reading;
+		const next = ordered.nextGroup();
+		await expect(
+			subscriber.runGroup(new Group({ subscribe: 0n, sequence: 0, frameStart: 5 }), reader),
+		).rejects.toThrow("group 0 starts at frame 5");
+		ordered.close();
+		expect(await next).toBeUndefined();
+	} finally {
+		reader.stop(new Error("test complete"));
+		ordered.close();
+		track.close();
+		broadcast.close();
+		subscriber.close();
+	}
+});
