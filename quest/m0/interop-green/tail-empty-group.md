@@ -25,4 +25,17 @@ JS IETF publisher (`js/net/src/ietf/publisher.ts`) or the Rust IETF
 subscriber (`rs/moq-net/src/ietf/`); never relax the tail check. If it
 passes, delete this quest with the passing run as evidence.
 
+Validation checkpoint, 2026-10-28, at
+[4018a321](https://github.com/moq-dev/moq/commit/4018a32198860c05f111928e4c4116164bde2c0e):
+the current-main reproduction waited for host capacity in `quest gate` and
+was stopped before any build or tail cell ran. No passing result or fix is
+claimed. Since the failing run, main also gained JS cached and joining FETCH
+support in [moq-dev/moq#6945](https://github.com/moq-dev/moq/pull/6945), so
+reproduce before changing either implementation. Resume with
+`just test interop --tail --publishers rust,js-native-node,js-native-bun
+--subscribers rust,js-native-node,js-native-bun --versions ietf` through
+`quest gate`. The tail harness selects both native JS runtimes from these
+axes and also runs its Rust control lanes; it has no per-direction tail
+filter.
+
 Public API: none expected. Wire: none expected.
