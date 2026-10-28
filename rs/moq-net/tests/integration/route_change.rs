@@ -47,7 +47,12 @@ pub(super) async fn link(version: Version, from: &origin::Producer, to: &origin:
 }
 
 /// [`link`], with `to` pricing the link at `cost` when given.
-pub(super) async fn priced_link(version: Version, from: &origin::Producer, to: &origin::Producer, cost: Option<u64>) -> MockPair {
+pub(super) async fn priced_link(
+	version: Version,
+	from: &origin::Producer,
+	to: &origin::Producer,
+	cost: Option<u64>,
+) -> MockPair {
 	let mut options = MockConnectOptions::new(version);
 	options.server_publish = Some(from.consume());
 	options.client_subscribe = Some(to.clone());
