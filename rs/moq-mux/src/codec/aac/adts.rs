@@ -46,7 +46,7 @@ pub struct Header {
 	pub(crate) frame_len: usize,
 	/// The number of raw AAC blocks carried by this frame.
 	pub blocks: u8,
-	/// Header length: 7 without CRC, 9 with.
+	/// Header length, including CRC and raw-block position fields when present.
 	pub(crate) header_len: usize,
 }
 
@@ -71,7 +71,8 @@ impl Header {
 			.get(freq_index as usize)
 			.copied()
 			.ok_or(Error::SampleRate)?;
-		let header_len = if protection_absent == 1 { 7 } else { 9 };
+		let blocks = 1 + (data[6] & 3);
+		let header_len = if protection_absent == 1 { 7 } else { 7 + 2 * usize::from(blocks) };
 		if frame_len < header_len {
 			return Err(Error::FrameLength);
 		}
@@ -81,11 +82,11 @@ impl Header {
 			sample_rate,
 			channel_config,
 			frame_len,
-			blocks: 1 + (data[6] & 3),
+			blocks,
 			header_len,
 		})
 	}
-	/// Borrow the raw data of exactly one complete ADTS frame.
+	/// Borrow the payload after the header of one complete ADTS frame.
 	pub fn payload<'a>(&self, packet: &'a [u8]) -> Result<&'a [u8], Error> {
 		if packet.len() != self.frame_len || self.header_len > packet.len() {
 			return Err(Error::PacketLength);
