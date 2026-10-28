@@ -57,9 +57,8 @@ CARGO_PROFILE=()
 [[ "$PROFILE" == "release" ]] && CARGO_PROFILE=(--release)
 
 echo "swift check: building moq-ffi for $HOST_TARGET..."
-# `openh264`, as release builds ship it: the software encoder the tests rely on.
-cargo build --locked ${CARGO_PROFILE[@]+"${CARGO_PROFILE[@]}"} --package moq-ffi --features openh264 \
-    --manifest-path "$WORKSPACE_DIR/Cargo.toml"
+# The shared default build (.cargo/config.toml), whose `openh264` the tests rely on.
+(cd "$WORKSPACE_DIR" && cargo build-ffi ${CARGO_PROFILE[@]+"${CARGO_PROFILE[@]}"})
 
 TARGET_BASE=$(cargo metadata --format-version 1 --manifest-path "$WORKSPACE_DIR/Cargo.toml" --no-deps |
     sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
