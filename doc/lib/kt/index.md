@@ -21,7 +21,7 @@ A missing data timestamp stays untimed; the library never substitutes zero or no
 `dev.moq.json` consumers' `values()` emits `Value` (`value`, `timestamp`) and `valuesAs<T>()` emits `Timed<T>`;
 a snapshot consumer yields each state in order, and `latest()` skips to the newest.
 A `Timestamp(value, scale)` is exact and reads back at the track's timescale, so a 90 kHz tick republishes unchanged.
-`Duration.toTimestamp()` is exact at nanosecond scale; `Timestamp.toDuration()` rounds to the nearest nanosecond.
+`Duration.toTimestamp()` is exact at nanosecond scale; `Timestamp.toDuration()` rounds down to a whole nanosecond.
 Raw tracks with a `null` timescale are untimed on both publish and receive.
 `MoqTrackInfo.compress` on a raw track sends each group DEFLATE-compressed to opt-in `moq-lite-07-wip` peers; other peers, and every reader here, get the original frames. `@moq/net` cannot read a compressed track yet.
 Whole-frame media writes require caller time; container imports keep their own timeline handling.

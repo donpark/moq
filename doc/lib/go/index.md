@@ -18,7 +18,7 @@ Construct `NewAudioTrackProducer` / `NewVideoTrackProducer` from a broadcast, an
 and a `Named` or `Requested` target. `NewCatalogProducer` holds its broadcast weakly;
 catalog writes fail with `ErrClosed` after the broadcast closes. Media timestamps are exact
 `moq.Timestamp` records (`Value` at `Scale` units per second), so a 90 kHz tick survives a read and republish;
-`TimestampFromDuration` and `TimestampToDuration` convert.
+`TimestampFromDuration` converts exactly; `TimestampToDuration` rounds down to a whole nanosecond.
 A missing data timestamp stays untimed; the library never substitutes zero or now.
 Raw tracks with a `nil` timescale are untimed on both publish and receive.
 `TrackInfo.Compress` on a raw track sends each group DEFLATE-compressed to opt-in `moq-lite-07-wip` peers; other peers, and every reader here, get the original frames. `@moq/net` cannot read a compressed track yet.

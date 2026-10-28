@@ -2334,7 +2334,14 @@ fn json_snapshot_publish_consume() {
 	let mut last = 0;
 	for expected in [r#"{"a":1}"#, r#"{"a":2}"#] {
 		assert_eq!(
-			unsafe { moq_publish_json_snapshot_update(producer, expected.as_ptr() as *const c_char, expected.len()) },
+			unsafe {
+				moq_publish_json_snapshot_update(
+					producer,
+					expected.as_ptr() as *const c_char,
+					expected.len(),
+					std::ptr::null(),
+				)
+			},
 			0
 		);
 		let value_id = id(value_cb.recv());
@@ -2403,7 +2410,14 @@ fn json_stream_publish_consume() {
 	let mut last = 0;
 	for expected in [r#"{"n":0}"#, r#"{"n":1}"#, r#"{"n":2}"#] {
 		assert_eq!(
-			unsafe { moq_publish_json_stream_append(producer, expected.as_ptr() as *const c_char, expected.len()) },
+			unsafe {
+				moq_publish_json_stream_append(
+					producer,
+					expected.as_ptr() as *const c_char,
+					expected.len(),
+					std::ptr::null(),
+				)
+			},
 			0
 		);
 		let value_id = id(value_cb.recv());
@@ -2424,6 +2438,27 @@ fn json_stream_publish_consume() {
 		);
 		assert_eq!(moq_consume_json_value_free(value_id), 0);
 	}
+
+	// A caller's timestamp replaces the clock's, floored to the track's millisecond scale.
+	let expected = r#"{"n":3}"#;
+	let at = moq_timestamp {
+		value: (last + 1_000) * 90 + 45,
+		scale: 90_000,
+	};
+	assert_eq!(
+		unsafe { moq_publish_json_stream_append(producer, expected.as_ptr() as *const c_char, expected.len(), &at) },
+		0
+	);
+	let value_id = id(value_cb.recv());
+	let mut value = moq_json_value {
+		json: std::ptr::null(),
+		json_len: 0,
+		timestamp: std::ptr::null(),
+	};
+	assert_eq!(unsafe { moq_consume_json_value(value_id, &mut value) }, 0);
+	let read = read_timestamp(value.timestamp).expect("a stamped value is timed");
+	assert_eq!((read.value, read.scale), (last + 1_000, 1_000));
+	assert_eq!(moq_consume_json_value_free(value_id), 0);
 
 	assert_eq!(moq_consume_json_cancel(consumer), 0);
 	assert_eq!(value_cb.recv_terminal(), 0, "clean close delivers terminal 0");
@@ -6544,7 +6579,7 @@ fn binary_snapshot_is_advertised_and_delivered() {
 	// The payload reaches a raw subscriber of the same track name, untouched.
 	let payload = [0xff_u8, 0xd8, 0xff, 0xe0, 1, 2, 3];
 	assert_eq!(
-		unsafe { moq_publish_binary_snapshot_update(producer, payload.as_ptr(), payload.len()) },
+		unsafe { moq_publish_binary_snapshot_update(producer, payload.as_ptr(), payload.len(), std::ptr::null()) },
 		0
 	);
 	let consume = request_broadcast(origin, path);
@@ -6589,11 +6624,18 @@ fn binary_stream_is_advertised_and_delivered() {
 	assert_eq!(entry.mode, hang::catalog::Mode::Stream);
 	assert_eq!(entry.mime, None);
 
+	// A timestamp past the bounds is refused before anything is appended.
+	let invalid = moq_timestamp { value: 1, scale: 0 };
+	assert_eq!(
+		unsafe { moq_publish_binary_stream_append(producer, b"bad".as_ptr(), 3, &invalid) },
+		MOQ_ERROR_TIMESTAMP_OVERFLOW
+	);
+
 	// Every appended payload is delivered, in order.
 	let payloads: [&[u8]; 2] = [b"first", b"second"];
 	for payload in payloads {
 		assert_eq!(
-			unsafe { moq_publish_binary_stream_append(producer, payload.as_ptr(), payload.len()) },
+			unsafe { moq_publish_binary_stream_append(producer, payload.as_ptr(), payload.len(), std::ptr::null()) },
 			0
 		);
 	}

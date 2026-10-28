@@ -19,7 +19,7 @@ updates catalog properties and sections without keeping the broadcast open.
 Its writes fail after closing or releasing the broadcast.
 Media timestamps are exact `Timestamp` records, `value` units at `scale` units per second, carried at the track's timescale
 (a write at another scale rounds down to it). On macOS 13+ and iOS, `try Timestamp(duration)` converts a `Duration` exactly,
-and `try timestamp.duration` rounds back to the nearest attosecond.
+and `try timestamp.duration` rounds down to a whole attosecond.
 `Flate.SnapshotProducer` / `StreamProducer` publish opaque bytes with an optional `timestamp`.
 A missing data timestamp stays untimed; the library never substitutes zero or now.
 `Json` consumers yield `Json.Timed` (`value`, `timestamp`); a snapshot consumer yields each state in order,

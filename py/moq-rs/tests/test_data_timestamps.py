@@ -40,8 +40,9 @@ def test_timedelta_conversions():
     assert moq.Timestamp.from_timedelta(timedelta(seconds=1, microseconds=5)) == moq.Timestamp(1_000_005, 1_000_000)
     with pytest.raises(ValueError):
         moq.Timestamp.from_timedelta(timedelta(microseconds=-1))
-    # Nearest, not floored: 2/3 µs is 1 µs and 11.1 µs is 11 µs.
-    assert moq.Timestamp(2, 3_000_000).to_timedelta() == timedelta(microseconds=1)
+    # Rounded down, like moq-net: half a microsecond and 2/3 of one are both 0, and 11.1 µs is 11 µs.
+    assert moq.Timestamp(1, 2_000_000).to_timedelta() == timedelta(0)
+    assert moq.Timestamp(2, 3_000_000).to_timedelta() == timedelta(0)
     assert moq.Timestamp(1, 90_000).to_timedelta() == timedelta(microseconds=11)
 
 

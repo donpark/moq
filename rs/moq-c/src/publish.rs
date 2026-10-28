@@ -260,8 +260,8 @@ impl<T> std::ops::DerefMut for Kept<T> {
 	}
 }
 
-// Legacy C data methods stamp writes on one fixed broadcast clock without retaining
-// another catalog handle after a failed stream retires its listing.
+// C data methods stamp a write the caller left unstamped on one fixed broadcast clock,
+// without retaining another catalog handle after a failed stream retires its listing.
 struct Data<T> {
 	producer: T,
 	clock: moq_mux::Clock,
@@ -1214,10 +1214,15 @@ impl Publish {
 	}
 
 	/// Publish a new value to a JSON snapshot track. A no-op if unchanged.
-	pub fn json_snapshot_update(&mut self, json: Id, value: serde_json::Value) -> Result<(), Error> {
+	pub fn json_snapshot_update(
+		&mut self,
+		json: Id,
+		value: serde_json::Value,
+		timestamp: Option<moq_net::Timestamp>,
+	) -> Result<(), Error> {
 		let json = &mut self.json_snapshot.get_mut(json).ok_or(Error::TrackNotFound)?.data;
-		json.producer
-			.update(moq_net::Timed::from(&value).at(json.clock.now()))?;
+		let at = timestamp.unwrap_or_else(|| json.clock.now());
+		json.producer.update(moq_net::Timed::from(&value).at(at))?;
 		Ok(())
 	}
 
@@ -1243,11 +1248,15 @@ impl Publish {
 	}
 
 	/// Append one record to a JSON stream track.
-	pub fn json_stream_append(&mut self, stream: Id, value: serde_json::Value) -> Result<(), Error> {
+	pub fn json_stream_append(
+		&mut self,
+		stream: Id,
+		value: serde_json::Value,
+		timestamp: Option<moq_net::Timestamp>,
+	) -> Result<(), Error> {
 		let producer = self.json_stream.get_mut(stream).ok_or(Error::TrackNotFound)?;
-		producer
-			.producer
-			.append(moq_net::Timed::from(&value).at(producer.clock.now()))?;
+		let at = timestamp.unwrap_or_else(|| producer.clock.now());
+		producer.producer.append(moq_net::Timed::from(&value).at(at))?;
 		Ok(())
 	}
 
@@ -1270,11 +1279,17 @@ impl Publish {
 	}
 
 	/// Publish a new payload to a binary snapshot track, superseding the last.
-	pub fn binary_snapshot_update(&mut self, binary: Id, payload: &[u8]) -> Result<(), Error> {
+	pub fn binary_snapshot_update(
+		&mut self,
+		binary: Id,
+		payload: &[u8],
+		timestamp: Option<moq_net::Timestamp>,
+	) -> Result<(), Error> {
 		let producer = self.binary_snapshot.get_mut(binary).ok_or(Error::TrackNotFound)?;
+		let at = timestamp.unwrap_or_else(|| producer.clock.now());
 		producer
 			.producer
-			.update(moq_net::Timed::from(bytes::Bytes::copy_from_slice(payload)).at(producer.clock.now()))?;
+			.update(moq_net::Timed::from(bytes::Bytes::copy_from_slice(payload)).at(at))?;
 		Ok(())
 	}
 
@@ -1297,11 +1312,17 @@ impl Publish {
 	}
 
 	/// Append one payload to a binary stream track.
-	pub fn binary_stream_append(&mut self, stream: Id, payload: &[u8]) -> Result<(), Error> {
+	pub fn binary_stream_append(
+		&mut self,
+		stream: Id,
+		payload: &[u8],
+		timestamp: Option<moq_net::Timestamp>,
+	) -> Result<(), Error> {
 		let producer = self.binary_stream.get_mut(stream).ok_or(Error::TrackNotFound)?;
+		let at = timestamp.unwrap_or_else(|| producer.clock.now());
 		producer
 			.producer
-			.append(moq_net::Timed::from(bytes::Bytes::copy_from_slice(payload)).at(producer.clock.now()))?;
+			.append(moq_net::Timed::from(bytes::Bytes::copy_from_slice(payload)).at(at))?;
 		Ok(())
 	}
 
@@ -1497,19 +1518,19 @@ mod children_tests {
 		}
 		let json = serde_json::Value::Null;
 		assert!(matches!(
-			state.publish.json_snapshot_update(json_snapshot, json.clone()),
+			state.publish.json_snapshot_update(json_snapshot, json.clone(), None),
 			Err(Error::TrackNotFound)
 		));
 		assert!(matches!(
-			state.publish.json_stream_append(json_stream, json),
+			state.publish.json_stream_append(json_stream, json, None),
 			Err(Error::TrackNotFound)
 		));
 		assert!(matches!(
-			state.publish.binary_snapshot_update(binary_snapshot, b"late"),
+			state.publish.binary_snapshot_update(binary_snapshot, b"late", None),
 			Err(Error::TrackNotFound)
 		));
 		assert!(matches!(
-			state.publish.binary_stream_append(binary_stream, b"late"),
+			state.publish.binary_stream_append(binary_stream, b"late", None),
 			Err(Error::TrackNotFound)
 		));
 	}

@@ -545,7 +545,6 @@ final class SmokeTests: XCTestCase {
             Timestamp(value: 1 << 61, scale: 90_000),
         ] {
             assertTimeOverflow(try track.writeFrame(Data("frame".utf8), timestamp: invalid))
-            assertTimeOverflow(try invalid.duration)
         }
 
         try track.finish()
@@ -565,13 +564,24 @@ final class SmokeTests: XCTestCase {
         // Three seconds of attoseconds passes 2^61, and the attosecond doesn't survive a coarser scale.
         assertTimeOverflow(try Timestamp(.seconds(3) + Duration(secondsComponent: 0, attosecondsComponent: 1)))
 
-        // Back to the nearest attosecond: a 90 kHz tick is 11_111_111_111_111.1 as, and 2/3 s rounds up.
+        // Back down to a whole attosecond: a 90 kHz tick is 11_111_111_111_111.1 as, 2/3 s ends in
+        // ...6.6 as, and half an attosecond is 0.
         let tick = Duration(secondsComponent: 0, attosecondsComponent: 11_111_111_111_111)
         XCTAssertEqual(try Timestamp(value: 1, scale: 90_000).duration, tick)
-        let twoThirds = Duration(secondsComponent: 0, attosecondsComponent: 666_666_666_666_666_667)
+        let twoThirds = Duration(secondsComponent: 0, attosecondsComponent: 666_666_666_666_666_666)
         XCTAssertEqual(try Timestamp(value: 2, scale: 3).duration, twoThirds)
+        XCTAssertEqual(try Timestamp(value: 1, scale: 2 * atto).duration, .zero)
         XCTAssertEqual(try micros(1_500_000).duration, .milliseconds(1_500))
         XCTAssertEqual(try Timestamp(.seconds(3_600)).duration, .seconds(3_600))
+
+        // A record outside what a write accepts is refused rather than converted.
+        for invalid in [
+            Timestamp(value: 0, scale: 0),
+            Timestamp(value: 0, scale: 1 << 62),
+            Timestamp(value: 1 << 61, scale: 90_000),
+        ] {
+            assertTimeOverflow(try invalid.duration)
+        }
     }
 
     func testReadFrameSkipsEmptyThenPopulatedGroups() async throws {

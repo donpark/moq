@@ -34,7 +34,7 @@ extension Timestamp {
         throw MoqError.TimeOverflow
     }
 
-    /// This timestamp as a `Duration`, rounded to the nearest attosecond.
+    /// This timestamp as a `Duration`, rounded down to a whole attosecond.
     ///
     /// Exact when `scale` divides 10^18, such as microseconds or nanoseconds; a 90 kHz tick rounds,
     /// so keep the record itself to republish a read exactly. Throws `MoqError.TimeOverflow` for a
@@ -44,8 +44,7 @@ extension Timestamp {
             guard scale != 0, scale <= maxScale, value <= maxValue else { throw MoqError.TimeOverflow }
             let (seconds, remainder) = value.quotientAndRemainder(dividingBy: scale)
             // `remainder` is below `scale`, so the quotient is below 10^18 and fits.
-            var (attoseconds, rest) = scale.dividingFullWidth(remainder.multipliedFullWidth(by: attosecondsPerSecond))
-            if rest >= scale - rest { attoseconds += 1 }
+            let (attoseconds, _) = scale.dividingFullWidth(remainder.multipliedFullWidth(by: attosecondsPerSecond))
             return Duration(secondsComponent: Int64(seconds), attosecondsComponent: Int64(attoseconds))
         }
     }

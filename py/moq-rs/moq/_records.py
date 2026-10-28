@@ -11,10 +11,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from fractions import Fraction
 from importlib import metadata
+from typing import ClassVar, cast
 
 from moq_ffi import (
+    MoqAnchor,
     MoqBackoff,
     MoqClientTls,
     MoqCongestionControl,
@@ -28,6 +29,9 @@ from moq_ffi import (
     MoqSubscription,
     MoqTimestamp,
     MoqTrackInfo,
+    MoqVideoDecodedFrame,
+    MoqVideoPixelFormat,
+    MoqVideoSurface,
     MoqWebSocketConfig,
 )
 
@@ -70,8 +74,11 @@ class Timestamp:
         return Timestamp(duration // _MICROSECOND, 1_000_000)
 
     def to_timedelta(self) -> timedelta:
-        """This timestamp rounded to the nearest microsecond, so a finer scale may lose precision."""
-        return timedelta(microseconds=round(Fraction(self.value * 1_000_000, self.scale)))
+        """This timestamp as a ``timedelta``, rounded down to a whole microsecond.
+
+        The timestamp itself is exact; keep it, not the ``timedelta``, to republish a tick such as 90 kHz.
+        """
+        return timedelta(microseconds=self.value * 1_000_000 // self.scale)
 
     def _ffi(self) -> MoqTimestamp:
         return MoqTimestamp(value=self.value, scale=self.scale)
@@ -127,6 +134,72 @@ class Datagram:
         )
 
 
+class Anchor:
+    """Where one end of a :class:`Range` falls, mirroring moq-net's ``track::Anchor``.
+
+    Build one with ``Anchor.ABSOLUTE(group=...)``, ``Anchor.RELATIVE(groups=...)``, or
+    ``Anchor.TIME(timestamp=...)``.
+    """
+
+    ABSOLUTE: ClassVar[type[_AnchorAbsolute]]
+    RELATIVE: ClassVar[type[_AnchorRelative]]
+    TIME: ClassVar[type[_AnchorTime]]
+
+    def _ffi(self) -> MoqAnchor:
+        raise TypeError("build an Anchor with Anchor.ABSOLUTE, Anchor.RELATIVE, or Anchor.TIME")
+
+
+# The generated variants subclass MoqAnchor only at runtime, so each _ffi casts for pyright.
+@dataclass(frozen=True)
+class _AnchorAbsolute(Anchor):
+    """This group, delivered from its first frame."""
+
+    group: int
+
+    def _ffi(self) -> MoqAnchor:
+        return cast(MoqAnchor, MoqAnchor.ABSOLUTE(group=self.group))
+
+
+@dataclass(frozen=True)
+class _AnchorRelative(Anchor):
+    """The group this many before the latest, clamped to group 0: ``0`` is the latest group."""
+
+    groups: int
+
+    def _ffi(self) -> MoqAnchor:
+        return cast(MoqAnchor, MoqAnchor.RELATIVE(groups=self.groups))
+
+
+@dataclass(frozen=True)
+class _AnchorTime(Anchor):
+    """The group containing this presentation time. An untimed track refuses it."""
+
+    timestamp: Timestamp
+
+    def _ffi(self) -> MoqAnchor:
+        return cast(MoqAnchor, MoqAnchor.TIME(timestamp=self.timestamp._ffi()))
+
+
+Anchor.ABSOLUTE = _AnchorAbsolute
+Anchor.RELATIVE = _AnchorRelative
+Anchor.TIME = _AnchorTime
+
+
+@dataclass(frozen=True)
+class Range:
+    """A span of a track to deliver, from ``start`` to ``end``, ``None`` to keep following the live edge.
+
+    A relative or time start is the first frame of its group, and a relative or time end
+    includes its whole group. An absolute end is exclusive.
+    """
+
+    start: Anchor
+    end: Anchor | None = None
+
+    def _ffi(self) -> MoqRange:
+        return MoqRange(start=self.start._ffi(), end=None if self.end is None else self.end._ffi())
+
+
 @dataclass(frozen=True)
 class Subscription:
     """Subscriber-side delivery preferences, mirroring moq-net's ``track::Subscription``.
@@ -141,14 +214,14 @@ class Subscription:
 
     priority: int = 0
     max_delay: timedelta | None = timedelta(0)
-    ranges: Sequence[MoqRange] | None = None
+    ranges: Sequence[Range] | None = None
     order: MoqOrder | None = None
 
     def _ffi(self) -> MoqSubscription:
         return MoqSubscription(
             priority=self.priority,
             max_delay=self.max_delay,
-            ranges=None if self.ranges is None else list(self.ranges),
+            ranges=None if self.ranges is None else [r._ffi() for r in self.ranges],
             order=self.order,
         )
 
@@ -364,3 +437,30 @@ class Grant:
             subscribe=tuple(grant.subscribe),
             expires=grant.expires,
         )
+
+
+class VideoDecodedFrame:
+    """One decoded picture. It owns the decoder's buffer until garbage collected, so drop it promptly."""
+
+    def __init__(self, inner: MoqVideoDecodedFrame) -> None:
+        self._inner = inner
+
+    def timestamp(self) -> Timestamp:
+        """The presentation timestamp, at the track's timescale."""
+        return Timestamp._from_ffi(self._inner.timestamp())
+
+    def width(self) -> int:
+        """The picture's width in pixels."""
+        return self._inner.width()
+
+    def height(self) -> int:
+        """The picture's height in pixels."""
+        return self._inner.height()
+
+    def pixels(self, format: MoqVideoPixelFormat) -> bytes:
+        """The picture converted to tightly packed CPU pixels in ``format``."""
+        return self._inner.pixels(format)
+
+    def surface(self) -> MoqVideoSurface | None:
+        """The decoder's platform surface, when the decoder output asked for one."""
+        return self._inner.surface()

@@ -467,11 +467,12 @@ void main() {
     final exact = const Duration(milliseconds: 20).toTimestamp();
     expect([exact.value, exact.scale], [20000, 1000000]);
     expect(exact.toDuration(), const Duration(milliseconds: 20));
-    // 5 ticks at 90 kHz is 55.6 us: rounded to nearest, not floored.
+    // 5 ticks at 90 kHz is 55.6 us, and half a microsecond is 0.5: both round down.
     expect(
       Timestamp(value: 5, scale: 90000).toDuration(),
-      const Duration(microseconds: 56),
+      const Duration(microseconds: 55),
     );
+    expect(Timestamp(value: 1, scale: 2000000).toDuration(), Duration.zero);
     expect(
       () => Timestamp(value: (1 << 61) - 1, scale: 1).toDuration(),
       throwsRangeError,

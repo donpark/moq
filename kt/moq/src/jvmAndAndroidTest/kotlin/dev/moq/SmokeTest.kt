@@ -435,13 +435,14 @@ class SmokeTest {
         }
     }
 
-    /** From a duration is exact at nanosecond scale; to a duration rounds to the nearest nanosecond. */
+    /** From a duration is exact at nanosecond scale; to a duration rounds down to a whole nanosecond. */
     @Test
     fun `timestamps convert to and from durations`() {
         assertEquals(Timestamp(20_000_000uL, 1_000_000_000uL), 20.milliseconds.toTimestamp())
         assertFailsWith<IllegalArgumentException> { (-1).nanoseconds.toTimestamp() }
         assertEquals(11_111.nanoseconds, Timestamp(1uL, 90_000uL).toDuration())
-        assertEquals(666_666_667.nanoseconds, Timestamp(2uL, 3uL).toDuration())
+        assertEquals(666_666_666.nanoseconds, Timestamp(2uL, 3uL).toDuration())
+        assertEquals(0.nanoseconds, Timestamp(1uL, 2_000_000_000uL).toDuration())
         // The sub-second remainder times a billion overflows 64 bits at the largest scale.
         assertEquals(500.milliseconds, Timestamp((1uL shl 61) - 1uL, (1uL shl 62) - 1uL).toDuration())
         assertFailsWith<IllegalArgumentException> { Timestamp((1uL shl 61) - 1uL, 1uL).toDuration() }

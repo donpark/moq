@@ -23,7 +23,7 @@ func TestTimestampFromDuration(t *testing.T) {
 	}
 }
 
-// Converting to a duration rounds to the nearest nanosecond, and a time past
+// Converting to a duration rounds down to a whole nanosecond, and a time past
 // time.Duration's ~292 years reads as the longest duration rather than wrapping.
 func TestTimestampToDuration(t *testing.T) {
 	cases := []struct {
@@ -31,13 +31,11 @@ func TestTimestampToDuration(t *testing.T) {
 		want time.Duration
 	}{
 		{Timestamp{Value: 0, Scale: 90_000}, 0},
-		// 11111.1 ns rounds down.
+		// 11111.1 ns, 666666666.6 ns, and half a nanosecond all round down.
 		{Timestamp{Value: 1, Scale: 90_000}, 11_111},
-		// 666666666.6 ns rounds up.
-		{Timestamp{Value: 2, Scale: 3}, 666_666_667},
-		// Half a nanosecond rounds up.
-		{Timestamp{Value: 1, Scale: 2_000_000_000}, 1},
-		{Timestamp{Value: 1001, Scale: 30_000}, 33_366_667},
+		{Timestamp{Value: 2, Scale: 3}, 666_666_666},
+		{Timestamp{Value: 1, Scale: 2_000_000_000}, 0},
+		{Timestamp{Value: 1001, Scale: 30_000}, 33_366_666},
 		{Timestamp{Value: math.MaxInt64, Scale: 1_000_000_000}, math.MaxInt64},
 		{Timestamp{Value: math.MaxInt64/1000 + 1, Scale: 1_000_000}, math.MaxInt64},
 		{Timestamp{Value: 1<<61 - 1, Scale: 1}, math.MaxInt64},

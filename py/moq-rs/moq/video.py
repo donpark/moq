@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Union
 
 from moq_ffi import (
     MoqVideoConsumer,
@@ -19,22 +18,20 @@ from moq_ffi import (
 from moq_ffi import MoqVideoFrameRate as FrameRate
 
 from ._read import End, Gap, _end, _gap
-from ._records import Timestamp
+from ._records import Timestamp, VideoDecodedFrame
 from ._stream import _Stream
 from .media import CatalogProducer, Dimensions, Video
 from .publish import TrackDemand
 from .session import Allocator, Reservation
 from .subscribe import BroadcastConsumer
 from .types import VideoCodec as Codec
-from .types import VideoDecodedFrame
 from .types import VideoEncoderInput as EncoderInput
 from .types import VideoEncoderKind as EncoderKind
 from .types import VideoEncoderOutput as EncoderOutput
 from .types import VideoGop as Gop
 from .types import VideoPixelFormat as PixelFormat
 
-# A Union rather than `|`: the generated frame class does not support `|` with other types.
-Read = Union[VideoDecodedFrame, Gap, End]
+Read = VideoDecodedFrame | Gap | End
 """One item a :class:`Consumer` reads, in delivery order: a decoded picture, or a break between them."""
 
 
@@ -174,7 +171,7 @@ class Consumer(_Stream[Read]):
         if value is None:
             return None
         if isinstance(value, MoqVideoRead.FRAME):
-            return value.frame
+            return VideoDecodedFrame(value.frame)
         if isinstance(value, MoqVideoRead.GAP):
             return _gap(value.timestamp, value.duration)
         if isinstance(value, MoqVideoRead.END):

@@ -91,10 +91,14 @@ int main(void) {
     CHECK(json > 0);
 
     const uint8_t payload[] = {1, 2, 3};
+    const char *doc = "{\"n\":1}";
     const moq_timestamp invalid[] = {{0, 0}, {0, 1ull << 62}, {1ull << 61, 1000000}};
-    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++)
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
         CHECK(moq_publish_track_frame((uint32_t)track, payload, sizeof(payload), &invalid[i]) ==
               MOQ_ERROR_TIMESTAMP_OVERFLOW);
+        CHECK(moq_publish_json_stream_append((uint32_t)json, doc, strlen(doc), &invalid[i]) ==
+              MOQ_ERROR_TIMESTAMP_OVERFLOW);
+    }
     CHECK(moq_publish_track_frame((uint32_t)track, payload, sizeof(payload), NULL) == MOQ_ERROR_MOQ);
 
     CHECK(moq_origin_request((uint32_t)origin, path, strlen(path), on_broadcast, &c) > 0);
@@ -115,8 +119,9 @@ int main(void) {
     WAIT_FOR(&c, c.frame_count == 2);
     CHECK(moq_publish_track_datagram((uint32_t)track, payload, sizeof(payload), &tick, NULL) == 0);
     WAIT_FOR(&c, c.datagram);
-    const char *doc = "{\"n\":1}";
-    CHECK(moq_publish_json_stream_append((uint32_t)json, doc, strlen(doc)) == 0);
+    // JSON tracks moq-c creates count milliseconds.
+    const moq_timestamp stamped = {1500, 1000};
+    CHECK(moq_publish_json_stream_append((uint32_t)json, doc, strlen(doc), &stamped) == 0);
     WAIT_FOR(&c, c.value);
 
     // Each timestamp points into its own read, so both stay intact until freed.
@@ -133,10 +138,9 @@ int main(void) {
     CHECK(same(datagram.timestamp, tick));
     CHECK(moq_consume_datagram_free((uint32_t)c.datagram) == 0);
 
-    // The JSON producer stamps each value with the broadcast clock.
     moq_json_value value;
     CHECK(moq_consume_json_value((uint32_t)c.value, &value) == 0);
-    CHECK(value.timestamp != NULL && value.timestamp->scale != 0);
+    CHECK(same(value.timestamp, stamped));
     CHECK(moq_consume_json_value_free((uint32_t)c.value) == 0);
 
     CHECK(moq_consume_track_cancel((uint32_t)frames) == 0);

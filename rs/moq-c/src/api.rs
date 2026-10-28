@@ -3324,17 +3324,27 @@ pub unsafe extern "C" fn moq_publish_json_snapshot(
 /// Publish a new value to a JSON snapshot track. `value` is a UTF-8 JSON document. A no-op if
 /// unchanged from the previous update.
 ///
+/// `timestamp` is when the value was captured, converted to the track's millisecond timescale;
+/// NULL stamps the broadcast clock's current time.
+///
 /// Returns a zero on success, or a negative code on failure.
 ///
 /// # Safety
 /// - The caller must ensure `value` is a valid pointer to `value_len` bytes.
+/// - `timestamp` must be NULL or a valid pointer to a [moq_timestamp].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moq_publish_json_snapshot_update(json: u32, value: *const c_char, value_len: usize) -> i32 {
+pub unsafe extern "C" fn moq_publish_json_snapshot_update(
+	json: u32,
+	value: *const c_char,
+	value_len: usize,
+	timestamp: *const moq_timestamp,
+) -> i32 {
 	ffi::enter(move || {
 		let json = ffi::parse_id(json)?;
 		let value = unsafe { ffi::parse_slice(value.cast::<u8>(), value_len)? };
 		let value = serde_json::from_slice(value)?;
-		State::lock().publish.json_snapshot_update(json, value)
+		let timestamp = unsafe { ffi::parse_timestamp(timestamp)? };
+		State::lock().publish.json_snapshot_update(json, value, timestamp)
 	})
 }
 
@@ -3378,17 +3388,27 @@ pub unsafe extern "C" fn moq_publish_json_stream(
 
 /// Append one record to a JSON stream track. `value` is a UTF-8 JSON document.
 ///
+/// `timestamp` is when the value was captured, converted to the track's millisecond timescale;
+/// NULL stamps the broadcast clock's current time.
+///
 /// Returns a zero on success, or a negative code on failure.
 ///
 /// # Safety
 /// - The caller must ensure `value` is a valid pointer to `value_len` bytes.
+/// - `timestamp` must be NULL or a valid pointer to a [moq_timestamp].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moq_publish_json_stream_append(stream: u32, value: *const c_char, value_len: usize) -> i32 {
+pub unsafe extern "C" fn moq_publish_json_stream_append(
+	stream: u32,
+	value: *const c_char,
+	value_len: usize,
+	timestamp: *const moq_timestamp,
+) -> i32 {
 	ffi::enter(move || {
 		let stream = ffi::parse_id(stream)?;
 		let value = unsafe { ffi::parse_slice(value.cast::<u8>(), value_len)? };
 		let value = serde_json::from_slice(value)?;
-		State::lock().publish.json_stream_append(stream, value)
+		let timestamp = unsafe { ffi::parse_timestamp(timestamp)? };
+		State::lock().publish.json_stream_append(stream, value, timestamp)
 	})
 }
 
@@ -3445,20 +3465,26 @@ pub unsafe extern "C" fn moq_publish_binary_snapshot(
 
 /// Publish a new payload to a binary snapshot track, superseding the last.
 ///
+/// `timestamp` is when the value was captured, converted to the track's millisecond timescale;
+/// NULL stamps the broadcast clock's current time.
+///
 /// Returns a zero on success, or a negative code on failure.
 ///
 /// # Safety
 /// - The caller must ensure `payload` is a valid pointer to `payload_len` bytes.
+/// - `timestamp` must be NULL or a valid pointer to a [moq_timestamp].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn moq_publish_binary_snapshot_update(
 	binary: u32,
 	payload: *const u8,
 	payload_len: usize,
+	timestamp: *const moq_timestamp,
 ) -> i32 {
 	ffi::enter(move || {
 		let binary = ffi::parse_id(binary)?;
 		let payload = unsafe { ffi::parse_slice(payload, payload_len)? };
-		State::lock().publish.binary_snapshot_update(binary, payload)
+		let timestamp = unsafe { ffi::parse_timestamp(timestamp)? };
+		State::lock().publish.binary_snapshot_update(binary, payload, timestamp)
 	})
 }
 
@@ -3501,16 +3527,26 @@ pub unsafe extern "C" fn moq_publish_binary_stream(
 
 /// Append one payload to a binary stream track.
 ///
+/// `timestamp` is when the value was captured, converted to the track's millisecond timescale;
+/// NULL stamps the broadcast clock's current time.
+///
 /// Returns a zero on success, or a negative code on failure.
 ///
 /// # Safety
 /// - The caller must ensure `payload` is a valid pointer to `payload_len` bytes.
+/// - `timestamp` must be NULL or a valid pointer to a [moq_timestamp].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn moq_publish_binary_stream_append(stream: u32, payload: *const u8, payload_len: usize) -> i32 {
+pub unsafe extern "C" fn moq_publish_binary_stream_append(
+	stream: u32,
+	payload: *const u8,
+	payload_len: usize,
+	timestamp: *const moq_timestamp,
+) -> i32 {
 	ffi::enter(move || {
 		let stream = ffi::parse_id(stream)?;
 		let payload = unsafe { ffi::parse_slice(payload, payload_len)? };
-		State::lock().publish.binary_stream_append(stream, payload)
+		let timestamp = unsafe { ffi::parse_timestamp(timestamp)? };
+		State::lock().publish.binary_stream_append(stream, payload, timestamp)
 	})
 }
 

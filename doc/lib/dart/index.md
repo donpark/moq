@@ -22,7 +22,7 @@ A missing data timestamp stays untimed; the library never substitutes zero or no
 `package:moq/json.dart` consumers return `Value` (`value`, `timestamp`) from `next()`; a snapshot consumer
 yields each state in order, and `latest()` skips to the newest.
 Media times are exact `Timestamp` records, `value` units at `scale` units per second, so a 90 kHz tick survives a
-read and republish. `Duration.toTimestamp()` converts exactly; `Timestamp.toDuration()` rounds to the nearest microsecond.
+read and republish. `Duration.toTimestamp()` converts exactly; `Timestamp.toDuration()` rounds down to a whole microsecond.
 Raw tracks with a `null` timescale are untimed on both publish and receive.
 `MoqTrackInfo.compress` on a raw track sends each group DEFLATE-compressed to opt-in `moq-lite-07-wip` peers; other peers, and every reader here, get the original frames. `@moq/net` cannot read a compressed track yet.
 Whole-frame media writes require caller time; container imports keep their own timeline handling.

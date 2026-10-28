@@ -23,12 +23,11 @@ func TimestampFromDuration(d time.Duration) (Timestamp, error) {
 	return Timestamp{Value: uint64(d), Scale: uint64(time.Second)}, nil
 }
 
-// TimestampToDuration rounds t to the nearest nanosecond, saturating past
-// time.Duration's ~292 years. It panics on a zero Scale, which no read returns.
+// TimestampToDuration converts t to a time.Duration, rounded down to a whole
+// nanosecond, saturating past time.Duration's ~292 years. It panics on a zero
+// Scale, which no read returns.
 func TimestampToDuration(t Timestamp) time.Duration {
 	hi, lo := bits.Mul64(t.Value, uint64(time.Second))
-	lo, carry := bits.Add64(lo, t.Scale/2, 0)
-	hi += carry
 	if hi >= t.Scale {
 		return time.Duration(math.MaxInt64)
 	}

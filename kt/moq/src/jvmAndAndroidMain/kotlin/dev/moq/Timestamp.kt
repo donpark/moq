@@ -6,7 +6,7 @@ import kotlin.time.Duration.Companion.nanoseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * This timestamp as a [Duration], rounded to the nearest nanosecond.
+ * This timestamp as a [Duration], rounded down to a whole nanosecond.
  *
  * The [Timestamp] itself is exact; keep it, not the duration, to republish a tick such as 90 kHz.
  * Throws [IllegalArgumentException] past [Duration]'s range, about 146 million years.
@@ -15,7 +15,7 @@ fun Timestamp.toDuration(): Duration {
     // The sub-second remainder times a billion can exceed 64 bits.
     val remainder = (value % scale).toString().toBigInteger()
     val divisor = scale.toString().toBigInteger()
-    val nanos = (remainder * BigInteger.valueOf(1_000_000_000L) + divisor.shiftRight(1)) / divisor
+    val nanos = remainder * BigInteger.valueOf(1_000_000_000L) / divisor
     val duration = (value / scale).toLong().seconds + nanos.toLong().nanoseconds
     // Duration saturates to infinite instead of failing.
     require(duration.isFinite()) { "timestamp $value/$scale s does not fit in a Duration" }

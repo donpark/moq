@@ -12,7 +12,7 @@ import moq_ffi
 import pytest
 
 # Every group from the first, rather than only what the live edge still reaches.
-FROM_GROUP_0 = [moq.Range(start=cast(moq.Anchor, moq.Anchor.ABSOLUTE(group=0)))]
+FROM_GROUP_0 = [moq.Range(start=moq.Anchor.ABSOLUTE(group=0))]
 
 
 async def until_wanted(demand: moq.TrackDemand, wanted: bool = True) -> None:
@@ -1028,7 +1028,7 @@ async def test_ascending_subscription_reads_a_cached_backlog_oldest_first():
     consumer = track.consume(
         moq.Subscription(
             max_delay=timedelta(seconds=10),
-            ranges=[moq.Range(start=cast(moq.Anchor, moq.Anchor.RELATIVE(groups=2)))],
+            ranges=[moq.Range(start=moq.Anchor.RELATIVE(groups=2))],
             order=moq.Order.ASCENDING,
         )
     )
@@ -1038,6 +1038,28 @@ async def test_ascending_subscription_reads_a_cached_backlog_oldest_first():
         assert group is not None
         sequences.append(group.sequence)
     assert sequences == [0, 1, 2]
+
+
+async def test_time_anchor_starts_at_the_group_containing_it():
+    """A time anchor takes a wrapper Timestamp and starts at the group containing that time."""
+    broadcast = moq.BroadcastProducer()
+    track = broadcast.publish_track("timed", moq.TrackInfo(timescale=1_000))
+    for second in range(3):
+        group = track.append_group()
+        group.write_frame(b"x", moq.Timestamp(second, 1))
+        group.finish()
+
+    start = moq.Anchor.TIME(timestamp=moq.Timestamp(1_500, 1_000))
+    consumer = track.consume(
+        moq.Subscription(
+            max_delay=timedelta(seconds=10),
+            ranges=[moq.Range(start=start)],
+            order=moq.Order.ASCENDING,
+        )
+    )
+    group = await asyncio.wait_for(consumer.recv_group(), timeout=5.0)
+    assert group is not None
+    assert group.sequence == 1
 
 
 async def test_raw_group_producer_consume_direct():
@@ -1548,6 +1570,7 @@ async def test_decode_video_frame():
     frame = await asyncio.wait_for(anext(decoder), timeout=5.0)
     decoder.cancel()
     assert isinstance(frame, moq.VideoDecodedFrame)
+    assert frame.timestamp().scale == 1_000_000
 
     i420 = frame.pixels(moq.VideoPixelFormat.I420)
 
