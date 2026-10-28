@@ -49,6 +49,7 @@ test:
     bun sh/gh/queue.test.ts
     python3 sh/gh/install-formula.test.py
     sh/gh/release.test.sh
+    python3 sh/gh/bump.test.py
     python3 sh/gh/ffi.test.py
     bun test sh/gh/ffi.test.ts sh/gh/cpp.test.ts
     python3 sh/rs/package-rename.test.py
@@ -69,6 +70,11 @@ test:
 [positional-arguments]
 release *args:
     sh/gh/release.sh "$@"
+
+# Patch-bump hand-versioned packages with unreleased changes: `just gh bump check|apply|pr`.
+[positional-arguments]
+bump *args:
+    python3 sh/gh/bump.py "$@"
 
 # Post a failed run to Discord, or check cron and publishing alert coverage.
 [positional-arguments]

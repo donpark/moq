@@ -96,13 +96,13 @@ For an advisory against Quinn, follow the advisory triage in [`rs/moq-quic/READM
 - Smoke clients call only the latest published APIs. A release cut updates `test/smoke/clients` to the APIs being published, then verifies the affected smoke lanes.
 - A release is cut by hand: a PR merging `main` into `release`, with a merge commit.
 - A breaking cut first writes, on `main`, each changed package's version-transition section in its `MIGRATE.md` (`## 0.3 -> 0.4`) from the migration audit: the `!` subjects since the `release` merge base, each of those PRs' Impact section, and the API diff.
-- Suggest a `release` backport for any serious bug fix (crash, security, data loss, broken interop), whether found on `main` or reported against a release. Land it on `main` first, then port it onto `release` as a separate PR that keeps the published API, so it ships as a patch. The Release gate's API diff (`just api-diff --deny`) fails a backport that changes one; on the cut PR, whose head is `main`, it only reports.
+- Suggest a `release` backport for any serious bug fix (crash, security, data loss, broken interop), whether found on `main` or reported against a release. Land it on `main` first, then port it onto `release` as a separate PR that keeps the published API, so it ships as a patch. The Release gate's API diff (`just api-diff --deny`) fails a backport that changes one; on the cut PR, whose head is `main`, it only reports. Don't bump versions in it: release-plz bumps the crates, and the Release bump workflow opens a `release-bump` PR patch-bumping every JavaScript, Python, Swift, and Kotlin package whose sources changed; merging both publishes the fix.
 - After any release publishes, patch or breaking, run `just test wire-compat --remeasure` on `main` and land the rewritten `test/interop/compat/planned-breaks.json` with refreshed reasons. Otherwise the nightly wire-compat check fails on the stale pins.
 - Nothing merges `release` into `main` automatically. Before cutting a minor or breaking release, the maintainer merges `release` into `main` once, so trunk carries the published versions, CHANGELOGs, and any `release`-only commits. It lands as a merge commit with `--admin`, never squashed, so the cut starts from an advanced merge base.
 
 # Versions
 
-Releases are cut separately; bump only when asked. Each package's version lives in one place:
+Releases are cut separately; bump only when asked. On `release`, the Release bump workflow (`just gh bump check` previews it) keeps one `release-bump` PR patch-bumping every JavaScript, Python, Swift, and Kotlin package whose sources changed since its current version first reached `release`, with the matching lockfile entries. Go derives its own patch, and Dart, C++, and OBS release from a tag pushed by hand. Each package's version lives in one place:
 
 - **Rust**: release-plz owns crate versions and Rust dependency requirements.
 - **JavaScript**: `js/*/package.json` packages with a `scripts.release` entry (skip private ones like `@moq/wasm`), plus the matching workspace version in `bun.lock`.
