@@ -5,7 +5,7 @@ This is a polyglot monorepo with Rust (server/native) and TypeScript (browser) i
 
 This file is split into nested `AGENTS.md` files based on the language/situation.
 
-- Read `CONTRIBUTING.md` when dealing with PRs.
+- Read `CONTRIBUTING.md` when dealing with PRs, and `REVIEW.md` when reviewing one or triaging review findings.
 - Read `PROMPTING.md` before instructing other agents via context, memory, plans, or reviews.
 - Read `*/AGENTS.md` if the file exists before touching a root directory.
 - Read (and keep up-to-date) `doc/*.md` for user-facing documentation.
