@@ -184,6 +184,7 @@ where
 		loop {
 			match Stream::poll_accept(&mut self.accept, self.shared.version, &mut cx) {
 				Poll::Ready(Ok(stream)) => {
+					let stream = stream.with_stats(self.shared.origin.stats());
 					self.children.push(Control {
 						shared: self.shared.clone(),
 						runtime: self.runtime.clone(),
@@ -650,6 +651,12 @@ impl<S: crate::transport::poll::Session> AnnounceServe<S> {
 		// model uses this exposure to park a reflected copy before it can replace
 		// the source we are currently advertising to that peer.
 		let origin = origin.excluding(Hop::new(exclude_hop).unwrap_or(Hop::UNKNOWN));
+		// Lite03 and later carry the hop path, so only routes with room for our hop
+		// under the origin's cap are advertised; Lite01/02 hide the depth entirely.
+		let origin = match self.shared.version {
+			Version::Lite01 | Version::Lite02 => origin,
+			_ => origin.forwardable(),
+		};
 		// Hidden routes are left out unless the peer opted in. A publish origin that
 		// already opted in (the caller's choice for this peer) keeps them either way.
 		let origin = match hidden {

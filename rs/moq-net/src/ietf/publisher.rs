@@ -365,6 +365,11 @@ impl<S> Publisher<S>
 where
 	S: crate::transport::poll::Boxable,
 {
+	/// Where this session's control traffic is counted.
+	pub(super) fn stats(&self) -> &crate::stats::Session {
+		self.origin.stats()
+	}
+
 	pub fn new(
 		runtime: crate::time::Clock,
 		session: S,
@@ -417,10 +422,21 @@ where
 		self.excluding(&self.peer().await)
 	}
 
-	/// Our origin handle with [`Self::exclude`] applied, the view both the data plane
-	/// and the announce loops read this peer's routes through.
+	/// Our origin handle with [`Self::exclude`] applied, the view the data plane reads
+	/// this peer's routes through. The announce loops read [`Self::advertising`].
 	fn excluding(&self, peer: &cluster::Peer) -> origin::Consumer {
 		self.origin.clone().excluding(self.exclude(peer))
+	}
+
+	/// `origin` as advertised to this peer: never its own routes back (split horizon),
+	/// and under MoQ Cluster only the routes with room for our hop under the origin's
+	/// cap, so selection falls back to a shorter route instead of withdrawing.
+	fn advertising(&self, origin: origin::Consumer, peer: &cluster::Peer) -> origin::Consumer {
+		let origin = origin.excluding(self.exclude(peer));
+		match peer.negotiated() {
+			true => origin.forwardable(),
+			false => origin,
+		}
 	}
 
 	/// The Hop ID whose paths must not be advertised (or served) back to this peer.
@@ -2012,7 +2028,13 @@ where
 
 		kio::wait(|waiter| {
 			if let Poll::Ready(res) = waiter.poll_future(open.as_mut()) {
-				return Poll::Ready(res.map(Some));
+				return Poll::Ready(res.map(|stream| {
+					Some(super::request_stream::with_stats(
+						stream,
+						self.origin.stats(),
+						self.version,
+					))
+				}));
 			}
 			if timeout.poll(waiter).is_ready() {
 				return Poll::Ready(Ok(None));
@@ -2031,8 +2053,7 @@ where
 	async fn read_response(&self, request: &mut Stream<S, Version>) -> Result<Option<(u64, bytes::Bytes)>, Error> {
 		let mut read = std::pin::pin!(async {
 			let type_id: u64 = request.reader.decode().await?;
-			let size: u16 = request.reader.decode().await?;
-			let data = request.reader.read_exact(size as usize).await?;
+			let data = request.reader.read_message(type_id).await?;
 			Ok::<_, Error>((type_id, data))
 		});
 		let mut timeout = crate::runtime::Deadline::after(&self.runtime, ADVERTISE_TIMEOUT);
@@ -2131,7 +2152,7 @@ where
 		// Split horizon, as the solicited loop applies it: never advertise a route back
 		// to the peer it came from.
 		let origin = self
-			.excluding(&peer)
+			.advertising(self.origin.clone(), &peer)
 			.discovery(!self.peer_setup.get().await.hidden || self.origin.includes_hidden());
 
 		let ns = Namespaces::new(peer, Target::Requests(None));
@@ -2202,7 +2223,7 @@ where
 		// Register the split-horizon peer on the announce cursor too. The origin
 		// model uses this exposure to park a reflected copy before it can replace
 		// the source we are currently advertising to that peer.
-		let origin = origin.excluding(self.exclude(&peer));
+		let origin = self.advertising(origin, &peer);
 
 		// Draft-14/15 predate NAMESPACE, so they answer with their own PUBLISH_NAMESPACE
 		// requests and keep this stream open for the subscription's lifetime.

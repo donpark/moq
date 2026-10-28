@@ -185,6 +185,7 @@ pub struct Setup {
 }
 
 impl Message for Setup {
+	const CONTROL: Option<crate::stats::Control> = Some(crate::stats::Control::Session);
 	const MAX_SIZE: usize = crate::setup::MAX_SETUP_SIZE;
 
 	fn decode_msg<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Self, DecodeError> {

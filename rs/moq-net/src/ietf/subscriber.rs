@@ -641,7 +641,8 @@ where
 	/// A negotiated peer supplies the path and cost, so the route is what the mesh
 	/// actually knows: the full chain, and the accumulated cost plus this link's price.
 	/// A path starting with 0 gets this connection's stamp in front of it; the 0s stay. An advertisement whose path already contains our own Hop ID looped back,
-	/// and neither forwarding it nor subscribing through it is safe.
+	/// and neither forwarding it nor subscribing through it is safe. One longer than
+	/// the origin's hop limit, stamp included, is discarded too.
 	fn route(&self, advert: Option<&cluster::Advert>, peer: &cluster::Peer) -> Option<Advertised> {
 		let Some(advert) = advert else {
 			return Some(Advertised {
@@ -657,6 +658,9 @@ where
 			.route(cluster::link_cost(self.cost, peer))
 			.with_via(self.via(peer));
 		route.hops.stamp(self.stamp).ok()?;
+		if route.hops.len() > self.origin.max_hops().get() {
+			return None;
+		}
 		Some(Advertised { route })
 	}
 
@@ -736,6 +740,11 @@ where
 		crate::model::interest_prefixes(&self.origin.allowed())
 	}
 
+	/// Where this session's control traffic is counted.
+	pub(super) fn stats(&self) -> &crate::stats::Session {
+		self.origin.stats()
+	}
+
 	/// Send SUBSCRIBE_NAMESPACE for one prefix on a bidi stream.
 	/// The caller is responsible for opening the appropriate stream type
 	/// (virtual for v14/v15, real bidi for v16+), one per prefix.
@@ -748,6 +757,12 @@ where
 		mut stream: Stream<T, Version>,
 		prefix: PathOwned,
 	) -> Result<(), Error> {
+		// Draft 16 opens a real bidi stream for this, so its reader counts too.
+		stream = match self.version {
+			Version::Draft16 => stream.with_stats(self.origin.stats()),
+			_ => super::request_stream::with_stats(stream, self.origin.stats(), self.version),
+		};
+
 		// A peer that sent GOAWAY told us to stop opening requests on this session,
 		// announce-interest included (draft-19 sect 10.4).
 		if self.going_away.is_set() {
@@ -790,8 +805,7 @@ where
 
 		// Read response
 		let type_id: u64 = stream.reader.decode().await?;
-		let size: u16 = stream.reader.decode().await?;
-		let mut data = stream.reader.read_exact(size as usize).await?;
+		let mut data = stream.reader.read_message(type_id).await?;
 
 		match type_id {
 			ietf::SubscribeNamespaceOk::ID if self.version == Version::Draft14 => {
@@ -855,8 +869,7 @@ where
 				Some(id) => id,
 				None => break, // Stream closed
 			};
-			let size: u16 = stream.reader.decode().await?;
-			let mut data = stream.reader.read_exact(size as usize).await?;
+			let mut data = stream.reader.read_message(type_id).await?;
 
 			match type_id {
 				// The suffix is relative to the prefix we subscribed, which is itself
@@ -1116,8 +1129,7 @@ where
 				return Err(Error::UnexpectedMessage);
 			}
 
-			let size: u16 = stream.reader.decode().await?;
-			let mut data = stream.reader.read_exact(size as usize).await?;
+			let mut data = stream.reader.read_message(type_id).await?;
 
 			if terminal {
 				ietf::PublishNamespaceDone::decode_msg(&mut data, self.version)?;
@@ -1631,7 +1643,7 @@ where
 		};
 
 		let mut stream = match Stream::open(&mut self.session.clone(), self.version).await {
-			Ok(s) => s,
+			Ok(s) => super::request_stream::with_stats(s, self.origin.stats(), self.version),
 			Err(err) => {
 				tracing::debug!(%err, "failed to open subscribe stream");
 				request.reject(err);
@@ -2079,7 +2091,7 @@ where
 		}
 
 		let mut stream = match Stream::open(&mut self.session.clone(), self.version).await {
-			Ok(s) => s,
+			Ok(s) => super::request_stream::with_stats(s, self.origin.stats(), self.version),
 			Err(err) => {
 				tracing::debug!(%err, "failed to open joining FETCH stream");
 				settle_join_live(&fill);
@@ -2148,8 +2160,7 @@ where
 	/// refusal, not a session error: the live subscription continues.
 	async fn read_fetch_response(&self, stream: &mut Stream<S, Version>) -> Result<bool, Error> {
 		let type_id: u64 = stream.reader.decode().await?;
-		let size: u16 = stream.reader.decode().await?;
-		let mut data = stream.reader.read_exact(size as usize).await?;
+		let mut data = stream.reader.read_message(type_id).await?;
 
 		match type_id {
 			ietf::FetchOk::ID => {
@@ -2171,8 +2182,7 @@ where
 	async fn read_subscribe_response(&self, stream: &mut Stream<S, Version>) -> Result<Option<Accepted>, Error> {
 		// Read type_id + size + body from the stream
 		let type_id: u64 = stream.reader.decode().await?;
-		let size: u16 = stream.reader.decode().await?;
-		let mut data = stream.reader.read_exact(size as usize).await?;
+		let mut data = stream.reader.read_message(type_id).await?;
 
 		match type_id {
 			ietf::SubscribeOk::ID => {
@@ -3022,7 +3032,7 @@ where
 		let _registered = GroupFetchEntry::new(&self.state, fetch_id, slot.clone());
 
 		let mut stream = match Stream::open(&mut self.session.clone(), self.version).await {
-			Ok(stream) => stream,
+			Ok(stream) => super::request_stream::with_stats(stream, self.origin.stats(), self.version),
 			Err(err) => return request.reject(err),
 		};
 
@@ -3193,8 +3203,7 @@ where
 	/// Read the answer to a group FETCH: FETCH_OK, or the publisher's refusal as an error.
 	async fn read_group_fetch_response(&self, stream: &mut Stream<S, Version>) -> Result<ietf::FetchOk, Error> {
 		let type_id: u64 = stream.reader.decode().await?;
-		let size: u16 = stream.reader.decode().await?;
-		let mut data = stream.reader.read_exact(size as usize).await?;
+		let mut data = stream.reader.read_message(type_id).await?;
 
 		match type_id {
 			ietf::FetchOk::ID => Ok(ietf::FetchOk::decode_msg(&mut data, self.version)?),

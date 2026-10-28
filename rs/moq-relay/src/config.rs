@@ -1279,6 +1279,33 @@ uid = [1001]
 				source: "generate",
 			},
 			Case {
+				name: "hop-limit-from-file",
+				toml: "[cluster]\nmax_hops = 8\n",
+				env: &[],
+				cli: &[],
+				key: "cluster.max_hops",
+				check: |config| assert_eq!(config.cluster.max_hops, Some(8)),
+				source: "max_hops",
+			},
+			Case {
+				name: "hop-limit-env-overrides-file",
+				toml: "[cluster]\nmax_hops = 8\n",
+				env: &[("MOQ_CLUSTER_MAX_HOPS", "6")],
+				cli: &[],
+				key: "cluster.max_hops",
+				check: |config| assert_eq!(config.cluster.max_hops, Some(6)),
+				source: "MOQ_CLUSTER_MAX_HOPS",
+			},
+			Case {
+				name: "hop-limit-cli-overrides-env-and-file",
+				toml: "[cluster]\nmax_hops = 8\n",
+				env: &[("MOQ_CLUSTER_MAX_HOPS", "6")],
+				cli: &["--cluster-max-hops", "4"],
+				key: "cluster.max_hops",
+				check: |config| assert_eq!(config.cluster.max_hops, Some(4)),
+				source: "--cluster-max-hops",
+			},
+			Case {
 				name: "env-overrides-file",
 				toml: "[stats]\nenabled = false\n",
 				env: &[("MOQ_STATS_ENABLED", "true")],
@@ -1305,6 +1332,7 @@ uid = [1001]
 				"MOQ_LISTEN_VERSION",
 				"MOQ_LISTEN_TLS_GENERATE",
 				"MOQ_RUNTIME_PIN",
+				"MOQ_CLUSTER_MAX_HOPS",
 			]);
 			for (key, value) in case.env {
 				// SAFETY: EnvGuard serializes env mutation across these tests.

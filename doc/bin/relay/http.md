@@ -47,8 +47,8 @@ listen = "127.0.0.1:9101"
 
 ### GET /metrics
 
-Prometheus text: bytes, frames, groups, subscriptions, viewers, and sessions
-split by `tier` and `role`, plus accept-loop counters per TCP listener. Alert
+Prometheus text: bytes, frames, groups, announces, subscriptions, viewers, and
+sessions split by `tier` and `role`, plus accept-loop counters per TCP listener. Alert
 on `moq_relay_accept_failures_total{class="exhausted"}`, which means the
 process ran out of a resource `accept` needs. Content dropped for drifting past
 a subscriber's budget is counted separately as `moq_relay_stale_bytes_total`
@@ -59,6 +59,12 @@ left yet. Host CPU and memory belong to a node exporter.
 Traffic and session counters accumulate for the node's lifetime, including
 broadcasts and sessions that have ended. The stats publishing prefix (normally
 `.stats`) is excluded to avoid counting the feed's own traffic.
+
+`moq_relay_control_tx_bytes_total` and `moq_relay_control_rx_bytes_total`
+count control-message bytes by `tier` and `class` (`session`, `announce`, `track_info`, `subscribe`, `fetch`,
+`probe`, `auth`, `goaway`, `other`) to spot control-heavy sessions. They
+include message size prefixes but leave out media payload and transport
+overhead such as QUIC framing, ACKs, and retransmissions.
 
 With `--runtime-io-uring`, each QUIC worker thread also reports its own
 `moq_relay_uring_*` counters under a `worker` label: datagrams and syscalls

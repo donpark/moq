@@ -288,7 +288,7 @@ async fn serve_health() -> Response {
 }
 
 /// Prometheus text-exposition metrics for this node's own MoQ traffic counters
-/// (bytes/frames/groups, subscriptions, viewers, and connected sessions),
+/// (bytes/frames/groups, announces, subscriptions, viewers, and connected sessions),
 /// summed across broadcasts and split by `tier`/`role`.
 ///
 /// Unauthenticated, which is why it lives on the internal listener rather than
@@ -423,6 +423,18 @@ fn render_metrics(
 	);
 	counter(
 		&mut out,
+		"moq_relay_announces_started_total",
+		"Broadcast announces started.",
+		|c| c.announces_started,
+	);
+	counter(
+		&mut out,
+		"moq_relay_announces_ended_total",
+		"Broadcast announces ended; subtract from started for live announces.",
+		|c| c.announces_ended,
+	);
+	counter(
+		&mut out,
 		"moq_relay_subscriptions_opened_total",
 		"Track subscriptions opened.",
 		|c| c.subscriptions_started,
@@ -469,6 +481,32 @@ fn render_metrics(
 			tier.as_str(),
 			sessions.sessions_ended
 		);
+	}
+
+	let control = snap.control();
+	for (name, help, field) in [
+		(
+			"moq_relay_control_tx_bytes_total",
+			"Control-message bytes encoded for sending, including codec prefixes; excludes transport overhead.",
+			(|b: &moq_net::stats::Bytes| b.tx) as fn(&moq_net::stats::Bytes) -> u64,
+		),
+		(
+			"moq_relay_control_rx_bytes_total",
+			"Control-message bytes decoded, including codec prefixes; excludes transport overhead.",
+			(|b: &moq_net::stats::Bytes| b.rx) as fn(&moq_net::stats::Bytes) -> u64,
+		),
+	] {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} counter");
+		for (tier, class, bytes) in &control {
+			let _ = writeln!(
+				out,
+				"{name}{{tier=\"{}\",class=\"{}\"}} {}",
+				tier.as_str(),
+				class.as_str(),
+				field(bytes)
+			);
+		}
 	}
 
 	render_accepts(&mut out, listeners);
@@ -914,6 +952,41 @@ mod tests {
 
 		let Json(snapshot) = serve_nodes(State(state)).await;
 		assert_eq!(snapshot.nodes[0].node, "https://relay-b.example/");
+	}
+
+	#[tokio::test]
+	async fn announce_metrics_keep_retired_totals() {
+		let stats = moq_net::stats::Registry::new(Default::default());
+		let producer =
+			moq_tokio::origin::spawn().with_stats(stats.tier(moq_net::stats::Tier::new("edge")).session("root"));
+		let broadcast = producer.create_broadcast("demo/retired").unwrap();
+		broadcast.announce(Default::default()).unwrap();
+
+		let body = render_metrics(&stats.snapshot(), &[], &[]);
+		assert!(
+			body.contains("moq_relay_announces_started_total{tier=\"edge\",role=\"subscriber\"} 1"),
+			"live announce start:\n{body}"
+		);
+		assert!(
+			body.contains("moq_relay_announces_ended_total{tier=\"edge\",role=\"subscriber\"} 0"),
+			"live announce end:\n{body}"
+		);
+
+		broadcast.unannounce();
+		drop(broadcast);
+		drop(producer);
+		let mut report = moq_net::stats::Report::default();
+		stats.report(&mut report);
+
+		let body = render_metrics(&stats.snapshot(), &[], &[]);
+		assert!(
+			body.contains("moq_relay_announces_started_total{tier=\"edge\",role=\"subscriber\"} 1"),
+			"retired announce start:\n{body}"
+		);
+		assert!(
+			body.contains("moq_relay_announces_ended_total{tier=\"edge\",role=\"subscriber\"} 1"),
+			"retired announce end:\n{body}"
+		);
 	}
 
 	/// The `/metrics` renderer emits well-formed Prometheus exposition: a

@@ -2,7 +2,7 @@ use crate::{broadcast, cache, group, stats, track};
 use kio::Pollable;
 use std::{
 	cmp::Reverse,
-	collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+	collections::{BTreeSet, HashMap, HashSet, VecDeque},
 	fmt,
 	sync::Arc,
 	sync::atomic::{AtomicU64, Ordering},
@@ -99,6 +99,14 @@ pub struct Config {
 	/// detection and shortest-path routing.
 	pub hop: Hop,
 
+	/// Longest hop path a session using this origin accepts or forwards (default 32).
+	///
+	/// Applies to moq-lite-03+ hop paths and the negotiated MoQ Cluster extension on
+	/// moq-transport. A forwarded path counts this origin's own hop too, including
+	/// when the receiving peer reconstructs that hop from the announce handshake.
+	/// Protocols without a hop path cannot reveal or bound the depth they hide.
+	pub max_hops: HopLimit,
+
 	/// The cache pool broadcasts under this origin charge their groups into. It flows
 	/// down the ownership chain (origin -> broadcast -> track -> group): a track opens
 	/// an account against it, and its groups charge through that. It has no byte target
@@ -161,6 +169,7 @@ impl Default for Config {
 		let pool = cache::Pool::new(cache::Config::default().with_expiry(cache::DEFAULT_EXPIRY));
 		Self {
 			hop: Hop::random(),
+			max_hops: HopLimit::default(),
 			pool,
 			cache_duration: Duration::MAX,
 			default_max_age: track::DEFAULT_MAX_AGE,
@@ -221,6 +230,32 @@ where
 /// diameter; appending past this limit returns [`InvalidHop::TooMany`] rather than
 /// silently truncating.
 pub(crate) const MAX_HOPS: usize = 32;
+
+/// The longest advertised hop path an origin accepts or forwards, from 1 to 32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HopLimit(usize);
+
+impl HopLimit {
+	/// A hop-path cap from 1 to 32, or `None` outside that range.
+	pub const fn new(max: usize) -> Option<Self> {
+		if max == 0 || max > MAX_HOPS {
+			None
+		} else {
+			Some(Self(max))
+		}
+	}
+
+	/// The maximum number of hops in an advertised path.
+	pub const fn get(self) -> usize {
+		self.0
+	}
+}
+
+impl Default for HopLimit {
+	fn default() -> Self {
+		Self(MAX_HOPS)
+	}
+}
 
 /// Bounded, loop-free list of [`Hop`] entries: the hop chain of a broadcast.
 ///
@@ -697,7 +732,7 @@ impl Quarantine {
 	}
 }
 
-/// A pending update's hold, keyed by prefix in its [`AnnounceConsumer`].
+/// A pending update's hold, kept with it in its [`AnnounceConsumer`]'s queue.
 ///
 /// A consumer reads the origin's clock outside the driver, where it holds the
 /// driver's last reading, not the time the update arrived. So a hold first waits
@@ -723,13 +758,31 @@ enum PendingUpdate {
 	UnannounceAnnounce { old: AnnounceMeta, new: AnnounceMeta },
 }
 
-/// Pending updates keyed by prefix. `BTreeMap` keeps memory strictly bounded by
-/// the number of distinct prefixes with outstanding work (collapsed pairs are
-/// fully erased) and gives a deterministic lexicographic delivery order so
-/// tests can predict it.
+/// A prefix's queued update and where it waits in the queue.
+struct Pending {
+	update: Option<PendingUpdate>,
+	/// When a poll looks at the entry again, in [`OriginConsumerState::parked`],
+	/// or `None` while it is in [`OriginConsumerState::due`].
+	wake: Option<Instant>,
+	/// The update hold, from the first poll that saw the entry as one.
+	held: Option<Held>,
+}
+
+/// Pending updates keyed by prefix. Memory stays strictly bounded by the number
+/// of distinct prefixes with outstanding work (collapsed pairs are fully erased),
+/// and delivery takes the first ready prefix in lexicographic order, so tests can
+/// predict it.
+///
+/// Every entry sits in exactly one of `due` and `parked`, so a poll touches only
+/// what changed or came due since the last one, never the entries it holds back.
 #[derive(Default)]
 struct OriginConsumerState {
-	pending: BTreeMap<PathOwned, PendingUpdate>,
+	pending: HashMap<PathOwned, Pending>,
+	/// The entries a poll looks at next, in delivery order: queued or changed since,
+	/// or come due.
+	due: BTreeSet<PathOwned>,
+	/// The entries held back, by when a poll looks at them again.
+	parked: BTreeSet<(Instant, PathOwned)>,
 	/// Prefixes whose most recently delivered update was an announce. A pending
 	/// `Announce` is ambiguous on its own: it is an unseen initial announce (a
 	/// retraction cancels it entirely) or a metadata update on a route the
@@ -738,12 +791,57 @@ struct OriginConsumerState {
 	/// Set by the origin's teardown: the cursor drains `pending`, then reports
 	/// the end instead of parking forever on a table that can never fire again.
 	ended: bool,
+	/// Entries the polls have looked at, which the CPU a poll costs follows.
+	#[cfg(test)]
+	steps: usize,
 }
 
 impl OriginConsumerState {
+	/// Queue `update` at `prefix`, or replace the one queued there in its place. A
+	/// replaced entry is looked at again on the next poll.
+	fn put(&mut self, prefix: PathOwned, update: PendingUpdate) {
+		let Some(pending) = self.pending.get_mut(&prefix) else {
+			self.due.insert(prefix.clone());
+			self.pending.insert(
+				prefix,
+				Pending {
+					update: Some(update),
+					wake: None,
+					held: None,
+				},
+			);
+			return;
+		};
+		pending.update = Some(update);
+		if let Some(wake) = pending.wake.take() {
+			let parked = (wake, prefix);
+			self.parked.remove(&parked);
+			self.due.insert(parked.1);
+		}
+	}
+
+	/// Unqueue the entry at `prefix`.
+	fn remove(&mut self, prefix: &PathOwned) -> Option<Pending> {
+		let (prefix, pending) = self.pending.remove_entry(prefix)?;
+		match pending.wake {
+			Some(wake) => self.parked.remove(&(wake, prefix)),
+			None => self.due.remove(&prefix),
+		};
+		Some(pending)
+	}
+
+	/// The origin tore down: drain everything queued, holds and all, then end.
+	fn end(&mut self) {
+		self.ended = true;
+		for (_, prefix) in std::mem::take(&mut self.parked) {
+			self.pending.get_mut(&prefix).unwrap().wake = None;
+			self.due.insert(prefix);
+		}
+	}
+
 	fn apply_announce(&mut self, prefix: PathOwned, meta: RouteMeta, captures: Option<Vec<Pattern>>) {
 		let meta = (meta, captures);
-		let new = match self.pending.remove(&prefix) {
+		let new = match self.pending.get_mut(&prefix).and_then(|pending| pending.update.take()) {
 			// First announce, a stale announce being replaced, or a metadata update.
 			None | Some(PendingUpdate::Announce(_)) => PendingUpdate::Announce(meta),
 			// Consumer needs to observe the retraction before this announce.
@@ -751,85 +849,117 @@ impl OriginConsumerState {
 				PendingUpdate::UnannounceAnnounce { old, new: meta }
 			}
 		};
-		self.pending.insert(prefix, new);
+		self.put(prefix, new);
 	}
 
 	fn apply_unannounce(&mut self, prefix: PathOwned, last: RouteMeta, captures: Option<Vec<Pattern>>) {
 		let last = (last, captures);
-		match self.pending.remove(&prefix) {
+		match self.pending.get_mut(&prefix).and_then(|pending| pending.update.take()) {
 			// The pending announce was never delivered and neither was any earlier
 			// one, so the pair cancels entirely.
-			Some(PendingUpdate::Announce(_)) if !self.delivered.contains(&prefix) => {}
+			Some(PendingUpdate::Announce(_)) if !self.delivered.contains(&prefix) => {
+				self.remove(&prefix);
+			}
 			// Either nothing is pending or the pending announce was a metadata
 			// update on a delivered route; the consumer still owes a retraction.
 			None | Some(PendingUpdate::Announce(_) | PendingUpdate::Unannounce(_)) => {
-				self.pending.insert(prefix, PendingUpdate::Unannounce(last));
+				self.put(prefix, PendingUpdate::Unannounce(last));
 			}
 			// The embedded announce cancels with this retraction; the consumer still
 			// needs the leading one.
 			Some(PendingUpdate::UnannounceAnnounce { old, .. }) => {
-				self.pending.insert(prefix, PendingUpdate::Unannounce(old));
+				self.put(prefix, PendingUpdate::Unannounce(old));
 			}
 		}
 	}
 
-	/// Whether the pending entry at `prefix` changes a route the consumer holds
-	/// to another route, rather than adding or removing one.
-	fn is_update(&self, prefix: &PathOwned, update: &PendingUpdate) -> bool {
-		matches!(update, PendingUpdate::Announce(_)) && self.delivered.contains(prefix)
+	/// Whether a poll at `now` has an entry to look at: one queued, changed, or come
+	/// due since the last, or the end of a torn-down origin.
+	fn due(&self, now: Option<Instant>) -> bool {
+		!self.due.is_empty()
+			|| self.wake().is_some_and(|wake| now.is_some_and(|now| wake <= now))
+			|| (self.ended && self.pending.is_empty())
 	}
 
-	/// The first pending prefix ready to deliver, or when the next held one is.
-	/// See [`Config::update_hold`]; a hold starts the first time a scan sees it,
-	/// and a quarantine in `retracted` (settled against `now`) holds until it ends.
+	/// When the next held entry is due, if any is held.
+	fn wake(&self) -> Option<Instant> {
+		self.parked.first().map(|(wake, _)| *wake)
+	}
+
+	/// The first pending prefix ready to deliver at `now`, or when the next held one
+	/// is. Each entry looked at is either ready or parked until it could be.
+	///
+	/// A pending entry that changes a route the consumer holds to another route,
+	/// rather than adding or removing one, waits out the update hold (see
+	/// [`Config::update_hold`]), which starts the first time a poll sees it. A stale
+	/// path to a retracted publisher waits out its quarantine in `retracted`,
+	/// settled against `now`.
 	fn scan(
-		&self,
-		held: &mut HashMap<PathOwned, Held>,
+		&mut self,
 		retracted: &HashMap<PathOwned, Quarantine>,
 		now: Option<Instant>,
 		hold: Duration,
 	) -> Result<PathOwned, Option<Instant>> {
-		let mut wake = None;
-		for (prefix, update) in &self.pending {
+		while let Some((wake, _)) = self.parked.first()
+			&& now.is_some_and(|now| *wake <= now)
+		{
+			let (_, prefix) = self.parked.pop_first().unwrap();
+			self.pending.get_mut(&prefix).unwrap().wake = None;
+			self.due.insert(prefix);
+		}
+		while let Some(prefix) = self.due.first() {
+			#[cfg(test)]
+			{
+				self.steps += 1;
+			}
 			let Some(now) = now.filter(|_| !hold.is_zero() && !self.ended) else {
 				return Ok(prefix.clone());
 			};
-			if !self.is_update(prefix, update) {
-				let quarantine = match update {
-					PendingUpdate::Announce((meta, _)) => retracted.get(prefix).filter(|q| q.holds(meta)),
-					_ => None,
-				};
-				let until = match quarantine.map(|q| q.held) {
-					Some(Held::Anchoring(seen)) => seen + Duration::from_nanos(1),
-					Some(Held::Until(until)) if now < until => until,
-					_ => return Ok(prefix.clone()),
-				};
-				wake = Some(wake.map_or(until, |w: Instant| w.min(until)));
-				continue;
-			}
-			// The clock reads the driver's last advance, which may be stale: anchor the
-			// hold on the first advance after the update arrived, by waking the driver.
-			let until = match held.get(prefix).copied() {
-				None => {
-					held.insert(prefix.clone(), Held::Anchoring(now));
-					now + Duration::from_nanos(1)
+			let pending = self.pending.get_mut(prefix).unwrap();
+			let wake = match pending.update.as_ref().unwrap() {
+				PendingUpdate::Announce(_) if self.delivered.contains(prefix) => {
+					// The clock reads the driver's last advance, which may be stale: anchor
+					// the hold on the first advance after the update arrived, by waking the
+					// driver.
+					match pending.held {
+						None => {
+							pending.held = Some(Held::Anchoring(now));
+							Some(now + Duration::from_nanos(1))
+						}
+						Some(Held::Anchoring(seen)) if now <= seen => Some(seen + Duration::from_nanos(1)),
+						Some(Held::Anchoring(_)) => {
+							pending.held = Some(Held::Until(now + hold));
+							Some(now + hold)
+						}
+						Some(Held::Until(until)) => Some(until).filter(|until| *until > now),
+					}
 				}
-				Some(Held::Anchoring(seen)) if now <= seen => seen + Duration::from_nanos(1),
-				Some(Held::Anchoring(_)) => {
-					held.insert(prefix.clone(), Held::Until(now + hold));
-					now + hold
-				}
-				Some(Held::Until(until)) if until <= now => return Ok(prefix.clone()),
-				Some(Held::Until(until)) => until,
+				PendingUpdate::Announce((meta, _)) => match retracted.get(prefix).filter(|q| q.holds(meta)) {
+					Some(Quarantine {
+						held: Held::Anchoring(seen),
+						..
+					}) => Some(*seen + Duration::from_nanos(1)),
+					Some(Quarantine {
+						held: Held::Until(until),
+						..
+					}) => Some(*until).filter(|until| *until > now),
+					None => None,
+				},
+				_ => None,
 			};
-			wake = Some(wake.map_or(until, |w: Instant| w.min(until)));
+			let Some(wake) = wake else {
+				return Ok(prefix.clone());
+			};
+			pending.wake = Some(wake);
+			let prefix = self.due.pop_first().unwrap();
+			self.parked.insert((wake, prefix));
 		}
-		Err(wake)
+		Err(self.wake())
 	}
 
 	/// Take the pending update at `prefix` for delivery.
 	fn take_prefix(&mut self, prefix: PathOwned) -> Option<AnnounceUpdate> {
-		let ((meta, captures), kind) = match self.pending.remove(&prefix).unwrap() {
+		let ((meta, captures), kind) = match self.remove(&prefix).unwrap().update.unwrap() {
 			PendingUpdate::Announce(meta) => {
 				// The consumer has seen this prefix before, so it is a metadata update.
 				let kind = match self.delivered.insert(prefix.clone()) {
@@ -846,7 +976,7 @@ impl OriginConsumerState {
 				// Deliver the retraction now; leave the trailing announce pending so
 				// the next take returns it for the same prefix.
 				self.delivered.remove(&prefix);
-				self.pending.insert(prefix.clone(), PendingUpdate::Announce(new));
+				self.put(prefix.clone(), PendingUpdate::Announce(new));
 				(old, AnnounceKind::Retracted)
 			}
 		};
@@ -905,6 +1035,10 @@ struct RouteEntry {
 	/// and building one allocates a segment vector and a canonical string. Holding
 	/// it makes that visit a comparison.
 	claim: Pattern,
+	/// Each [`Self::scope`] member intersected with [`Self::claim`], built once at
+	/// announce time for the same reason: the paths beneath the prefix the route
+	/// may serve. A member whose intersection is too large to spell reaches nothing.
+	reach: Vec<Pattern>,
 }
 
 impl RouteEntry {
@@ -923,6 +1057,17 @@ impl RouteEntry {
 			true => Source::Peer(self.via),
 			false => Source::Local,
 		}
+	}
+
+	/// The metadata an announce cursor delivers for this entry.
+	fn meta(&self) -> RouteMeta {
+		(self.hops.clone(), self.cost, self.entered())
+	}
+
+	/// Whether [`Self::meta`] would equal `meta`, without building it.
+	fn delivers(&self, meta: &RouteMeta) -> bool {
+		let (hops, cost, source) = meta;
+		*hops == self.hops && *cost == self.cost && *source == self.entered()
 	}
 
 	/// Whether a request for `path` can be served through this entry. A served
@@ -956,12 +1101,17 @@ impl RouteEntry {
 
 	/// Whether this route and `allowed` share any path beneath the advertised prefix.
 	fn overlaps(&self, allowed: &Patterns) -> bool {
-		self.scope.iter().any(|scope| {
-			scope
-				.intersect(&self.claim)
-				.is_ok_and(|scoped| scoped.iter().any(|restriction| allowed.overlaps(restriction)))
-		})
+		self.reach.iter().any(|reach| allowed.overlaps(reach))
 	}
+}
+
+/// What `scope` lets a route at `claim` serve: see [`RouteEntry::reach`].
+fn reach(scope: &Patterns, claim: &Pattern) -> Vec<Pattern> {
+	scope
+		.iter()
+		.filter_map(|scope| scope.intersect(claim).ok())
+		.flatten()
+		.collect()
 }
 
 /// The paths a prefix can cover, using an exact pattern at the path depth limit.
@@ -1012,12 +1162,18 @@ struct Horizon {
 	exclude: Option<Hop>,
 	/// Hide the routes that entered from a cluster peer ([`Consumer::local`]).
 	local: bool,
+	/// Hide the routes with no room for our hop under this cap, because this reader
+	/// forwards them ([`Consumer::forwardable`]). Selection then falls back to a
+	/// shorter route instead of withdrawing a prefix an in-cap path still reaches.
+	max_hops: Option<HopLimit>,
 }
 
 impl Horizon {
 	/// Whether `entry` may be observed or served through this horizon.
 	fn admits(&self, entry: &RouteEntry) -> bool {
-		!(self.local && entry.peer) && entry.visible_to(self.exclude)
+		!(self.local && entry.peer)
+			&& entry.visible_to(self.exclude)
+			&& self.max_hops.is_none_or(|max| entry.hops.len() < max.get())
 	}
 
 	/// This horizon as it applies to the routes covering `path`: an excluded peer
@@ -1029,10 +1185,17 @@ impl Horizon {
 	/// front on its next request, while what it already reads stays on the plain
 	/// front. That cannot loop, since the peer serves our requests through its own
 	/// split horizon, which never routes back through us.
+	///
+	/// The hop cap bounds what is advertised, not what serves a request, so it never
+	/// applies here.
 	fn effective(self, routes: &RouteTable, path: &Path) -> Self {
-		match self.exclude {
-			Some(peer) if routes.covering(path).any(|entry| !entry.visible_to(Some(peer))) => self,
-			_ => Self { exclude: None, ..self },
+		let horizon = Self { max_hops: None, ..self };
+		match horizon.exclude {
+			Some(peer) if routes.covering(path).any(|entry| !entry.visible_to(Some(peer))) => horizon,
+			_ => Self {
+				exclude: None,
+				..horizon
+			},
 		}
 	}
 }
@@ -1053,8 +1216,17 @@ struct RemoteFront {
 	pin: kio::Lock<Pin>,
 }
 
-/// The last route a cursor observed: entry id, metadata, servability, and captures.
-type CursorRoute = (u64, RouteMeta, bool, Option<Vec<Pattern>>);
+/// The last route a cursor observed at a presented prefix.
+struct CursorRoute {
+	/// What the cursor delivered with it.
+	meta: RouteMeta,
+	/// Whether it serves requests: part of the dedupe key, but never delivered.
+	served: bool,
+	/// The absolute prefix it was announced at, which decides `captures`.
+	prefix: PathOwned,
+	/// What the cursor's scope captured from `prefix`.
+	captures: Option<Vec<Pattern>>,
+}
 
 impl WeakEntry for RemoteFront {
 	fn is_closed(&self) -> bool {
@@ -1094,9 +1266,7 @@ struct TableCursor {
 	/// patterns, so a wildcard captures what the handle names rather than the target.
 	named: Option<(Mount, Patterns)>,
 	/// The last delivered best route per presented (relative) prefix, for change
-	/// detection: `(entry id, hops, cost)`.
-	// entry id, metadata, and whether the entry could serve requests: the last
-	// is part of the dedupe key (see `sync_cursor`) but never leaves the model.
+	/// detection.
 	current: HashMap<PathOwned, CursorRoute>,
 }
 
@@ -1149,46 +1319,64 @@ impl TableCursor {
 
 	/// Deliver a changed winner at this presented prefix.
 	fn update(&mut self, presented: &PathOwned, best: Option<&RouteEntry>) {
-		match best {
-			Some(entry) => {
-				let meta = (entry.hops.clone(), entry.cost, entry.entered());
-				let served = entry.server.is_some();
-				let captures = self.captures(&entry.prefix);
-				let previous = self
-					.current
-					.insert(presented.clone(), (entry.id, meta.clone(), served, captures.clone()));
-				match previous {
-					// Unchanged metadata and servability: nothing the consumer could
-					// act on, even if the winning entry itself changed (a reconnect
-					// under an identical route is invisible, which is the point). A
-					// servability flip is delivered: a request that failed Unroutable
-					// under an advertise-only route retries on the update, and hiding
-					// it would park that waiter forever.
-					Some((_, prev, prev_served, prev_captures))
-						if prev == meta && prev_served == served && prev_captures == captures => {}
-					// Captures are consumer identity, not route metadata. Replace the
-					// old identity explicitly so capture-keyed consumers can remove it.
-					Some((_, prev, _, prev_captures)) if prev_captures != captures => {
-						if let Ok(mut state) = self.state.write() {
-							state.apply_unannounce(self.under.join(presented), prev, prev_captures);
-							state.apply_announce(self.under.join(presented), meta, captures);
-						}
-					}
-					_ => {
-						if let Ok(mut state) = self.state.write() {
-							state.apply_announce(self.under.join(presented), meta, captures);
-						}
-					}
+		let Some(entry) = best else {
+			if let Some(last) = self.current.remove(presented)
+				&& let Ok(mut state) = self.state.write()
+			{
+				state.apply_unannounce(self.under.join(presented), last.meta, last.captures);
+			}
+			return;
+		};
+		let served = entry.server.is_some();
+		// Compared in place first: most visits find the winner unchanged, and building
+		// what it delivers allocates. Captures follow from the prefix.
+		if self.current.get(presented).is_some_and(|previous| {
+			previous.prefix == entry.prefix && previous.served == served && entry.delivers(&previous.meta)
+		}) {
+			return;
+		}
+
+		let meta = entry.meta();
+		let captures = self.captures(&entry.prefix);
+		let previous = self.current.insert(
+			presented.clone(),
+			CursorRoute {
+				meta: meta.clone(),
+				served,
+				prefix: entry.prefix.clone(),
+				captures: captures.clone(),
+			},
+		);
+		match previous {
+			// Unchanged metadata and servability: nothing the consumer could
+			// act on, even if the winning entry itself changed (a reconnect
+			// under an identical route is invisible, which is the point). A
+			// servability flip is delivered: a request that failed Unroutable
+			// under an advertise-only route retries on the update, and hiding
+			// it would park that waiter forever.
+			Some(previous) if previous.meta == meta && previous.served == served && previous.captures == captures => {}
+			// Captures are consumer identity, not route metadata. Replace the
+			// old identity explicitly so capture-keyed consumers can remove it.
+			Some(previous) if previous.captures != captures => {
+				if let Ok(mut state) = self.state.write() {
+					state.apply_unannounce(self.under.join(presented), previous.meta, previous.captures);
+					state.apply_announce(self.under.join(presented), meta, captures);
 				}
 			}
-			None => {
-				if let Some((_, last, _, captures)) = self.current.remove(presented)
-					&& let Ok(mut state) = self.state.write()
-				{
-					state.apply_unannounce(self.under.join(presented), last, captures);
+			_ => {
+				if let Ok(mut state) = self.state.write() {
+					state.apply_announce(self.under.join(presented), meta, captures);
 				}
 			}
 		}
+	}
+
+	/// The visible entry among `candidates` that presents here: the longest prefix,
+	/// then the first in [`route_order`].
+	fn best<'a>(&self, candidates: impl Iterator<Item = &'a RouteEntry>) -> Option<&'a RouteEntry> {
+		candidates
+			.filter(|entry| self.visible(entry))
+			.min_by_key(|entry| (Reverse(entry.prefix.len()), route_order(&entry.prefix, entry)))
 	}
 
 	/// Whether the hidden rule lets this cursor discover a route at `prefix`.
@@ -1442,6 +1630,7 @@ pub struct Producer {
 	// Identity for this origin. Appended to route hops when re-announcing so
 	// downstream relays can detect loops and prefer the shortest path.
 	hop: Hop,
+	max_hops: HopLimit,
 
 	// The absolute patterns this handle may publish under.
 	scope: OriginScope,
@@ -1498,6 +1687,7 @@ impl Producer {
 		let pool = config.pool.clone();
 		let producer = Self {
 			hop: config.hop,
+			max_hops: config.max_hops,
 			scope: scope.clone(),
 			root: PathOwned::default(),
 			shared: shared.clone(),
@@ -1529,6 +1719,11 @@ impl Producer {
 		self
 	}
 
+	/// The stats context this handle attributes traffic to.
+	pub(crate) fn stats(&self) -> &stats::Session {
+		&self.stats
+	}
+
 	/// Mark this handle (and any handle derived from it) as a cluster peer's:
 	/// every route it announces reports [`Source::Peer`], and
 	/// [`Consumer::local`] hides it.
@@ -1545,6 +1740,7 @@ impl Producer {
 	pub fn config(&self) -> Config {
 		Config {
 			hop: self.hop,
+			max_hops: self.max_hops,
 			pool: self.pool.clone(),
 			cache_duration: self.cache_duration,
 			default_max_age: self.default_max_age,
@@ -1563,6 +1759,11 @@ impl Producer {
 		self.default_max_age
 	}
 
+	// Sessions enforce the hop cap configured once on the origin.
+	pub(crate) fn max_hops(&self) -> HopLimit {
+		self.max_hops
+	}
+
 	/// A producer with *no* allowed prefixes: it can't publish anything and
 	/// advertises no subscribe interest (its `allowed()` is empty, so the
 	/// subscriber issues no ANNOUNCE_PLEASE). Used to fill an unset session half
@@ -1573,6 +1774,7 @@ impl Producer {
 		let (tasks, _) = TaskSet::new();
 		Self {
 			hop,
+			max_hops: HopLimit::default(),
 			scope: OriginScope::empty(),
 			root: PathOwned::default(),
 			shared: kio::Shared::new(OriginState::new(DEFAULT_UPDATE_HOLD)),
@@ -1768,6 +1970,7 @@ impl Producer {
 		let scope = self.scope.narrow(&rooted).ok_or(Error::Unauthorized)?;
 		Ok(Producer {
 			hop: self.hop,
+			max_hops: self.max_hops,
 			scope,
 			root,
 			shared: self.shared.clone(),
@@ -1948,6 +2151,7 @@ impl Announcing {
 				advertised: serving.advertised,
 				stale,
 				claim: claim.clone(),
+				reach: reach(&self.scope, claim),
 			});
 			shared.sync_route(prefix, claim);
 			entries.push((prefix.clone(), id));
@@ -2250,7 +2454,7 @@ impl DriverState {
 		// the end. Registrations stay (the cursors remove themselves on drop).
 		for state in cursors {
 			if let Ok(mut state) = state.write() {
-				state.ended = true;
+				state.end();
 			}
 		}
 	}
@@ -3275,8 +3479,16 @@ impl RouteTable {
 
 	/// The routes covering `path`: those announced at it and at every prefix of it.
 	fn covering(&self, path: &Path) -> impl Iterator<Item = &RouteEntry> {
-		let (above, at) = self.split(path);
-		above.into_iter().chain(at).flat_map(|node| node.entries.iter())
+		// Walked lazily rather than through [`Self::split`], which allocates: the
+		// announce sync asks this per cursor presenting a prefix as its root.
+		let mut parts = path.parts();
+		let mut next = Some(&self.root);
+		std::iter::from_fn(move || {
+			let node = next?;
+			next = parts.next().and_then(|part| node.children.get(part));
+			Some(node)
+		})
+		.flat_map(|node| node.entries.iter())
 	}
 
 	/// Whether the live route `id` still covers `path`.
@@ -3568,23 +3780,13 @@ impl OriginState {
 		// above it (all of which present as the empty path). Among them, the
 		// longest prefix wins outright, so the metadata a cursor advertises
 		// matches what a request through it actually resolves.
-		let candidates: Vec<&RouteEntry> = match presented.is_empty() {
-			true => routes
-				.covering(&cursor.root)
-				.filter(|entry| cursor.visible(entry))
-				.collect(),
+		let best = match presented.is_empty() {
+			true => cursor.best(routes.covering(&cursor.root)),
 			false => {
 				let absolute = cursor.root.join(presented);
-				routes.at(&absolute).filter(|entry| cursor.visible(entry)).collect()
+				cursor.best(routes.at(&absolute))
 			}
 		};
-		let most = candidates.iter().map(|entry| entry.prefix.len()).max();
-		let best = most.and_then(|most| {
-			candidates
-				.into_iter()
-				.filter(|entry| entry.prefix.len() == most)
-				.min_by_key(|entry| route_order(&entry.prefix, entry))
-		});
 
 		cursor.update(presented, best);
 	}
@@ -4015,6 +4217,7 @@ impl Consume<track::Consumer> for track::Consumer {
 pub struct Consumer {
 	// Identity of the origin this consumer was derived from.
 	hop: Hop,
+	max_hops: HopLimit,
 	scope: OriginScope,
 
 	// A prefix that is automatically stripped from all paths.
@@ -4057,6 +4260,7 @@ impl Consumer {
 	fn from_producer(producer: &Producer, stats: stats::Session) -> Self {
 		Self {
 			hop: producer.hop,
+			max_hops: producer.max_hops,
 			scope: producer.scope.clone(),
 			root: producer.root.clone(),
 			shared: producer.shared.clone(),
@@ -4084,6 +4288,14 @@ impl Consumer {
 	/// peer.
 	pub(crate) fn excluding(mut self, peer: Hop) -> Self {
 		self.horizon.exclude = Some(peer);
+		self
+	}
+
+	/// A clone whose announcements skip the routes this origin cannot forward: a
+	/// chain already at [`Config::max_hops`] has no room for our hop. Sessions whose
+	/// wire carries the hop path apply this to the routes they advertise.
+	pub(crate) fn forwardable(mut self) -> Self {
+		self.horizon.max_hops = Some(self.max_hops);
 		self
 	}
 
@@ -4139,6 +4351,11 @@ impl Consumer {
 	pub fn with_stats(mut self, session: stats::Session) -> Self {
 		self.stats = session;
 		self
+	}
+
+	/// The stats context this handle attributes traffic to.
+	pub(crate) fn stats(&self) -> &stats::Session {
+		&self.stats
 	}
 
 	/// A clone of this consumer with its stats context cleared, so an internal
@@ -4576,10 +4793,9 @@ pub struct AnnounceConsumer {
 	// borrow never collides with the body's.
 	park: kio::Park,
 
-	// Held updates (see [`Config::update_hold`]): their holds by prefix, the
-	// clock they count on, and the timer that wakes the next.
+	// Held updates (see [`Config::update_hold`]): the hold, the clock it counts
+	// on, and the timer that wakes the next.
 	update_hold: Duration,
-	held: HashMap<PathOwned, Held>,
 	// Quarantines by prefix, and their retractions in clock order: first waiting
 	// for a fresh reading (by the stale one), then quarantined (by when each ends).
 	retracted: HashMap<PathOwned, Quarantine>,
@@ -4626,7 +4842,6 @@ impl AnnounceConsumer {
 			guards: HashMap::new(),
 			park: kio::Park::default(),
 			update_hold,
-			held: HashMap::new(),
 			retracted: HashMap::new(),
 			anchoring: VecDeque::new(),
 			expiring: VecDeque::new(),
@@ -4735,50 +4950,40 @@ impl AnnounceConsumer {
 		loop {
 			let now = self.timers.try_now();
 			let settling = self.settle(now);
-			let hold = self.update_hold;
-			let held = &mut self.held;
-			let retracted = &self.retracted;
-			let mut ready = None;
 			let mut wake = None;
-			let update = match self.state.poll(waiter, |state| {
-				if state.pending.is_empty() {
-					return match state.ended {
-						true => Poll::Ready(()),
-						false => Poll::Pending,
-					};
-				}
-				match state.scan(held, retracted, now, hold) {
-					Ok(prefix) => {
-						ready = Some(prefix);
-						Poll::Ready(())
-					}
-					Err(at) => {
-						wake = at;
-						Poll::Pending
-					}
+			// Decided without touching the queue: parking what it holds back is a write,
+			// which would wake whoever waits on it, this poll included.
+			let mut state = match self.state.poll(waiter, |state| match state.due(now) {
+				true => Poll::Ready(()),
+				false => {
+					wake = state.wake();
+					Poll::Pending
 				}
 			}) {
-				Poll::Ready(Ok(mut state)) => match ready {
-					Some(prefix) => state.take_prefix(prefix),
-					None => {
-						// Ended by the origin's teardown, pending updates already
-						// drained; close the channel so every closure signal agrees.
-						state.close();
-						None
-					}
-				},
+				Poll::Ready(Ok(state)) => state,
 				// Closed: discard the Ref so its MutexGuard doesn't escape this call.
-				Poll::Ready(Err(_)) => None,
+				Poll::Ready(Err(_)) => return Poll::Ready(None),
 				Poll::Pending => {
 					self.hold.set(earliest(wake, settling));
 					ready!(self.hold.poll(waiter));
 					continue;
 				}
 			};
+			if state.pending.is_empty() {
+				// Ended by the origin's teardown, pending updates already drained; close
+				// the channel so every closure signal agrees.
+				state.close();
+				return Poll::Ready(None);
+			}
+			// Whatever was due may all be held, parked until a later poll.
+			let Ok(prefix) = state.scan(&self.retracted, now, self.update_hold) else {
+				continue;
+			};
+			let update = state.take_prefix(prefix);
+			drop(state);
 			let Some(update) = update else {
 				return Poll::Ready(None);
 			};
-			self.held.remove(&update.prefix);
 			self.quarantine(&update, now);
 			return Poll::Ready(Some(self.hand_out(update)));
 		}
@@ -4791,21 +4996,29 @@ impl AnnounceConsumer {
 	pub fn try_next(&mut self) -> Option<AnnounceUpdate> {
 		let now = self.timers.try_now();
 		let settling = self.settle(now);
-		let mut state = self.state.write().ok()?;
-		let prefix = match state.scan(&mut self.held, &self.retracted, now, self.update_hold) {
-			Ok(prefix) => prefix,
+		// Read first, so a call with nothing due writes nothing; see `poll_next`.
+		let idle = {
+			let state = self.state.read();
+			(!state.due(now) || state.pending.is_empty()).then(|| state.wake())
+		};
+		let scanned = match idle {
+			Some(wake) => Err(wake),
+			None => {
+				let mut state = self.state.write().ok()?;
+				state
+					.scan(&self.retracted, now, self.update_hold)
+					.map(|prefix| state.take_prefix(prefix))
+			}
+		};
+		let update = match scanned {
+			Ok(update) => update?,
 			Err(wake) => {
-				let wake = earliest(wake, settling);
 				// Arm the hold even though nothing polls it: the armed timer wakes the
 				// driver, so its clock reaches the deadline for a later call to see.
-				drop(state);
-				self.hold.set(wake);
+				self.hold.set(earliest(wake, settling));
 				return None;
 			}
 		};
-		self.held.remove(&prefix);
-		let update = state.take_prefix(prefix)?;
-		drop(state);
 		self.quarantine(&update, now);
 		Some(self.hand_out(update))
 	}
@@ -4942,6 +5155,53 @@ mod tests {
 			.iter()
 			.map(|prefix| Pattern::subtree(prefix).unwrap())
 			.collect()
+	}
+
+	#[test]
+	fn hop_limit_refuses_values_outside_the_wire_bound() {
+		for invalid in [0, 33, usize::MAX] {
+			assert_eq!(HopLimit::new(invalid), None);
+		}
+		for valid in [1, 6, 32] {
+			assert_eq!(HopLimit::new(valid).unwrap().get(), valid);
+		}
+		assert_eq!(HopLimit::default().get(), 32);
+		let config = Config {
+			max_hops: HopLimit::new(6).unwrap(),
+			..Default::default()
+		};
+		let (producer, _driver) = Producer::new(config);
+		let scoped = producer.scope("room", &Patterns::from(Pattern::all())).unwrap();
+		assert_eq!(scoped.config().max_hops.get(), 6);
+		assert_eq!(scoped.consume().forwardable().horizon.max_hops, HopLimit::new(6));
+	}
+
+	/// A forwarding cursor skips a route with no room for our hop and announces the
+	/// best one that has room, while requests still resolve through the full route.
+	#[tokio::test]
+	async fn forwardable_caps_announcements_but_not_requests() {
+		let producer = Config {
+			max_hops: HopLimit::new(2).unwrap(),
+			..Config::new(origin(1))
+		}
+		.produce();
+		let mut plain = producer.consume().announced();
+		let mut forwarded = producer.consume().forwardable().announced();
+
+		let _full = producer
+			.dynamic("room", Route::default().with_hops(hops(&[7, 8])).with_cost(1))
+			.unwrap();
+		assert_eq!(plain.assert_next_active("room").hops, hops(&[7, 8]));
+		forwarded.assert_next_wait();
+
+		let pending = producer.consume().forwardable().request_broadcast("room/alice");
+		assert!(pending.now_or_never().is_none(), "the cap must not refuse a request");
+
+		let _short = producer
+			.dynamic("room", Route::default().with_hops(hops(&[9])).with_cost(50))
+			.unwrap();
+		assert_eq!(forwarded.assert_next_active("room").hops, hops(&[9]));
+		plain.assert_next_wait();
 	}
 
 	#[test]
@@ -5447,7 +5707,7 @@ mod tests {
 		let _b = producer.announce("room/bob", Route::default()).unwrap();
 
 		let mut announced = producer.consume().announced();
-		// BTreeMap order: lexicographic by prefix.
+		// Delivery order: lexicographic by prefix.
 		announced.assert_next_active("room/alice");
 		announced.assert_next_active("room/bob");
 		announced.assert_next_wait();
@@ -7209,6 +7469,48 @@ mod tests {
 		let update = announced.try_next().expect("the hold passed");
 		assert_eq!(update.kind, AnnounceKind::Updated);
 		assert_eq!(update.route.hops, hops(&[9, 3, 4]));
+	}
+
+	/// Two peers carry the same `k` broadcasts of one publisher, and both go away a
+	/// broadcast at a time, the cursor polled after each change. The first peer's
+	/// withdrawals queue `k` held updates; the second's, in the opposite order, make
+	/// each ready behind the held rest. A poll touches only what is due, so the wave
+	/// costs each cursor O(k log k) steps, not O(k²).
+	#[test]
+	fn a_withdrawal_wave_costs_k_log_k_steps() {
+		for k in [64usize, 256, 1024] {
+			let (producer, mut driver) = Producer::new(Config::new(origin(1)));
+			// The holds read the driver's last clock reading, which stays put below.
+			driver.poll(Instant::now(), &kio::Waiter::noop()).unwrap();
+			let peer = producer.clone().peer();
+			let route = |chain: &[u64], via| Route::default().with_hops(hops(chain)).with_via(origin(via));
+			let mut near = Vec::new();
+			let mut far = Vec::new();
+			for i in 0..k {
+				near.push(peer.dynamic(format!("room/{i}"), route(&[9, 2], 2)).unwrap());
+				far.push(peer.dynamic(format!("room/{i}"), route(&[9, 3, 4], 4)).unwrap());
+			}
+			let mut announced = producer.consume().announced();
+			for _ in 0..k {
+				assert_eq!(announced.try_next().unwrap().kind, AnnounceKind::Announced);
+			}
+			let before = announced.state.read().steps;
+
+			for route in near {
+				drop(route);
+				assert!(announced.try_next().is_none(), "the update is held");
+			}
+			for (i, route) in far.into_iter().enumerate().rev() {
+				drop(route);
+				let update = announced.try_next().expect("the retraction is delivered");
+				assert_eq!(update.kind, AnnounceKind::Retracted);
+				assert_eq!(update.prefix, Path::new(&format!("room/{i}")));
+			}
+
+			let steps = announced.state.read().steps - before;
+			let bound = 4 * k * (k.ilog2() as usize + 1);
+			assert!(steps <= bound, "{k} broadcasts took {steps} steps, over {bound}");
+		}
 	}
 
 	/// A new route and a removal are delivered at once. A change of the best route
