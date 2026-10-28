@@ -229,6 +229,8 @@ pub(super) struct GroupState {
 	waiting: Arc<Mutex<BTreeMap<usize, usize>>>,
 	// On a refill copy, the group it writes its frames into instead of holding them.
 	refill: Option<Box<Handle>>,
+	// The group's sequence, which a reader's refill asks its track's fills for.
+	sequence: u64,
 	// IETF relay state, boxed so a group that never carries any pays one pointer.
 	relay: Option<Box<Relay>>,
 	// Compressed-track state, boxed so a plain group pays one pointer.
@@ -1495,6 +1497,7 @@ impl Producer {
 				)));
 			}
 			state.charge = charge;
+			state.sequence = info.sequence;
 			state.log.reader()
 		};
 		let alive = Arc::new(Alive {
@@ -2314,7 +2317,9 @@ impl Handle {
 		let Ok(start) = usize::try_from(frames.start) else {
 			return false;
 		};
-		let end = frames.end.map_or(base, |end| usize::try_from(end).unwrap_or(usize::MAX).min(base));
+		let end = frames
+			.end
+			.map_or(base, |end| usize::try_from(end).unwrap_or(usize::MAX).min(base));
 		let mut index = start.max(state.offset);
 		while index < end {
 			match state.hole(index) {
@@ -2832,7 +2837,6 @@ impl Handle {
 				cache: self.cache.clone(),
 				access: self.alive.access.clone(),
 				refreshed: self.cache.pool().now(),
-				sequence: self.info.sequence,
 				refill: None,
 			},
 			// Untagged: a tagged track attaches the egress meter via `with_meter`
@@ -3291,14 +3295,14 @@ struct Cursor {
 	access: Arc<cache::Access>,
 	refreshed: u64,
 
-	// The group's sequence, which a refill asks its track's fills for.
-	sequence: u64,
 	// The refill this cursor asked for frames pressure shed, held while it reads them.
-	refill: Option<Refill>,
+	// Boxed: rare, and every consumer carries the slot.
+	refill: Option<Box<Refill>>,
 }
 
 /// A cursor's ask for the frames shed at `start..end`, kept wanted while it reads them.
 struct Refill {
+	sequence: u64,
 	start: usize,
 	end: usize,
 	ask: track::Refill,
@@ -3349,7 +3353,6 @@ impl Clone for Cursor {
 			cache: self.cache.clone(),
 			access: self.access.clone(),
 			refreshed: self.refreshed,
-			sequence: self.sequence,
 			// A clone asks a refill of its own if it reaches a hole.
 			refill: None,
 		}
@@ -3407,13 +3410,13 @@ impl Consumer {
 		self
 	}
 
-	/// The index of the first frame the group holds (see [`Producer::start_at`]).
 	/// Whether the group still holds a committed frame.
-	#[cfg(test)]
+	#[cfg(all(test, feature = "async"))]
 	pub(super) fn holds_frames(&self) -> bool {
 		!self.cursor.state.read().is_empty()
 	}
 
+	/// The index of the first frame the group holds (see [`Producer::start_at`]).
 	pub(crate) fn first_frame(&self) -> u64 {
 		self.cursor.state.read().offset as u64
 	}
@@ -3927,25 +3930,33 @@ impl Cursor {
 	/// What became of the refill this cursor asked covering `index`, dropping one it read
 	/// past.
 	fn asked(&mut self, waiter: &kio::Waiter, index: usize) -> Option<Asked> {
-		let Some(refill) = self.refill.as_ref().filter(|refill| (refill.start..refill.end).contains(&index)) else {
+		let Some(refill) = self
+			.refill
+			.as_ref()
+			.filter(|refill| (refill.start..refill.end).contains(&index))
+		else {
 			self.refill = None;
 			return None;
 		};
-		Some(refill.ask.poll(waiter, self.sequence, index == refill.start))
+		Some(refill.ask.poll(waiter, refill.sequence, index == refill.start))
 	}
 
 	/// Ask a refill of the frames shed at `index..end`, or [`Error::Evicted`] with nothing
 	/// to serve it.
 	fn ask(&mut self, index: usize, end: usize) -> Result<()> {
 		// Waiting before it asks, so a refill its handler writes at once spares the frame.
-		let waiting = Waiting::new(self.state.read().waiting.clone(), index);
-		let ask = track::Refill::ask(&self.cache, self.sequence, index as u64..end as u64).ok_or(Error::Evicted)?;
-		self.refill = Some(Refill {
+		let (waiting, sequence) = {
+			let state = self.state.read();
+			(Waiting::new(state.waiting.clone(), index), state.sequence)
+		};
+		let ask = track::Refill::ask(&self.cache, sequence, index as u64..end as u64).ok_or(Error::Evicted)?;
+		self.refill = Some(Box::new(Refill {
+			sequence,
 			start: index,
 			end,
 			ask,
 			_waiting: waiting,
-		});
+		}));
 		Ok(())
 	}
 
@@ -5056,7 +5067,9 @@ mod test {
 		for _ in 0..10_000 {
 			producer.write_frame(Timestamp::ZERO, Bytes::from_static(b"x")).unwrap();
 		}
-		producer.write_frame(Timestamp::ZERO, vec![0u8; MAX_CACHE_BYTES as usize]).unwrap();
+		producer
+			.write_frame(Timestamp::ZERO, vec![0u8; MAX_CACHE_BYTES as usize])
+			.unwrap();
 		producer.finish().unwrap();
 
 		let state = producer.handle.state.read();

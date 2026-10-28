@@ -781,7 +781,11 @@ mod test {
 		// Segments of 1, 2, and 4 slots, the last holding entries 3 and 4.
 		assert_eq!(writer.segment_end(), Some(1));
 		writer.evict(2);
-		assert_eq!(writer.segment_end(), Some(3), "a partly evicted segment still holds entry 2");
+		assert_eq!(
+			writer.segment_end(),
+			Some(3),
+			"a partly evicted segment still holds entry 2"
+		);
 		let heap = writer.heap();
 		writer.evict(3);
 		assert!(writer.heap() < heap, "evicting to it frees the segment");

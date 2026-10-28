@@ -20808,6 +20808,7 @@ mod test {
 	}
 
 	/// A track caching into a pool of `capacity` bytes.
+	#[cfg(feature = "async")]
 	fn small_pool(capacity: u64) -> (Producer, cache::Pool) {
 		let pool = cache::Pool::new(cache::Config::default().with_capacity(capacity));
 		(track_producer_pooled("test", pool.clone()), pool)
@@ -20815,6 +20816,7 @@ mod test {
 
 	/// Serve every queued fill from `archive`, every frame group 0 ever held, writing until
 	/// the fill's private end refuses the next, and return the frame ranges written.
+	#[cfg(feature = "async")]
 	fn serve_refills(requests: &Requests, archive: &[bytes::Bytes]) -> Vec<ops::Range<u64>> {
 		let mut served = Vec::new();
 		while let Poll::Ready(fill) = requests.poll_requested_fill(&kio::Waiter::noop()) {
@@ -20824,6 +20826,7 @@ mod test {
 	}
 
 	/// Serve one taken fill from `archive`, as [`serve_refills`] does.
+	#[cfg(feature = "async")]
 	fn serve_refill(fill: &Fill, archive: &[bytes::Bytes]) -> ops::Range<u64> {
 		let mut group = fill.accept(0, None).unwrap();
 		let start = fill.frame_start(0);
@@ -20846,6 +20849,7 @@ mod test {
 	}
 
 	/// The pool the groups below cache into: about 256 frames.
+	#[cfg(feature = "async")]
 	const POOL: u64 = 4 * 1024 * 1024;
 
 	/// One live group grows past any fixed cap through a pool far smaller than it: its
@@ -20924,7 +20928,8 @@ mod test {
 		let mut read = 0;
 		for index in 0..4_000 {
 			archive.push(numbered(index));
-			live.write_frame(Timestamp::ZERO, archive[index as usize].clone()).unwrap();
+			live.write_frame(Timestamp::ZERO, archive[index as usize].clone())
+				.unwrap();
 			// One frame read for every four written.
 			if index % 4 != 0 {
 				continue;
@@ -20991,12 +20996,16 @@ mod test {
 		// Pressure sheds the refill nobody reads, frame 0 with it.
 		for index in 1_000..2_000 {
 			archive.push(numbered(index));
-			live.write_frame(Timestamp::ZERO, archive[index as usize].clone()).unwrap();
+			live.write_frame(Timestamp::ZERO, archive[index as usize].clone())
+				.unwrap();
 		}
 		let mut again = live.consume();
 		assert!(again.read_frame().now_or_never().is_none());
 		assert_eq!(serve_refills(&requests, &archive)[0].start, 0, "frame 0 was shed");
-		assert_eq!(again.read_frame().now_or_never().unwrap().unwrap().unwrap().payload, archive[0]);
+		assert_eq!(
+			again.read_frame().now_or_never().unwrap().unwrap().unwrap().payload,
+			archive[0]
+		);
 	}
 
 	/// A join onto a group whose first frame was shed asks for a new group on a track that
