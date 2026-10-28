@@ -16,6 +16,11 @@
 //! threads, swept over threads, readers, and frames appended per round, so contention
 //! on the group's shared state shows up as a slope across cores.
 //!
+//! `group_shed` writes one live group through a pool far smaller than it, swept over
+//! the frames written and the pool's size, so shedding the front stays a flat cost per
+//! frame whatever the group or the pool holds. `group_refill` has readers that fell
+//! behind refill the front pressure shed, swept over readers and the hole's length.
+//!
 //! Run with `cargo bench -p moq-net`.
 
 #![expect(
@@ -49,9 +54,7 @@ fn timed() -> track::Info {
 /// overhead rather than payload allocation.
 const PAYLOAD: usize = 64;
 
-/// Frame counts to sweep. 8192 is the largest legal group (`MAX_GROUP_FRAMES`);
-/// the 8193rd write returns `GroupTooLarge`. The top end is that full group of
-/// tiny frames.
+/// Frame counts to sweep. The top end is a long group of tiny frames.
 const COUNTS: [usize; 5] = [4, 5, 512, 2_048, 8_192];
 
 /// Cached group counts to sweep for the track-level delivery benchmarks. A track
@@ -665,6 +668,114 @@ fn bench_contended(c: &mut Criterion) {
 	g.finish();
 }
 
+/// A frame for the shedding benchmarks: large enough that a group outgrows a small
+/// pool in a few hundred frames.
+const SHED_PAYLOAD: usize = 16 * 1024;
+
+/// A live group cached in a pool of `capacity` bytes.
+fn pooled_group(capacity: u64) -> Ctx {
+	let mut info = broadcast::Info::default();
+	info.pool = moq_net::cache::Pool::new(moq_net::cache::Config::default().with_capacity(capacity));
+	let broadcast = broadcast::Producer::new(info);
+	let track = broadcast.create_track("bench", timed()).unwrap();
+	let group = track.append_group().unwrap();
+	Ctx {
+		_broadcast: broadcast,
+		_track: track,
+		group,
+	}
+}
+
+/// Write a live group far past its pool, which sheds its front to make room.
+///
+/// The time per frame should stay flat across both axes: a shed costs the frames it
+/// drops, never the frames the group still holds.
+fn bench_shed(c: &mut Criterion) {
+	let payload = Bytes::from(vec![0u8; SHED_PAYLOAD]);
+	let mut g = c.benchmark_group("group_shed");
+	for pool in [1 << 20, 16 << 20] {
+		for frames in [4_096, 32_768] {
+			g.throughput(Throughput::Elements(frames as u64));
+			let id = BenchmarkId::new(format!("{}MiB", pool >> 20), frames);
+			g.bench_function(id, |b| {
+				b.iter_batched(
+					|| pooled_group(pool),
+					|mut ctx| {
+						for _ in 0..frames {
+							ctx.group.write_frame(Timestamp::ZERO, payload.clone()).unwrap();
+						}
+						ctx
+					},
+					BatchSize::PerIteration,
+				);
+			});
+		}
+	}
+	g.finish();
+}
+
+/// Readers that fell behind a live group read its shed front back through refills its
+/// publisher serves, then catch up to the edge.
+///
+/// Readers at one hole share each refill, so the time per reader should fall as they
+/// grow. A hole longer than the pool refills in pool-sized runs: each refill asks for
+/// the whole hole unpaced and pressure sheds its unread tail, which the next run fetches
+/// again, so the time per frame grows with the hole over the pool.
+fn bench_refill(c: &mut Criterion) {
+	const POOL: u64 = 4 << 20;
+	let payload = Bytes::from(vec![0u8; SHED_PAYLOAD]);
+	let mut g = c.benchmark_group("group_refill");
+	for readers in [1, 16, 128] {
+		for hole in [64, 1_024] {
+			// Past the hole by twice the pool, so pressure shed at least `hole` frames.
+			let written = hole + 2 * (POOL as usize / SHED_PAYLOAD);
+			g.throughput(Throughput::Elements((readers * written) as u64));
+			g.bench_function(BenchmarkId::new(readers.to_string(), hole), |b| {
+				b.iter_batched(
+					|| {
+						let mut ctx = pooled_group(POOL);
+						let requests = ctx._track.requests();
+						let consumers: Vec<_> = (0..readers).map(|_| ctx.group.consume()).collect();
+						for _ in 0..written {
+							ctx.group.write_frame(Timestamp::ZERO, payload.clone()).unwrap();
+						}
+						(ctx, requests, consumers)
+					},
+					|(ctx, requests, mut consumers)| {
+						let mut read = vec![0; readers];
+						while read.iter().any(|&n| n < written) {
+							for (consumer, read) in consumers.iter_mut().zip(&mut read) {
+								while *read < written {
+									let Some(frame) = consumer.read_frame().now_or_never() else {
+										break;
+									};
+									black_box(frame.unwrap().unwrap());
+									*read += 1;
+								}
+							}
+							serve(&requests, &payload);
+						}
+						(ctx, requests, consumers)
+					},
+					BatchSize::PerIteration,
+				);
+			});
+		}
+	}
+	g.finish();
+}
+
+/// Serve every queued refill, writing frames until its end refuses the next.
+fn serve(requests: &track::Requests, payload: &Bytes) {
+	while let Poll::Ready(fill) = requests.poll_requested_fill(&kio::Waiter::noop()) {
+		let Ok(mut group) = fill.unwrap().accept(0, None) else {
+			continue;
+		};
+		while group.write_frame(Timestamp::ZERO, payload.clone()).is_ok() {}
+		let _ = group.finish();
+	}
+}
+
 criterion_group!(
 	benches,
 	bench_write,
@@ -674,6 +785,8 @@ criterion_group!(
 	bench_stamp,
 	bench_relay_frames,
 	bench_inflate,
-	bench_contended
+	bench_contended,
+	bench_shed,
+	bench_refill
 );
 criterion_main!(benches);
