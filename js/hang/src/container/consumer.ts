@@ -1,5 +1,5 @@
 import { Instant, Micro, Milli, Nano, now } from "@moq/clock";
-import * as Moq from "@moq/net";
+import type * as Moq from "@moq/net";
 import { Effect, type Getter, type GetterInit, getter, Once, Signal } from "@moq/signals";
 import type { Format } from "./format";
 import { Jitter } from "./jitter";
@@ -82,8 +82,6 @@ interface Group {
 	minMedia?: Micro; // Lowest decodable timestamp
 	latest?: Micro; // The timestamp of the latest known frame
 	end?: Micro; // The furthest presentation point so far, i.e. max(timestamp + duration)
-	done?: boolean; // Set when #runGroup finishes reading all frames
-	truncated?: boolean; // The missing tail becomes a gap after the buffered frames are delivered.
 	fault?: Error; // The payload that failed to decode, an error after the buffered frames are delivered.
 	index: number; // Media frames decoded so far: the first is a keyframe by protocol invariant
 	charged: number; // What this group holds against the max buffer
@@ -131,7 +129,7 @@ export class Consumer {
 	#maxBuffer: number;
 	// What the buffered groups hold, against the max buffer.
 	#used = 0;
-	// Group tasks and the track loop parked on a full max buffer.
+	// Group watchers and the track loop parked on a full max buffer.
 	#room: (() => void)[] = [];
 	#groups: Group[] = [];
 	#active?: number; // the active group sequence number
@@ -195,7 +193,7 @@ export class Consumer {
 				group.consumer.close();
 			}
 			this.#groups.length = 0;
-			// Parked tasks see the abort and return.
+			// Parked watchers see the abort and return.
 			this.#wake();
 		});
 	}
@@ -255,8 +253,7 @@ export class Consumer {
 					this.#notify = undefined;
 				}
 
-				// Start buffering frames from this group
-				this.#signals.spawn(this.#runGroup.bind(this, group));
+				this.#signals.spawn(this.#watch.bind(this, group));
 			}
 			this.#finish(null);
 		} catch (err) {
@@ -264,85 +261,74 @@ export class Consumer {
 		}
 	}
 
-	async #runGroup(group: Group) {
-		try {
-			for (;;) {
-				// Wait for a frame without taking it, so a group parked on the max buffer holds nothing.
-				await group.consumer.readable();
-				while (!this.#stopped(group) && !this.#admits(group)) await this.#park();
-				if (this.#stopped(group)) return;
-				if (this.#decodeBuffered(group)) {
-					if (group.fault) return;
-					continue;
-				}
-				// Nothing buffered: next() took the frame, or the group ended or failed, which readFrame
-				// reports without carrying a frame.
-				if (!group.consumer.done) continue;
-				if (!(await group.consumer.readFrame())) break;
-			}
-		} catch (err) {
-			if (this.#error) return;
-			// Stop reading the group but keep already-decoded frames.
-			// A stream RESET or eviction truncates the tail of the GoP;
-			// frames decoded before it are still valid and playable.
-			// The tail is gone though, so the next group does not continue this one.
-			group.truncated = true;
-			if (!(err instanceof Moq.Error.Stream)) throw err;
-		} finally {
-			group.done = true;
-
-			// A dropped group no longer holds the cursor.
-			if (!group.released && group.consumer.sequence === this.#active) {
-				this.#recordPresented(group);
-
-				// Advance to the next buffered group's actual sequence, but ONLY if it continues this
-				// group's timeline. Some encoders number groups non-sequentially with large gaps (not
-				// +1), so a bare `+= 1` would point #active at a nonexistent sequence and stall next()
-				// until #checkMaxDelay skipped it -- every group through the skip path, i.e. constant
-				// stutter. A real PTS gap is different: an intermediate group may still be in transit,
-				// so fall back to +1 there (next()'s promotion guard fixes it up once a continuous
-				// group arrives) and let #checkMaxDelay / #tryDurationSkip skip the gap only once
-				// age or duration coverage proves it too old.
-				const next = this.#groups[this.#groups.indexOf(group) + 1];
-				this.#active = continues(group, next) ? next.consumer.sequence : group.consumer.sequence + 1;
-			}
-
-			// Recompute buffered ranges now that this group is done,
-			// so consecutive done groups can merge into a single range.
-			this.#updateBuffered();
-
-			// Always notify - the consumer may need to advance past this group
-			// even if it wasn't active when this task finished.
+	// Watch `group` for wire frames and its end, waking the reader. Only #look decodes, and the
+	// watcher runs it at once rather than leave it to the next read, so buffered ranges, arrival times
+	// and the age budget keep up while the reader is busy. Completion, faults and the pressure skip are
+	// next()'s alone: it reads the transport's state as it stands, so nothing here settles a group
+	// behind its back.
+	async #watch(group: Group) {
+		while (!this.#stopped(group)) {
+			await group.consumer.readable();
+			if (this.#stopped(group)) return;
+			this.#look();
 			this.#notify?.();
 			this.#notify = undefined;
-
-			group.consumer.close();
+			if (group.fault || group.consumer.done) return;
+			// A frame left unread behind a full max buffer waits for room or for the group to lead.
+			if (!this.#admits(group)) await this.#park();
 		}
 	}
 
-	// Take and decode `group`'s next wire frame if the transport already holds one, charging what it
-	// decodes to. Synchronous, so it shares one step with the admission check before it: nothing yields
-	// between them, or every task woken together would spend the same room. Returns false when nothing
-	// is buffered; a payload that fails to decode sets the group's fault.
-	#decodeBuffered(group: Group): boolean {
-		const next = group.consumer.tryReadFrame();
-		if (!next) return false;
+	// Take and decode every wire frame the transport already holds, oldest group first, each only while
+	// the max buffer admits it, then skip what the new frames make too stale to wait for. The one place
+	// frames come off the wire. Synchronous, so each admission check shares one step with the decode it
+	// admits, and nothing can spend the same room twice or see a group half decoded.
+	#look(): void {
+		for (;;) {
+			let decoded = false;
+			// A frame past the cursor, which can show the groups ahead of it are too slow to wait for.
+			let ahead = false;
+			for (const group of this.#groups) {
+				while (!group.fault && this.#admits(group)) {
+					const wire = group.consumer.tryReadFrame();
+					if (!wire) break;
+					this.#decode(group, wire);
+					decoded = true;
+					if (group.consumer.sequence !== this.#active) ahead = true;
+				}
+			}
+			if (!decoded) return;
+			this.#updateBuffered();
+			// This runs even when the decoded group is the delivery head, because that is exactly the
+			// stalled case (#active sits below every buffered group) where the max delay budget is what
+			// eventually breaks the stall. A newer group reaching back to where the stalled active group
+			// has already presented means it can advance now instead of waiting.
+			if (!ahead) return;
+			const aged = this.#checkMaxDelay();
+			if (!this.#tryDurationSkip() && !aged) return;
+			// The skip refunded room and moved the head, which may admit frames left unread.
+		}
+	}
+
+	// Decode one wire frame into `group`, charging what it buffers. A payload that fails to decode sets
+	// the group's fault, which next() raises once the frames ahead of it are read.
+	#decode(group: Group, wire: Moq.Group.Frame): void {
 		group.empty = false;
 		const arrival = Nano.toMilli(Nano(now()));
 
 		// A malformed payload is not loss: it ends the reader where it sits, rather than truncating the group.
 		let decoded: Frame[];
 		try {
-			decoded = this.#format.decode(next.payload, next.timestamp);
+			decoded = this.#format.decode(wire.payload, wire.timestamp);
 		} catch (err) {
 			group.fault = err instanceof Error ? err : new Error(String(err));
-			return true;
+			return;
 		}
 		if (this.#format.kind === "data") {
 			// A data track's marker is one object with no bytes, alone in its group.
 			if (group.bare || (decoded.length === 0 && group.media)) {
 				group.fault = new Error("a data track's discontinuity marker shares its group");
-				return true;
+				return;
 			}
 			group.bare = decoded.length === 0;
 		}
@@ -392,40 +378,13 @@ export class Consumer {
 				group.end = end;
 			}
 		}
+	}
 
-		if (decoded.length === 0) return true;
-
-		// Skip and wake only once the whole batch is in its group: a skip that drops this group
-		// checks it for a rewind, which must see every sample one fragment decoded to.
-		this.#updateBuffered();
-
-		let skipped = false;
-		if (group.consumer.sequence !== this.#active) {
-			// A non-active group can also be too slow to wait for. This runs even when
-			// the group is the delivery head, because that is exactly the stalled case
-			// (#active sits below every buffered group) where the max delay budget is
-			// what eventually breaks the stall.
-			this.#checkMaxDelay();
-
-			// A newer group reaching back to where the stalled active group has
-			// already presented means we can advance now instead of waiting.
-			skipped = this.#tryDurationSkip();
-		}
-
-		// Wake next() for the current delivery head so its frames surface as they
-		// arrive. Gating only on `=== #active` assumed +1 group numbering: with
-		// non-sequential group ids (large jumps between groups) #active lags one group
-		// behind as a stale `+1` phantom, so the real head never matched and its whole
-		// group was held until completion, then flushed in a burst. The earliest
-		// buffered group is the delivery head regardless of id scheme; next()'s
-		// promotion guard advances #active to it. Works for sequential and
-		// non-sequential ids alike.
-		// Once the max buffer fills, next() may have to skip the stalled head it is waiting on.
-		if (skipped || group.consumer.sequence === this.#active || group === this.#groups[0] || this.#full()) {
-			this.#notify?.();
-			this.#notify = undefined;
-		}
-		return true;
+	// The transport's verdict on a group with nothing left to read: null once it finished cleanly, the
+	// error that cut its tail off, or undefined while more may arrive.
+	#ended(group: Group): Error | null | undefined {
+		if (!group.consumer.done) return undefined;
+		return group.consumer.closed.peek() ?? null;
 	}
 
 	// Record where a group's content ends as the cursor advances past it. next()'s promotion guard
@@ -438,8 +397,9 @@ export class Consumer {
 		if (group.end !== undefined) this.#presentedEnd = group.end;
 	}
 
-	#checkMaxDelay() {
-		if (this.#active === undefined) return;
+	// Skip the oldest groups while the buffered span exceeds the max delay. Returns true if any was skipped.
+	#checkMaxDelay(): boolean {
+		if (this.#active === undefined) return false;
 
 		let skipped = 0;
 		const start = this.#groups[0]?.consumer.sequence;
@@ -479,10 +439,11 @@ export class Consumer {
 			const discarded = first.frames.some((frame) => this.#format.end?.(frame) === undefined);
 			// Adjacency proves nothing is missing only once the group finished cleanly: a truncated
 			// or still-open group may have lost its tail.
-			const finished = first.done && !first.truncated;
+			const ended = this.#ended(first);
+			const truncated = ended instanceof Error;
 			const adjacent = next?.consumer.sequence === first.consumer.sequence + 1;
-			const continued = (finished && adjacent) || ptsContiguous(first.end ?? this.#presentedEnd, nextStart);
-			if (marker || discarded || first.truncated || !continued) this.#lost = true;
+			const continued = (ended === null && adjacent) || ptsContiguous(first.end ?? this.#presentedEnd, nextStart);
+			if (marker || discarded || truncated || !continued) this.#lost = true;
 			skipped++;
 			if (!this.#discard(first)) break;
 		}
@@ -492,11 +453,8 @@ export class Consumer {
 				`skipping slow groups: track=${this.#track.name} ${start} -> ${this.#active} count=${skipped}`,
 			);
 			this.#updateBuffered();
-
-			// Wake up any consumers waiting for a new frame.
-			this.#notify?.();
-			this.#notify = undefined;
 		}
+		return skipped > 0;
 	}
 
 	// Skip the stalled active group once it has presented up to where the next group
@@ -508,7 +466,7 @@ export class Consumer {
 
 		const active = this.#groups[0];
 		if (!active || active.consumer.sequence !== this.#active) return false;
-		if (active.done || active.frames.length > 0 || active.end === undefined) return false;
+		if (this.#ended(active) !== undefined || active.frames.length > 0 || active.end === undefined) return false;
 
 		const next = this.#groups[1];
 		const nextStart = next?.frames.at(0)?.timestamp;
@@ -528,20 +486,17 @@ export class Consumer {
 	// waits behind, to the next group even with nothing of it read yet: that one reads as the head, and
 	// each such skip refunds what the group left behind held. The head may be the active group or a
 	// backlog group admitted below it. Only fires when the head is fully consumed and still open, so we
-	// never drop frames the consumer hasn't seen. Returns true if it skipped a group or read one.
+	// never drop frames the consumer hasn't seen: #look already read what the transport holds for it.
+	// Returns true if it skipped a group.
 	#tryPressureSkip(): boolean {
 		if (this.#active === undefined || !this.#full()) return false;
 
 		const head = this.#groups[0];
 		if (!head || head.consumer.sequence > this.#active) return false;
-		if (head.done || head.fault || head.frames.length > 0) return false;
+		if (head.fault || head.frames.length > 0 || this.#ended(head) !== undefined) return false;
 
 		const next = this.#groups[1];
 		if (!next) return false;
-
-		// Its task may not have run since it became the head, so read what the transport already holds
-		// before calling it stalled, as its own task would: the head decodes past a full max buffer.
-		if (this.#decodeBuffered(head)) return true;
 
 		this.#groups.shift();
 		console.warn(
@@ -549,9 +504,10 @@ export class Consumer {
 		);
 		if (head.consumer.sequence === this.#active) {
 			// Still open, so its tail is lost unless the next group picks up where it ended, which nothing
-			// proves before its start is read.
+			// proves before its start is read. A marker group stops the timeline, so moving past one loses it.
 			const nextStart = next.frames.at(0)?.timestamp;
-			if (head.truncated || !ptsContiguous(head.end ?? this.#presentedEnd, nextStart)) this.#lost = true;
+			const marker = !head.empty && !head.media;
+			if (marker || !ptsContiguous(head.end ?? this.#presentedEnd, nextStart)) this.#lost = true;
 			this.#recordPresented(head);
 			this.#active = next.consumer.sequence;
 		} else {
@@ -592,7 +548,7 @@ export class Consumer {
 		return !this.#full() || (group === this.#groups[0] && group.frames.length === 0);
 	}
 
-	// Whether `group`'s task should stop: the group was dropped, so what it decodes would never be
+	// Whether `group`'s watcher should stop: the group was dropped, so what it decodes would never be
 	// refunded, or the consumer closed.
 	#stopped(group: Group): boolean {
 		return group.released === true || this.#signals.abort.aborted;
@@ -603,7 +559,7 @@ export class Consumer {
 		return new Promise<void>((resolve) => this.#room.push(resolve));
 	}
 
-	// Let parked tasks re-check the max buffer: something was refunded, or the head or cursor moved.
+	// Let parked watchers re-check the max buffer: something was refunded, or the head or cursor moved.
 	#wake(): void {
 		const room = this.#room;
 		this.#room = [];
@@ -612,7 +568,7 @@ export class Consumer {
 
 	// Drop a group without delivering it. A drop must not hide what was already found, so one holding
 	// a fault, or with frames below the latest delivered group start, ends the reader instead. What
-	// its task has not decoded yet stays unchecked: decoding data only to throw it away is work a
+	// #look has not decoded yet stays unchecked: decoding data only to throw it away is work a
 	// peer could force. Returns false if it ended the reader.
 	#discard(group: Group): boolean {
 		group.consumer.close();
@@ -640,7 +596,7 @@ export class Consumer {
 		this.#track.close(error);
 		this.#notify?.();
 		this.#notify = undefined;
-		// Nothing more is read, so stop the group tasks and release their groups rather than let a
+		// Nothing more is read, so stop the group watchers and release their groups rather than let a
 		// peer keep them decoding and buffering. After the wake: next() reads a closed effect as closed.
 		this.#signals.close();
 	}
@@ -662,6 +618,8 @@ export class Consumer {
 		}
 		for (;;) {
 			if (this.#error) throw this.#error;
+			// Decode what has arrived, so every decision below sees it.
+			this.#look();
 
 			const ended = this.#closed.peek();
 			if (this.#groups[0]?.consumer.sequence === this.#active || this.#groups.length === 0) {
@@ -674,7 +632,7 @@ export class Consumer {
 				}
 			}
 
-			// If #active points below all buffered groups -- e.g. the finally block's `+ 1`
+			// If #active points below all buffered groups -- e.g. a finished group's `+ 1`
 			// fallback fired because no later group was buffered yet, and the real (large-gap,
 			// non-sequential) next group has since arrived -- promote #active to the first real
 			// group so delivery resumes instead of stalling on a nonexistent sequence.
@@ -722,15 +680,12 @@ export class Consumer {
 				}
 			}
 
-			if (
-				this.#groups.length > 0 &&
-				this.#active !== undefined &&
-				this.#groups[0].consumer.sequence <= this.#active
-			) {
-				const frame = this.#groups[0].frames.shift();
+			const head = this.#groups.at(0);
+			if (head && this.#active !== undefined && head.consumer.sequence <= this.#active) {
+				const seq = head.consumer.sequence;
+				const frame = head.frames.shift();
 				if (frame) {
-					this.#refund(this.#groups[0], FRAME_COST + frame.payload.byteLength);
-					const seq = this.#groups[0].consumer.sequence;
+					this.#refund(head, FRAME_COST + frame.payload.byteLength);
 					const end = this.#format.end?.(frame);
 					if (end !== undefined) {
 						this.#updateBuffered();
@@ -756,39 +711,42 @@ export class Consumer {
 					return this.#emit({ kind: "frame", group: seq, frame });
 				}
 
-				// Check if the group is done and then remove it. A group is removable only
-				// once its #runGroup task has finished (done) and all frames are consumed:
-				// a below-#active group (a backlog group admitted behind the live edge) may
-				// still be downloading when its buffer momentarily drains, and removing it
-				// then silently truncates its tail. #runGroup notifies whenever the head
-				// group gains a frame, so waiting here is woken, and #checkMaxDelay bounds
-				// how long a stalled head can hold delivery up.
-				if (this.#groups[0].done) {
-					if (this.#groups[0].consumer.sequence === this.#active) {
-						// The cursor moves past this group here rather than in #runGroup's finally
-						// block whenever the group finished before it became active, so this is the
-						// site that has to record its presentation end. Advance by +1 and let the
-						// promotion guard above resolve the real successor on the next iteration.
-						this.#recordPresented(this.#groups[0]);
-						this.#active += 1;
-					}
+				// A payload that failed to decode ends the reader once the frames ahead of it are read.
+				if (head.fault) {
+					this.#abort(head.fault);
+					throw head.fault;
+				}
 
-					const group = this.#groups.shift();
-					if (group) {
-						this.#release(group);
-						if (group.fault) {
-							this.#abort(group.fault);
-							throw group.fault;
-						}
-						if (group.truncated) this.#lost = true;
-						this.#updateBuffered();
-						// A data track's marker carries no timestamp, so it ends where this reader got to.
-						// Before the first item there is nothing to end.
-						if (group.bare && !group.truncated && this.#edge !== undefined) {
-							return this.#emit({ kind: "end", group: group.consumer.sequence, end: this.#edge });
-						}
-						continue;
+				// Remove the group once the transport has settled it and every frame is read. A
+				// below-#active group (a backlog group admitted behind the live edge) may still be
+				// downloading when its buffer momentarily drains, and removing it then silently
+				// truncates its tail. Its watcher wakes this read whenever the group gains a frame or
+				// ends, and #checkMaxDelay bounds how long a stalled head can hold delivery up.
+				const settled = this.#ended(head);
+				if (settled !== undefined) {
+					this.#groups.shift();
+					if (seq === this.#active) {
+						// Advance to the next buffered group's actual sequence, but ONLY if it continues this
+						// group's timeline. Some encoders number groups non-sequentially with large gaps (not
+						// +1), so a bare `+= 1` would point #active at a nonexistent sequence and stall until
+						// the hole expired -- every group through the skip path, i.e. constant stutter. A real
+						// PTS gap is different: an intermediate group may still be in transit, so fall back to
+						// +1 there (the promotion guard above fixes it up once a continuous group arrives).
+						this.#recordPresented(head);
+						const next = this.#groups.at(0);
+						this.#active = continues(head, next) ? next.consumer.sequence : seq + 1;
 					}
+					head.consumer.close();
+					this.#release(head);
+					const truncated = settled instanceof Error;
+					if (truncated) this.#lost = true;
+					this.#updateBuffered();
+					// A data track's marker carries no timestamp, so it ends where this reader got to.
+					// Before the first item there is nothing to end.
+					if (head.bare && !truncated && this.#edge !== undefined) {
+						return this.#emit({ kind: "end", group: seq, end: this.#edge });
+					}
+					continue;
 				}
 
 				// The active group is stalled with nothing buffered. If a later group
@@ -801,7 +759,7 @@ export class Consumer {
 			if (this.#notify) {
 				throw new Error("multiple calls to next not supported");
 			}
-			// The head or cursor may have moved, which can exempt a parked task from the max buffer.
+			// The head or cursor may have moved, which can exempt a parked watcher from the max buffer.
 			this.#wake();
 
 			const abort = this.#signals.abort;
@@ -864,7 +822,7 @@ export class Consumer {
 			const end = Milli.fromMicro(group.latest);
 
 			const last = ranges.at(-1);
-			const contiguous = prev?.done && prev.consumer.sequence + 1 === group.consumer.sequence;
+			const contiguous = prev?.consumer.done && prev.consumer.sequence + 1 === group.consumer.sequence;
 			if (last && (last.end >= start || contiguous)) {
 				last.end = Milli(Math.max(last.end, end));
 			} else {

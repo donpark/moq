@@ -295,3 +295,85 @@ test("Consumer reads what a promoted head already holds before skipping it under
 		warn.mockRestore();
 	}
 });
+
+// Settle `promise` within a second, so a reader that hangs fails the test instead of timing it out.
+async function within<T>(promise: Promise<T>): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const hung = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error("the reader hung")), 1_000);
+	});
+	try {
+		return await Promise.race([promise, hung]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+test("Consumer raises a malformed frame in a head promoted under pressure", async () => {
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format: new Format("data"),
+		maxDelay: Milli(5_000),
+		maxBuffer: 1024,
+	});
+	try {
+		const stalled = track.createGroup(0);
+		write(stalled, 0);
+		expect(await consumer.next()).toMatchObject({ kind: "frame", group: 0 });
+
+		// A later group's large frame fills the max buffer, then a malformed frame lands in the open group between.
+		const between = track.createGroup(1);
+		const later = track.createGroup(2);
+		const early = Time.Timestamp.now();
+		later.writeFrame({
+			payload: encodeFrame(new Uint8Array(2_000), 20_000 as Micro),
+			timestamp: Time.Timestamp.now(),
+		});
+		await flush();
+		between.writeFrame({ payload: new Uint8Array([0x80]), timestamp: early });
+
+		// Group 0 is skipped, and group 1's decode error ends the reader rather than leaving it waiting.
+		await expect(within(consumer.next())).rejects.toThrow("buffer too short");
+	} finally {
+		consumer.close();
+		track.close();
+		warn.mockRestore();
+	}
+});
+
+test("Consumer reads a finished marker group's end before skipping under pressure", async () => {
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format: new Format("data"),
+		maxDelay: Milli(5_000),
+		maxBuffer: 1024,
+	});
+	try {
+		const stalled = track.createGroup(0);
+		write(stalled, 0);
+		expect(await consumer.next()).toMatchObject({ kind: "frame", group: 0 });
+
+		// A later group's large frame fills the max buffer, then the group between finishes as a data marker.
+		const between = track.createGroup(1);
+		const later = track.createGroup(2);
+		const early = Time.Timestamp.now();
+		later.writeFrame({
+			payload: encodeFrame(new Uint8Array(2_000), 20_000 as Micro),
+			timestamp: Time.Timestamp.now(),
+		});
+		await flush();
+		between.writeFrame({ payload: new Uint8Array(), timestamp: early });
+		between.finish();
+
+		// Group 0 is skipped, and group 1 declares its end before group 2 is read.
+		expect(await within(consumer.next())).toMatchObject({ kind: "gap" });
+		expect(await within(consumer.next())).toMatchObject({ kind: "end", group: 1 });
+		expect(await within(consumer.next())).toMatchObject({ kind: "frame", group: 2, frame: { timestamp: 20_000 } });
+	} finally {
+		consumer.close();
+		track.close();
+		warn.mockRestore();
+	}
+});

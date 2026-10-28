@@ -4260,6 +4260,84 @@ mod tests {
 		assert_eq!(reads, vec![Some(ts(0)), None, Some(ts(20_000))]);
 	}
 
+	/// Groups 0 and 1 open behind a cursor that read group 0's frame, and group 2's large frame that
+	/// fills the max buffer once read ahead. Returns groups 0 and 1.
+	fn fill_behind_a_stalled_group(
+		track: &mut moq_net::track::Producer,
+		consumer: &mut Consumer<Container>,
+		waiter: &kio::Waiter,
+	) -> (moq_net::group::Producer, moq_net::group::Producer) {
+		let stalled = open_group(track, 0, ts(0));
+		assert!(matches!(
+			consumer.poll_read(waiter),
+			Poll::Ready(Ok(Some(Read::Frame { group: 0, .. })))
+		));
+		let between = track.create_group(moq_net::group::Info { sequence: 1 }).unwrap();
+		let mut later = track.create_group(moq_net::group::Info { sequence: 2 }).unwrap();
+		Container::Legacy(crate::container::Kind::Data)
+			.write(
+				&mut later,
+				&[Frame {
+					timestamp: ts(20_000),
+					payload: Bytes::from(vec![0; 4096]),
+					keyframe: false,
+					duration: None,
+				}],
+			)
+			.unwrap();
+		later.finish().unwrap();
+		(stalled, between)
+	}
+
+	// A max buffer that holds three groups' overhead with room to spare, short of group 2's large frame.
+	fn pressured_data_consumer(track: &mut moq_net::track::Producer) -> Consumer<Container> {
+		let mut consumer = container_max_delay_only(track.subscribe(None), Duration::from_secs(5));
+		consumer.set_max_buffer(1024 + 3 * std::mem::size_of::<GroupBuffer<Container>>());
+		consumer
+	}
+
+	/// A malformed frame landing in the group the cursor moves on to under pressure fails the reader
+	/// rather than leaving it waiting on the group.
+	#[test]
+	fn a_malformed_frame_in_a_group_moved_to_under_pressure_fails_the_reader() {
+		let waiter = kio::Waiter::noop();
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let mut consumer = pressured_data_consumer(&mut track);
+		let (_stalled, mut between) = fill_behind_a_stalled_group(&mut track, &mut consumer, &waiter);
+
+		between.write_frame(ts(10_000), Bytes::from_static(&[0x80])).unwrap();
+		let read = loop {
+			match consumer.poll_read(&waiter) {
+				Poll::Ready(Ok(Some(Read::Gap { .. }))) => continue,
+				other => break other,
+			}
+		};
+		assert!(matches!(read, Poll::Ready(Err(_))), "{read:?}");
+	}
+
+	/// A data marker group that finished before the cursor moved on to it under pressure still reads
+	/// its end before the group after it.
+	#[test]
+	fn a_finished_marker_group_moved_to_under_pressure_reads_its_end() {
+		let waiter = kio::Waiter::noop();
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let mut consumer = pressured_data_consumer(&mut track);
+		let (_stalled, mut between) = fill_behind_a_stalled_group(&mut track, &mut consumer, &waiter);
+
+		between.write_frame(ts(10_000), Bytes::new()).unwrap();
+		between.finish().unwrap();
+		let mut reads = Vec::new();
+		while let Poll::Ready(read) = consumer.poll_read(&waiter) {
+			reads.push(match read.unwrap() {
+				Some(Read::Frame { group, frame }) => format!("frame {group} {}", frame.timestamp.as_micros()),
+				Some(Read::Gap { .. }) => "gap".to_string(),
+				Some(Read::End { group, .. }) => format!("end {group}"),
+				None => break,
+			});
+		}
+		assert_eq!(reads, ["gap", "end 1", "frame 2 20000"]);
+	}
+
 	/// No cap is too small to read through: the cursor's group and one successor are always pulled, so
 	/// a stalled group can be moved past even when one group's overhead fills the max buffer.
 	#[test]
