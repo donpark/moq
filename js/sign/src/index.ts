@@ -34,6 +34,5 @@ export { type Code, Failure } from "./failure.ts";
 /** Signing writer and verifying reader for one group. */
 export * as Group from "./group.ts";
 export { PublicKey, SecretKey } from "./key.ts";
-export { SIGNATURE_LEN } from "./scope.ts";
 /** Signing producer and verifying subscriber for one track. */
 export * as Track from "./track.ts";

@@ -41,11 +41,7 @@ impl Producer {
 	/// # Errors
 	///
 	/// A net error if the broadcast already holds the name or has ended.
-	pub fn create_track(
-		&self,
-		name: &str,
-		info: impl Into<Option<moq_net::track::Info>>,
-	) -> Result<track::Producer> {
+	pub fn create_track(&self, name: &str, info: impl Into<Option<moq_net::track::Info>>) -> Result<track::Producer> {
 		let inner = self.inner.create_track(name, info)?;
 		let scope = Scope::new(&self.path, &self.epoch, name);
 		Ok(track::Producer::new(inner, self.key.clone(), scope))

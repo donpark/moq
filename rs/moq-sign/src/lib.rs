@@ -27,7 +27,6 @@ mod scope;
 
 pub use error::{Error, Result};
 pub use key::{InvalidKey, PublicKey, SecretKey};
-pub use scope::SIGNATURE_LEN;
 
 #[cfg(test)]
 mod tests;

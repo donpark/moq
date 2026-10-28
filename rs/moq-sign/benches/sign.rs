@@ -61,7 +61,10 @@ fn bench_sign(c: &mut Criterion) {
 			});
 		});
 		group.bench_function(format!("roundtrip_{}k", size / 1024), |b| {
-			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.unwrap();
 			let (producer, mut consumer, _origin) = runtime.block_on(roundtrip(&key));
 			let waiter = kio::Waiter::noop();
 			b.iter(|| {

@@ -21,19 +21,11 @@ const KEY_LEN: usize = 32;
 pub struct PublicKey([u8; KEY_LEN]);
 
 impl PublicKey {
-	/// Wrap the 32 raw bytes of an Ed25519 public key.
-	pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
-		Self(bytes)
-	}
-
-	/// The 32 raw bytes of the key.
-	pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
-		&self.0
-	}
-
 	/// Whether `signature` is this key's Ed25519 signature over `message`.
 	pub(crate) fn verify(&self, message: &[u8], signature: &[u8; SIGNATURE_LEN]) -> bool {
-		UnparsedPublicKey::new(&ED25519, &self.0).verify(message, signature).is_ok()
+		UnparsedPublicKey::new(&ED25519, &self.0)
+			.verify(message, signature)
+			.is_ok()
 	}
 }
 
@@ -93,7 +85,12 @@ impl SecretKey {
 
 	pub(crate) fn from_seed(seed: Zeroizing<[u8; KEY_LEN]>) -> Self {
 		let pair = Ed25519KeyPair::from_seed_unchecked(seed.as_ref()).expect("a 32-byte Ed25519 seed");
-		let public = PublicKey(pair.public_key().as_ref().try_into().expect("a 32-byte Ed25519 public key"));
+		let public = PublicKey(
+			pair.public_key()
+				.as_ref()
+				.try_into()
+				.expect("a 32-byte Ed25519 public key"),
+		);
 		Self(Arc::new(Inner { seed, pair, public }))
 	}
 

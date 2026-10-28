@@ -38,7 +38,12 @@ fn identity(row: &Value) -> (Arc<Scope>, u64, u64) {
 fn vector_keys() {
 	for row in vectors()["keys"].as_array().unwrap() {
 		let key = seed(&row["seed"]);
-		assert_eq!(key.public().to_string(), row["public"].as_str().unwrap(), "{}", row["id"]);
+		assert_eq!(
+			key.public().to_string(),
+			row["public"].as_str().unwrap(),
+			"{}",
+			row["id"]
+		);
 		assert_eq!(key.public(), public(&row["public"]));
 	}
 }
@@ -71,7 +76,11 @@ fn vector_negative() {
 #[test]
 fn vector_invalid_ids() {
 	for row in vectors()["invalid_ids"].as_array().unwrap() {
-		assert!(row["text"].as_str().unwrap().parse::<PublicKey>().is_err(), "{}", row["id"]);
+		assert!(
+			row["text"].as_str().unwrap().parse::<PublicKey>().is_err(),
+			"{}",
+			row["id"]
+		);
 	}
 }
 
@@ -188,7 +197,10 @@ async fn roundtrip_through_an_origin() {
 	let published = publish(&key, "mesh/node/ssh");
 	let video = published
 		.signed
-		.create_track("video", moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI))
+		.create_track(
+			"video",
+			moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI),
+		)
 		.unwrap();
 	let consumer = published.consume(key.public()).await;
 	assert_eq!(consumer.epoch(), published.signed.epoch());
@@ -258,26 +270,38 @@ async fn frame_replayed_from_another_group_or_track_is_refused() {
 	group.write_frame(None, b"original").unwrap();
 	group.finish().unwrap();
 	let body = raw_frame(&mut raw).await;
-	assert_eq!(read(&mut recv_group(&mut a).await).await.unwrap().unwrap(), &b"original"[..]);
+	assert_eq!(
+		read(&mut recv_group(&mut a).await).await.unwrap().unwrap(),
+		&b"original"[..]
+	);
 
 	// The same bytes as group 1 of the same track.
 	let mut replay = net.append_group().unwrap();
 	replay.write_frame(None, body.clone()).unwrap();
 	replay.finish().unwrap();
-	assert!(matches!(read(&mut recv_group(&mut a).await).await, Err(Error::Signature)));
+	assert!(matches!(
+		read(&mut recv_group(&mut a).await).await,
+		Err(Error::Signature)
+	));
 
 	// The same bytes at the same group and index of another track.
 	let mut moved = other_net.create_group(moq_net::group::Info { sequence: 0 }).unwrap();
 	moved.write_frame(None, body.clone()).unwrap();
 	moved.finish().unwrap();
-	assert!(matches!(read(&mut recv_group(&mut b).await).await, Err(Error::Signature)));
+	assert!(matches!(
+		read(&mut recv_group(&mut b).await).await,
+		Err(Error::Signature)
+	));
 
 	// The same bytes at frame 1 of a group at the original sequence's neighbor.
 	let mut shifted = net.append_group().unwrap();
 	shifted.write_frame(None, b"filler".as_slice()).unwrap();
 	shifted.write_frame(None, body).unwrap();
 	shifted.finish().unwrap();
-	assert!(matches!(read(&mut recv_group(&mut a).await).await, Err(Error::Signature)));
+	assert!(matches!(
+		read(&mut recv_group(&mut a).await).await,
+		Err(Error::Signature)
+	));
 }
 
 #[tokio::test(start_paused = true)]

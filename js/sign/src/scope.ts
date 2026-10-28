@@ -3,8 +3,8 @@ import type { Epoch, Path } from "@moq/net";
 import { Failure } from "./failure.ts";
 import type { PublicKey, SecretKey } from "./key.ts";
 
-/** Length of the Ed25519 signature appended to every signed frame. */
-export const SIGNATURE_LEN = 64;
+// Length of the Ed25519 signature appended to every signed frame.
+const SIGNATURE_LEN = 64;
 
 const encoder = new TextEncoder();
 // Domain separation for the profile, with no length prefix of its own.

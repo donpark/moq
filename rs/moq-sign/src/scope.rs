@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::key::{PublicKey, SecretKey};
 
 /// Length of the Ed25519 signature appended to every signed frame.
-pub const SIGNATURE_LEN: usize = 64;
+pub(crate) const SIGNATURE_LEN: usize = 64;
 
 /// Domain separation for the profile, with no length prefix of its own.
 const LABEL: &[u8] = b"moq-sign-00";

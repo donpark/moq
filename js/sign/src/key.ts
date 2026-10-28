@@ -19,15 +19,14 @@ const PKCS8_PREFIX = Uint8Array.from([
  * accepts only that form, so one key has exactly one ID to name a path by.
  */
 export class PublicKey {
-	/** The 32 raw bytes of the key. */
-	readonly bytes: Uint8Array<ArrayBuffer>;
+	#bytes: Uint8Array<ArrayBuffer>;
 	#verifier?: Promise<CryptoKey>;
 
 	private constructor(bytes: Uint8Array<ArrayBuffer>) {
-		this.bytes = bytes;
+		this.#bytes = bytes;
 	}
 
-	/** Wrap the 32 raw bytes of an Ed25519 public key, copying them; throws {@link Failure} `key` otherwise. */
+	/** Wrap the 32 raw bytes of an Ed25519 public key, copying them; throws {@link Failure} `key` otherwise. @internal */
 	static fromBytes(bytes: Uint8Array): PublicKey {
 		if (bytes.byteLength !== KEY_LEN) throw new Failure("key");
 		return new PublicKey(Uint8Array.from(bytes));
@@ -41,17 +40,17 @@ export class PublicKey {
 
 	/** Whether `other` is the same key. */
 	equals(other: PublicKey): boolean {
-		return this.bytes.every((byte, i) => byte === other.bytes[i]);
+		return this.#bytes.every((byte, i) => byte === other.#bytes[i]);
 	}
 
 	/** The endpoint ID: 64 lowercase hex characters. */
 	toString(): string {
-		return Array.from(this.bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+		return Array.from(this.#bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 	}
 
 	/** Whether `signature` is this key's Ed25519 signature over `message`. @internal */
 	async verify(message: Uint8Array<ArrayBuffer>, signature: Uint8Array<ArrayBuffer>): Promise<boolean> {
-		this.#verifier ??= crypto.subtle.importKey("raw", this.bytes, ED25519, false, ["verify"]);
+		this.#verifier ??= crypto.subtle.importKey("raw", this.#bytes, ED25519, false, ["verify"]);
 		return crypto.subtle.verify(ED25519, await this.#verifier, signature, message);
 	}
 }
