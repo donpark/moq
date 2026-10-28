@@ -3543,6 +3543,14 @@ impl Bounds {
 			frames: Frames::default(),
 		};
 		for range in ranges {
+			// Empty partway through a group, which whole groups can't say: keep its place,
+			// covering no group and narrowing no frame of one.
+			if let (Some(lite::Anchor::Absolute(start)), Some(lite::Anchor::Absolute(end))) = (range.start, range.end)
+				&& end <= start
+			{
+				bounds.ranges.push(Range::groups(start.group..start.group));
+				continue;
+			}
 			let start = match range.start {
 				None => Range::oldest().start,
 				Some(start) => anchor(start)?,
@@ -4890,6 +4898,11 @@ mod serve_group_test {
 		let started = bounds(group(5, 3), None);
 		assert_eq!((started.groups().start(), started.groups().end()), (Some(5), None));
 		assert_eq!(started.frames.start(5), 3);
+
+		// Empty partway through group 5 covers no group, rather than all of it.
+		let empty = bounds(group(5, 3), group(5, 3));
+		assert_eq!(empty.ranges, [crate::track::Range::groups(5..5)]);
+		assert_eq!(empty.frames, Frames::default());
 
 		// A time anchor names no group on a track the peer was told is untimed.
 		let time = [lite::Range {
