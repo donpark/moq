@@ -29,11 +29,9 @@ The stable controls do not pass, so the pins remain unchanged. Both
 same-source Rust media controls and all 24 stable cross-version Rust media
 cells fail the Opus tone's timestamp check by 321 microseconds. Removing
 only an Opus source's MP4 edit list reproduces that exact phase error;
-preserving it passes. The fMP4 exporter keeps `dOps.pre_skip` but strips the
-edit list that places the first kept sample. The published CLI 0.14.9 has
-the same failure, so a source fix and a corrected published CLI are needed
-before accepting a fresh measurement. Do not count this as a lite-07-wip
-break or normalize the decoded timestamps to hide it.
+preserving it passes. The current fMP4 exporter keeps `dOps.pre_skip` but
+strips the edit list that places the first kept sample. Do not count this
+as a lite-07-wip break or normalize decoded timestamps to hide it.
 
 The run also exposed four stable JS publication failures: the released
 `Group.Producer` completes with `close()`, while the checkout uses
@@ -45,9 +43,24 @@ adapter; all four lite-07-wip publication combinations still fail with
 framing errors. Remeasurement now refuses to refresh accepted pins when
 stable cells fail.
 
-After the Opus fix ships, resolve releases again, rerun the full gated
-measurement, and refresh both the pins and the dated reason only when the
-stable cells pass. Maintainer decision: schedule that source fix and patch
-release, or leave this measurement blocked until the next release cut.
+The fixed export also exposed a decoder-command error: FFmpeg normally
+shifts its negative Opus priming start to zero, moving the retained PCM
+timestamps by the pre-skip again. The decode command now uses `-copyts` to
+preserve demuxed PTS. With the exact output from the independent
+[Opus export fix](https://github.com/moq-dev/moq/pull/7118), the unchanged
+tone check passes at +3/+1 microseconds; removing only its edit list fails
+at 321 microseconds even with `-copyts`. This preserves the assertion.
+
+With that decoder command, the actual fixed/current lite-06 control and
+its swapped-tone negative control pass. The exact released/released
+0.14.9/0.17.9 control still fails, now with a measured phase error of
+781 microseconds. Its complete cause remains unverified; do not assume the
+current exporter fix is the only change a released build needs.
+
+After a corrected CLI ships, resolve releases again, rerun its stable
+controls and the full gated measurement, and refresh both the pins and the
+dated reason only when the stable cells pass. Maintainer decision:
+investigate and schedule a corrected patch release, or leave this
+measurement blocked until the next release cut.
 
 Public API: none. Wire: none.

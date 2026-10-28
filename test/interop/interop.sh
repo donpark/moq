@@ -1271,13 +1271,15 @@ PYCODE
                 # frame's timestamp and length for tone.py. The outputs are the verdict: a CLI may
                 # exit on EPIPE with a plain error once ffmpeg has what it needs. The WAV cannot say
                 # which codec it came from, so this takes a publisher of one audio rendition.
+                # Keep demuxed PTS: Opus priming can start before zero, and FFmpeg's default
+                # start-time shift would move the kept samples after their actual media time.
                 if [[ "$codecs" == *,* ]]; then
                     echo "error: the ffmpeg decode reads one audio rendition, not $codecs" >&2
                     return 1
                 fi
                 (timeout -k 3 "$TIMEOUT" "${INTEROP_SUB_MOQ:-$MOQ}" --connect "$URL" \
                     ${INTEROP_VERSION:+--connect-version "$INTEROP_VERSION"} --broadcast "$broadcast" export fmp4 || [[ "$?" == 141 ]]) |
-                    ffmpeg -hide_banner -loglevel error -i - \
+                    ffmpeg -hide_banner -loglevel error -copyts -i - \
                         -map 0:v:0 -frames:v 1 -f rawvideo -pix_fmt gray "$HARNESS_RUN/$broadcast.raw" \
                         -map 0:a:0 -af "atrim=duration=${AUDIO_MS}ms" -c:a pcm_f32le \
                         -stats_enc_pre "$audio_out.stats" -stats_enc_pre_fmt '{tb} {pts} {samp}' -f wav "$audio_out.wav"
