@@ -33,10 +33,15 @@ Decided 2026-10-28 (maintainer):
   replaces a publisher head buffer, which was considered and dropped as the
   same idea special-cased.
 
-The epic's own work: once the children land, rerun the reporter's
-measurement (22 presses, 100 ms RTT, 2% loss, 300 ms delay). Unmute → audible
-is then the one-way trip plus the delay, with every frame of the utterance
-delivered. Record the result in the PR.
+The epic's own work: once the children land, measure push-to-talk (22
+presses, 300 ms delay) behind bufferbloat: a rate limit below the media
+bitrate, behind a deep but finite queue whose overflow drops packets. That
+gates acceptance. A held listener's unmute pays no catalog round trip and no
+resubscribe, so unmute → audible is the path's one-way delay plus the 300 ms.
+Every frame of the utterance is encoded and sent; any frames dropped come
+only from queue overflow. Rerun the reporter's setup (100 ms RTT, 2% random
+loss) only as a reproduction of the original numbers, not as acceptance.
+Record both in the PR.
 
 ## Required
 
