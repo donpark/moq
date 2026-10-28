@@ -10132,7 +10132,15 @@ mod serve_tests {
 					.clone()
 					.run_subscribe_stream(stream, subscribe(Filter::NextObject, None))
 			);
-			registered(&h, serving.as_mut()).await;
+			std::future::poll_fn(|cx| {
+				assert!(std::future::Future::poll(serving.as_mut(), cx).is_pending());
+				if !h.log.trail().is_empty() && Wire::read(&h.log, version).sent(ietf::SubscribeOk::ID).is_some() {
+					Poll::Ready(())
+				} else {
+					Poll::Pending
+				}
+			})
+			.await;
 			let mut group = h.track.create_group(group::Info { sequence: 3 }).unwrap();
 			group
 				.write_frame(timestamp(), b"first locally received".as_slice())
