@@ -16,10 +16,12 @@ x86\_64) and desktop JVM (Linux x86\_64/aarch64, macOS arm64, Windows x64).
 `dev.moq.media` owns catalogs, encoded imports, and container consumers. `TrackProducer.audio`
 / `.video` take a broadcast, a `Named` or `Requested` target, and an init record.
 `CatalogProducer(broadcast)` holds its broadcast weakly and fails with `Closed` after it closes.
-`dev.moq.flate.SnapshotProducer` / `StreamProducer` publish opaque bytes with an optional `timestampUs`.
+`dev.moq.flate.SnapshotProducer` / `StreamProducer` publish opaque bytes with an optional `timestamp`.
 A missing data timestamp stays untimed; the library never substitutes zero or now.
 `dev.moq.json` consumers' `values()` emits `Value` (`value`, `timestamp`) and `valuesAs<T>()` emits `Timed<T>`;
-a snapshot consumer yields each state in order, and `latest()` skips to the newest. Read timestamps are rounded down to a whole microsecond.
+a snapshot consumer yields each state in order, and `latest()` skips to the newest.
+A `Timestamp(value, scale)` is exact and reads back at the track's timescale, so a 90 kHz tick republishes unchanged.
+`Duration.toTimestamp()` is exact at nanosecond scale; `Timestamp.toDuration()` rounds to the nearest nanosecond.
 Raw tracks with a `null` timescale are untimed on both publish and receive.
 `MoqTrackInfo.compress` on a raw track sends each group DEFLATE-compressed to opt-in `moq-lite-07-wip` peers; other peers, and every reader here, get the original frames. `@moq/net` cannot read a compressed track yet.
 Whole-frame media writes require caller time; container imports keep their own timeline handling.
@@ -71,7 +73,7 @@ Moq.connect("https://relay.example.com", ClientConfig(tls = ClientTls(roots = li
 Moq.connect("https://relay.example.com").use { moq ->
     val broadcast = moq.createBroadcast("my-stream.hang")
     val audio = dev.moq.media.TrackProducer.audio(broadcast, Named(null), AudioInit(format = AudioFormat.OPUS, data = opusInit))
-    audio.writeFrame(Frame(payload = packet, timestampUs = 20_000u))
+    audio.writeFrame(Frame(payload = packet, timestamp = Timestamp(960u, 48_000u)))
     audio.cut() // audio has no keyframes, so this is what gives it groups
 
     val video = dev.moq.video.Producer(
@@ -79,7 +81,7 @@ Moq.connect("https://relay.example.com").use { moq ->
         dev.moq.video.ProducerOptions(input = VideoEncoderInput(format = VideoPixelFormat.RGBA, width = 1280u, height = 720u, framerate = dev.moq.video.FrameRate(30000u, 1001u)),
         output = VideoEncoderOutput(codec = VideoCodec.H264, bitrate = null, gop = null, kind = autoEncoder), track = "camera"),
     )
-    video.write(VideoFrame(timestampUs = pts, data = rgba))
+    video.write(VideoFrame(timestamp = pts, data = rgba))
     broadcast.announce(AnnounceRoute(epoch = mintEpoch())) // a fresh epoch per run
     audio.finish()
     video.finish()

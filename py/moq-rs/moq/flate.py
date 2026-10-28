@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 from moq_ffi import MoqFlateConfig, MoqFlateSnapshotProducer, MoqFlateStreamProducer
 
 from . import publish
-from ._records import _opt_us
+from ._records import Timestamp, _opt_ts
 
 __all__ = ["SnapshotProducer", "StreamProducer"]
 
@@ -27,9 +25,9 @@ class SnapshotProducer:
             broadcast._inner, track._inner, MoqFlateConfig(compression=compression, mime=mime)
         )
 
-    def update(self, payload: bytes, *, timestamp: timedelta | None = None) -> None:
+    def update(self, payload: bytes, *, timestamp: Timestamp | None = None) -> None:
         """Replace the payload at the given broadcast time, or leave it untimed."""
-        self._inner.update(payload, _opt_us(timestamp, "timestamp"))
+        self._inner.update(payload, _opt_ts(timestamp))
 
     def finish(self) -> None:
         """Finish the track and retire its catalog entry."""
@@ -51,9 +49,9 @@ class StreamProducer:
             broadcast._inner, track._inner, MoqFlateConfig(compression=compression, mime=mime)
         )
 
-    def append(self, payload: bytes, *, timestamp: timedelta | None = None) -> None:
+    def append(self, payload: bytes, *, timestamp: Timestamp | None = None) -> None:
         """Append a payload at the given broadcast time, or leave it untimed."""
-        self._inner.append(payload, _opt_us(timestamp, "timestamp"))
+        self._inner.append(payload, _opt_ts(timestamp))
 
     def finish(self) -> None:
         """Finish the track and retire its catalog entry."""

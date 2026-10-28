@@ -746,14 +746,13 @@ impl MoqMediaCatalogProducer {
 		}))
 	}
 
-	/// Read the broadcast clock in microseconds, fixing it for subsequent media producers.
-	pub fn now(&self) -> Result<u64, MoqError> {
+	/// Read the broadcast clock, fixing it for subsequent media producers.
+	pub fn now(&self) -> Result<MoqTimestamp, MoqError> {
 		let _guard = crate::ffi::enter();
-		self.broadcast.upgrade().ok_or(MoqError::Closed)?.with_state(|state| {
-			u64::try_from(state.catalog.clock().now().as_micros()).map_err(|_| MoqError::Codec {
-				reason: "broadcast clock exceeds microsecond timestamp range".into(),
-			})
-		})
+		self.broadcast
+			.upgrade()
+			.ok_or(MoqError::Closed)?
+			.with_state(|state| Ok(state.catalog.clock().now().into()))
 	}
 
 	/// Replace shared video properties, clearing fields that are absent.

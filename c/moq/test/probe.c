@@ -336,8 +336,8 @@ int main(void) {
     moq_frame frame = moq_frame_default();
     frame.payload.data = hello;
     frame.payload.len = sizeof(hello);
-    frame.timestamp_us.has_value = true;
-    frame.timestamp_us.value = 1000;
+    moq_timestamp timestamp = {1000, 1000000};
+    frame.timestamp = &timestamp;
     ok(moq_track_producer_write_frame(track, &frame), "write_frame");
     moq_frame *received = await(&reading, "read_frame");
     moq_task_free(task);
@@ -345,7 +345,7 @@ int main(void) {
     CHECK(received->payload.len == sizeof(hello));
     CHECK(memcmp(received->payload.data, hello, sizeof(hello)) == 0);
     /* The default moq-lite-06 session drops received timestamps, so the track arrives untimed. */
-    CHECK(!received->timestamp_us.has_value);
+    CHECK(!received->timestamp);
     moq_frame_free(received);
     CHECK(!cancelled.done);
 

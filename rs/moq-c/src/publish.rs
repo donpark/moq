@@ -1076,8 +1076,13 @@ impl Publish {
 		self.groups.insert(group)
 	}
 
-	/// Write a single-frame group to a raw track with an explicit timestamp.
-	pub fn track_frame(&mut self, track: Id, timestamp: moq_net::Timestamp, payload: &[u8]) -> Result<(), Error> {
+	/// Write a single-frame group to a raw track, `None` when untimed.
+	pub fn track_frame(
+		&mut self,
+		track: Id,
+		timestamp: Option<moq_net::Timestamp>,
+		payload: &[u8],
+	) -> Result<(), Error> {
 		let track = self.tracks.get_mut(track).ok_or(Error::TrackNotFound)?;
 		track.write_frame(timestamp, bytes::Bytes::copy_from_slice(payload))?;
 		Ok(())
@@ -1088,9 +1093,13 @@ impl Publish {
 	/// The payload must be at most [`moq_net::MAX_DATAGRAM_PAYLOAD`] bytes. Datagrams are
 	/// delivered only on transports and wire versions with a datagram channel; there is no
 	/// group fallback.
-	pub fn track_datagram(&mut self, track: Id, timestamp_us: u64, payload: &[u8]) -> Result<u64, Error> {
+	pub fn track_datagram(
+		&mut self,
+		track: Id,
+		timestamp: Option<moq_net::Timestamp>,
+		payload: &[u8],
+	) -> Result<u64, Error> {
 		let track = self.tracks.get_mut(track).ok_or(Error::TrackNotFound)?;
-		let timestamp = moq_net::Timestamp::from_micros(timestamp_us)?;
 		Ok(track.append_datagram(timestamp, bytes::Bytes::copy_from_slice(payload))?)
 	}
 
@@ -1304,8 +1313,13 @@ impl Publish {
 		Ok(())
 	}
 
-	/// Write a frame into a raw group with an explicit timestamp.
-	pub fn group_frame(&mut self, group: Id, timestamp: moq_net::Timestamp, payload: &[u8]) -> Result<(), Error> {
+	/// Write a frame into a raw group, `None` when untimed.
+	pub fn group_frame(
+		&mut self,
+		group: Id,
+		timestamp: Option<moq_net::Timestamp>,
+		payload: &[u8],
+	) -> Result<(), Error> {
 		let group = self.groups.get_mut(group).ok_or(Error::GroupNotFound)?;
 		group.write_frame(timestamp, bytes::Bytes::copy_from_slice(payload))?;
 		Ok(())

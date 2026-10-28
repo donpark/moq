@@ -76,6 +76,7 @@ from ._records import (
     Grant,
     QuicConfig,
     Subscription,
+    Timestamp,
     TrackInfo,
     WebSocketConfig,
 )
@@ -103,6 +104,7 @@ __all__ = [
     "Range",
     "Route",
     "Subscription",
+    "Timestamp",
     "TrackInfo",
     "VideoCodec",
     "VideoEncoderInput",

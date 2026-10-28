@@ -29,7 +29,6 @@ import dev.moq.json.WindowProducer
 import dev.moq.json.decode
 import dev.moq.json.events
 import dev.moq.json.push
-import dev.moq.json.timestamp
 import dev.moq.json.update
 import dev.moq.json.valuesAs
 import kotlinx.serialization.Serializable
@@ -42,6 +41,8 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.nanoseconds
+import kotlin.time.Duration.Companion.seconds
 
 @Serializable
 private data class Status(val state: String)
@@ -265,7 +266,7 @@ class SmokeTest {
         BroadcastProducer().use { broadcast ->
             val track = broadcast.publishTrack("events", TrackInfo(timescale = 1_000_000uL))
             val group = track.appendGroup()
-            group.writeFrame(Frame(payload = "cached".encodeToByteArray(), timestampUs = 0uL))
+            group.writeFrame(Frame(payload = "cached".encodeToByteArray(), timestamp = Timestamp(0uL, 1_000_000uL)))
             group.finish()
 
             val fetched = broadcast.consume().fetchGroup(
@@ -285,7 +286,7 @@ class SmokeTest {
             val track = broadcast.publishTrack("backlog", TrackInfo(timescale = 1_000_000uL))
             for (ms in 0uL until 3uL) {
                 val group = track.appendGroup()
-                group.writeFrame(Frame(payload = "x".encodeToByteArray(), timestampUs = ms * 1_000uL))
+                group.writeFrame(Frame(payload = "x".encodeToByteArray(), timestamp = Timestamp(ms, 1_000uL)))
                 group.finish()
             }
             val consumer = track.consume(
@@ -307,16 +308,16 @@ class SmokeTest {
             val consumer = track.consume(null)
             track.appendGroup().finish()
             track.appendGroup().finish()
-            track.writeFrame(Frame(payload = "populated".encodeToByteArray(), timestampUs = 2_000uL))
+            track.writeFrame(Frame(payload = "populated".encodeToByteArray(), timestamp = 2.milliseconds.toTimestamp()))
             val frame = consumer.readFrame()
             assertEquals("populated", frame?.payload?.decodeToString())
-            assertEquals(2_000uL, frame?.timestampUs)
+            assertEquals(Timestamp(2_000uL, 1_000_000uL), frame?.timestamp)
         }
     }
 
     @Test
     fun `flate preserves optional timestamps`() = runTest {
-        for (timestamp in listOf(null, 123_456uL)) {
+        for (timestamp in listOf(null, Timestamp(123_456uL, 1_000_000uL))) {
             for (mode in listOf("snapshot", "stream")) {
                 BroadcastProducer().use { broadcast ->
                     val info = if (timestamp == null) null else TrackInfo(timescale = 1_000_000uL)
@@ -334,7 +335,7 @@ class SmokeTest {
                     }
                     val frame = consumer.readFrame()
                     assertEquals("payload", frame?.payload?.decodeToString())
-                    assertEquals(timestamp, frame?.timestampUs)
+                    assertEquals(timestamp, frame?.timestamp)
                 }
             }
         }
@@ -348,7 +349,7 @@ class SmokeTest {
             track.writeFrame(Frame(payload = "payload".encodeToByteArray()))
             val frame = consumer.readFrame()
             assertEquals("payload", frame?.payload?.decodeToString())
-            assertNull(frame?.timestampUs)
+            assertNull(frame?.timestamp)
             assertNull(consumer.info().timescale)
             track.finish()
         }
@@ -374,7 +375,7 @@ class SmokeTest {
             val consumer = broadcast.consume()
             val (name, audio) = catalog(consumer).audio.entries.single()
 
-            media.writeFrame(Frame(payload = "opus frame".encodeToByteArray(), timestampUs = 5_000_000uL))
+            media.writeFrame(Frame(payload = "opus frame".encodeToByteArray(), timestamp = 5.seconds.toTimestamp()))
 
             // Fetch while the track is still published: finishing the media producer
             // unpublishes it, and the fetch would then miss with NotFound.
@@ -389,7 +390,7 @@ class SmokeTest {
                 assertEquals(1, frames.size)
                 val frame = frames.single()
                 assertEquals("opus frame", frame.payload.decodeToString())
-                assertEquals(5_000_000uL, frame.timestampUs)
+                assertEquals(5.seconds, frame.timestamp.toDuration())
             }
         }
     }
@@ -409,10 +410,41 @@ class SmokeTest {
         assertNotNull(audio)
     }
 
-    /** Microsecond timestamps read back as a Duration. */
+    /** A 90 kHz tick, a present zero, and an untimed frame survive a write and read exactly. */
     @Test
-    fun `microsecond timestamps read back as durations`() {
-        assertEquals(20.milliseconds, Frame(payload = ByteArray(0), timestampUs = 20_000uL).timestamp)
+    fun `timestamps round-trip exactly`() = runTest {
+        for (timestamp in listOf(Timestamp(1uL, 90_000uL), Timestamp(0uL, 90_000uL), null)) {
+            BroadcastProducer().use { broadcast ->
+                // A timed track refuses an untimed frame, so null goes to an untimed one.
+                val track = broadcast.publishTrack("ticks", timestamp?.let { TrackInfo(timescale = 90_000uL) })
+                val consumer = track.consume(null)
+                track.writeFrame(Frame(payload = ByteArray(0), timestamp = timestamp))
+                assertEquals(timestamp, consumer.readFrame()?.timestamp)
+            }
+        }
+    }
+
+    /** A zero scale, a scale past 2^62 - 1, and a value past 2^61 - 1 are refused at the write. */
+    @Test
+    fun `out of range timestamps are refused`() {
+        BroadcastProducer().use { broadcast ->
+            val track = broadcast.publishTrack("ticks", TrackInfo(timescale = 90_000uL))
+            for (timestamp in listOf(Timestamp(1uL, 0uL), Timestamp(1uL, 1uL shl 62), Timestamp(1uL shl 61, 90_000uL))) {
+                assertFailsWith<MoqException.TimeOverflow> { track.writeFrame(Frame(payload = ByteArray(0), timestamp = timestamp)) }
+            }
+        }
+    }
+
+    /** From a duration is exact at nanosecond scale; to a duration rounds to the nearest nanosecond. */
+    @Test
+    fun `timestamps convert to and from durations`() {
+        assertEquals(Timestamp(20_000_000uL, 1_000_000_000uL), 20.milliseconds.toTimestamp())
+        assertFailsWith<IllegalArgumentException> { (-1).nanoseconds.toTimestamp() }
+        assertEquals(11_111.nanoseconds, Timestamp(1uL, 90_000uL).toDuration())
+        assertEquals(666_666_667.nanoseconds, Timestamp(2uL, 3uL).toDuration())
+        // The sub-second remainder times a billion overflows 64 bits at the largest scale.
+        assertEquals(500.milliseconds, Timestamp((1uL shl 61) - 1uL, (1uL shl 62) - 1uL).toDuration())
+        assertFailsWith<IllegalArgumentException> { Timestamp((1uL shl 61) - 1uL, 1uL).toDuration() }
         assertNull(AudioEncoderOutput(codec = AudioCodec.opus()).frameDuration)
     }
 
@@ -423,12 +455,12 @@ class SmokeTest {
             val track = broadcast.publishTrack("status", TrackInfo(timescale = 1_000_000uL))
             val producer = SnapshotProducer(broadcast, track, config)
             val consumer = SnapshotConsumer(broadcast.consume().subscribeTrack("status", null), config)
-            for (n in 1..4) producer.update(Status(state = "live$n"), timestampUs = n.toULong() * 1_000uL)
+            for (n in 1..4) producer.update(Status(state = "live$n"), timestamp = n.milliseconds.toTimestamp())
 
             // `next` yields every state in order; `latest` skips the buffered third.
-            assertEquals(Timed(Status(state = "live1"), 1.milliseconds), consumer.next()?.decode<Status>())
-            assertEquals(Timed(Status(state = "live2"), 2.milliseconds), consumer.next()?.decode<Status>())
-            assertEquals(Timed(Status(state = "live4"), 4.milliseconds), consumer.latest()?.decode<Status>())
+            assertEquals(Timed(Status(state = "live1"), Timestamp(1_000uL, 1_000_000uL)), consumer.next()?.decode<Status>())
+            assertEquals(Timed(Status(state = "live2"), Timestamp(2_000uL, 1_000_000uL)), consumer.next()?.decode<Status>())
+            assertEquals(Timed(Status(state = "live4"), Timestamp(4_000uL, 1_000_000uL)), consumer.latest()?.decode<Status>())
         }
     }
 
@@ -439,23 +471,23 @@ class SmokeTest {
             val track = broadcast.publishTrack("log", TrackInfo(timescale = 1_000_000uL))
             val producer = WindowProducer(track, config)
             val consumer = WindowConsumer(broadcast.consume().subscribeTrack("log", null), config)
-            for (n in 1..3) producer.push(Status(state = "live$n"), timestampUs = n.toULong() * 1_000uL)
-            producer.pop(2uL, 4_000uL)
+            for (n in 1..3) producer.push(Status(state = "live$n"), timestamp = Timestamp(n.toULong(), 1_000uL))
+            producer.pop(2uL, Timestamp(4uL, 1_000uL))
 
             for (n in 0..2) {
                 val timed = checkNotNull(consumer.next())
                 val push = assertIs<WindowEventPush>(timed.event)
                 assertEquals(n.toULong(), push.index)
                 assertEquals(Status(state = "live${n + 1}"), push.decode<Status>())
-                assertEquals((n + 1).milliseconds, timed.timestamp)
+                assertEquals((n + 1).milliseconds, timed.timestamp?.toDuration())
             }
             val pop = checkNotNull(consumer.next())
             assertEquals(WindowEventPop(0uL, 2uL), pop.event)
-            assertEquals(4.milliseconds, pop.timestamp)
+            assertEquals(4.milliseconds, pop.timestamp?.toDuration())
 
             // The cut's new group restates record 2, which this reader already has.
             producer.cut()
-            producer.push(Status(state = "live4"), timestampUs = 5_000uL)
+            producer.push(Status(state = "live4"), timestamp = 5.milliseconds.toTimestamp())
             producer.finish()
             val events = consumer.events().toList()
             assertEquals(1, events.size)
@@ -659,7 +691,7 @@ class SmokeTest {
                 ),
             )
             // 2.5 ms of silence at 48 kHz mono f32: exactly one encoded frame.
-            fine.write(AudioFrame(timestampUs = 0uL, data = ByteArray(120 * 4)))
+            fine.write(AudioFrame(timestamp = Timestamp(0uL, 48_000uL), data = ByteArray(120 * 4)))
             fine.finish()
 
             assertFailsWith<MoqException.Audio> {
@@ -748,7 +780,7 @@ class SmokeTest {
 
                 // Two 20 ms Opus frames of silence at 48 kHz mono.
                 for (i in 0 until 2) {
-                    audio.write(AudioFrame(timestampUs = i.toULong() * 20_000uL, data = ByteArray(960 * 4)))
+                    audio.write(AudioFrame(timestamp = Timestamp(i.toULong() * 960uL, 48_000uL), data = ByteArray(960 * 4)))
                 }
                 assertIs<AudioReadFrame>(fixed.next())
                 assertIs<AudioReadFrame>(estimated.next())
@@ -782,7 +814,7 @@ class SmokeTest {
                 val rgba = ByteArray(320 * 240 * 4) { 0x80.toByte() }
                 video.cut()
                 for (i in 0 until 10) {
-                    video.write(VideoFrame(timestampUs = i.toULong() * 33_333uL, data = rgba))
+                    video.write(VideoFrame(timestamp = Timestamp(i.toULong(), 30uL), data = rgba))
                 }
 
                 val consumer = origin.consume().requestBroadcast("video-decode-frame")
@@ -793,7 +825,7 @@ class SmokeTest {
 
                 // Keep the encoder fed so the decoder sees frames after it joined.
                 for (i in 10 until 40) {
-                    video.write(VideoFrame(timestampUs = i.toULong() * 33_333uL, data = rgba))
+                    video.write(VideoFrame(timestamp = Timestamp(i.toULong(), 30uL), data = rgba))
                 }
 
                 assertIs<VideoReadFrame>(decoder.next()).frame.use { frame ->
@@ -817,7 +849,7 @@ class SmokeTest {
     @Test
     fun `encode audio with opus object`() {
         val input = AudioEncoderInput(format = AudioSampleFormat.F32, sampleRate = 48_000u, channels = 1u)
-        val silence = AudioFrame(timestampUs = 0uL, data = ByteArray(960 * 4))
+        val silence = AudioFrame(timestamp = Timestamp(0uL, 48_000uL), data = ByteArray(960 * 4))
 
         // The producer retains the codec, so releasing the codec and the
         // config in either order must still encode.

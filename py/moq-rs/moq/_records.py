@@ -1,8 +1,7 @@
 """Root records the wrapper owns, as frozen dataclasses with Python defaults.
 
-moq-ffi spells media timestamps as integer microseconds, so ``Frame`` and
-``Datagram`` convert them to ``timedelta`` at the boundary. Durations already
-cross as ``timedelta``. ``ClientTls`` lives here with the rest of the client
+Media timestamps cross as exact :class:`Timestamp` records; durations cross as
+``timedelta``. ``ClientTls`` lives here with the rest of the client
 config, so a bare string passed for a list is refused instead of splitting into
 characters.
 """
@@ -12,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
+from fractions import Fraction
 from importlib import metadata
 
 from moq_ffi import (
@@ -26,6 +26,7 @@ from moq_ffi import (
     MoqQuicConfig,
     MoqRange,
     MoqSubscription,
+    MoqTimestamp,
     MoqTrackInfo,
     MoqWebSocketConfig,
 )
@@ -42,20 +43,6 @@ def _implementation() -> str:
         return "moq-py/dev"
 
 
-def _to_us(value: timedelta, name: str) -> int:
-    if value < timedelta(0):
-        raise ValueError(f"{name} must not be negative: {value}")
-    return value // _MICROSECOND
-
-
-def _opt_us(value: timedelta | None, name: str) -> int | None:
-    return None if value is None else _to_us(value, name)
-
-
-def _from_us(us: int) -> timedelta:
-    return timedelta(microseconds=us)
-
-
 def _strs(value: Sequence[str], name: str) -> list[str]:
     # A str is itself a Sequence[str], so list() would split it into characters.
     if isinstance(value, str):
@@ -63,8 +50,43 @@ def _strs(value: Sequence[str], name: str) -> list[str]:
     return list(value)
 
 
-def _opt_from_us(us: int | None) -> timedelta | None:
-    return None if us is None else _from_us(us)
+@dataclass(frozen=True)
+class Timestamp:
+    """An exact media timestamp: ``value`` units at ``scale`` units per second.
+
+    ``value`` is at most ``2**61 - 1`` and ``scale`` is non-zero and at most ``2**62 - 1``;
+    a write past either bound raises ``moq.Error.TimeOverflow``. A read carries the
+    track's timescale, and a write at another scale is floored to it.
+    """
+
+    value: int
+    scale: int
+
+    @staticmethod
+    def from_timedelta(duration: timedelta) -> Timestamp:
+        """Exactly ``duration``, at microsecond scale since that is a ``timedelta``'s own unit."""
+        if duration < timedelta(0):
+            raise ValueError(f"timestamp must not be negative: {duration}")
+        return Timestamp(duration // _MICROSECOND, 1_000_000)
+
+    def to_timedelta(self) -> timedelta:
+        """This timestamp rounded to the nearest microsecond, so a finer scale may lose precision."""
+        return timedelta(microseconds=round(Fraction(self.value * 1_000_000, self.scale)))
+
+    def _ffi(self) -> MoqTimestamp:
+        return MoqTimestamp(value=self.value, scale=self.scale)
+
+    @staticmethod
+    def _from_ffi(value: MoqTimestamp) -> Timestamp:
+        return Timestamp(value.value, value.scale)
+
+
+def _opt_ts(value: Timestamp | None) -> MoqTimestamp | None:
+    return None if value is None else value._ffi()
+
+
+def _opt_from_ts(value: MoqTimestamp | None) -> Timestamp | None:
+    return None if value is None else Timestamp._from_ffi(value)
 
 
 @dataclass(frozen=True)
@@ -75,14 +97,14 @@ class Frame:
     """
 
     payload: bytes
-    timestamp: timedelta | None = None
+    timestamp: Timestamp | None = None
 
     def _ffi(self) -> MoqFrame:
-        return MoqFrame(payload=self.payload, timestamp_us=_opt_us(self.timestamp, "timestamp"))
+        return MoqFrame(payload=self.payload, timestamp=_opt_ts(self.timestamp))
 
     @staticmethod
     def _from_ffi(frame: MoqFrame) -> Frame:
-        return Frame(payload=frame.payload, timestamp=_opt_from_us(frame.timestamp_us))
+        return Frame(payload=frame.payload, timestamp=_opt_from_ts(frame.timestamp))
 
 
 @dataclass(frozen=True)
@@ -93,14 +115,14 @@ class Datagram:
     """
 
     sequence: int
-    timestamp: timedelta | None
+    timestamp: Timestamp | None
     payload: bytes
 
     @staticmethod
     def _from_ffi(datagram: MoqDatagram) -> Datagram:
         return Datagram(
             sequence=datagram.sequence,
-            timestamp=_opt_from_us(datagram.timestamp_us),
+            timestamp=_opt_from_ts(datagram.timestamp),
             payload=datagram.payload,
         )
 

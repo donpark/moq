@@ -65,19 +65,7 @@ func (o DecoderOutput) ffi() (ffi.MoqAudioDecoderOutput, error) {
 }
 
 // Frame is interleaved PCM with its presentation timestamp.
-type Frame struct {
-	Timestamp time.Duration
-	Data      []byte
-}
-
-func (f Frame) ffi() (ffi.MoqAudioFrame, error) {
-	us, err := bridge.Duration(f.Timestamp, "audio timestamp")
-	return ffi.MoqAudioFrame{TimestampUs: us, Data: f.Data}, err
-}
-
-func frame(raw ffi.MoqAudioFrame) Frame {
-	return Frame{Timestamp: time.Duration(raw.TimestampUs) * time.Microsecond, Data: raw.Data}
-}
+type Frame = ffi.MoqAudioFrame
 
 // Read is one item a Consumer reads, in delivery order: a ReadFrame, ReadGap, or ReadEnd.
 type Read interface{ read() }
@@ -90,7 +78,7 @@ type ReadFrame struct {
 // ReadGap is media lost after what was already read: what follows does not continue it.
 type ReadGap struct {
 	// Timestamp is the furthest presentation point already read.
-	Timestamp time.Duration
+	Timestamp moq.Timestamp
 	// Duration is an upper bound on how long until the next frame resumes.
 	Duration time.Duration
 }
@@ -100,7 +88,7 @@ type ReadGap struct {
 // comes from a fresh encoder.
 type ReadEnd struct {
 	// End is where the stopped encoder's media stops.
-	End time.Duration
+	End moq.Timestamp
 }
 
 func (ReadFrame) read() {}
@@ -110,11 +98,11 @@ func (ReadEnd) read()   {}
 func audioRead(raw ffi.MoqAudioRead) (Read, error) {
 	switch read := raw.(type) {
 	case ffi.MoqAudioReadFrame:
-		return ReadFrame{Frame: frame(read.Frame)}, nil
+		return ReadFrame{Frame: read.Frame}, nil
 	case ffi.MoqAudioReadGap:
-		return ReadGap{Timestamp: time.Duration(read.TimestampUs) * time.Microsecond, Duration: read.Duration}, nil
+		return ReadGap{Timestamp: read.Timestamp, Duration: read.Duration}, nil
 	case ffi.MoqAudioReadEnd:
-		return ReadEnd{End: time.Duration(read.EndUs) * time.Microsecond}, nil
+		return ReadEnd{End: read.End}, nil
 	}
 	return nil, fmt.Errorf("unknown audio read: %T", raw)
 }
@@ -166,11 +154,7 @@ func (p *Producer) Reanchor() error { return p.inner.Reanchor() }
 
 // Write encodes and publishes one PCM frame in the configured input layout.
 func (p *Producer) Write(value Frame) error {
-	raw, err := value.ffi()
-	if err != nil {
-		return err
-	}
-	return p.inner.Write(raw)
+	return p.inner.Write(value)
 }
 
 // Reservation returns this track's bandwidth reservation, or nil without one.
@@ -246,7 +230,6 @@ func (d *Consumer) Next(ctx context.Context) (Read, error) {
 
 // All ranges over every read until the track ends or the loop breaks.
 func (d *Consumer) All(ctx context.Context) iter.Seq2[Read, error] { return bridge.Seq(ctx, d.Next) }
-
 
 // Delay is the playout delay to hold ahead of the playhead: the fixed one, or the estimate from every frame read so far.
 // The estimate measures when Next returns, so call it again as soon as the previous frame is handled.

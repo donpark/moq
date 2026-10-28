@@ -15,8 +15,8 @@ extension Flate {
         }
 
         /// Replace the payload at the given broadcast time, or leave it untimed when nil.
-        public func update(_ payload: Data, timestampUs: UInt64? = nil) throws {
-            try ffi.update(payload: payload, timestampUs: timestampUs)
+        public func update(_ payload: Data, timestamp: Timestamp? = nil) throws {
+            try ffi.update(payload: payload, timestamp: timestamp)
         }
 
         /// Close the track and retire its catalog entry.
@@ -33,8 +33,8 @@ extension Flate {
         }
 
         /// Append a payload at the given broadcast time, or leave it untimed when nil.
-        public func append(_ payload: Data, timestampUs: UInt64? = nil) throws {
-            try ffi.append(payload: payload, timestampUs: timestampUs)
+        public func append(_ payload: Data, timestamp: Timestamp? = nil) throws {
+            try ffi.append(payload: payload, timestamp: timestamp)
         }
 
         /// Close the track and retire its catalog entry.

@@ -2,8 +2,6 @@
 package flate
 
 import (
-	"time"
-
 	"moq.dev/moq"
 	ffi "moq.dev/moq-ffi/moq"
 	"moq.dev/moq/internal/bridge"
@@ -30,12 +28,8 @@ func NewSnapshotProducer(broadcast *moq.BroadcastProducer, track *moq.TrackProdu
 }
 
 // Update publishes payload at timestamp on the broadcast clock; nil is untimed.
-func (p *SnapshotProducer) Update(payload []byte, timestamp *time.Duration) error {
-	at, err := bridge.OptionalDuration(timestamp, "timestamp")
-	if err != nil {
-		return err
-	}
-	return p.inner.Update(payload, at)
+func (p *SnapshotProducer) Update(payload []byte, timestamp *moq.Timestamp) error {
+	return p.inner.Update(payload, timestamp)
 }
 
 // Finish closes the track and retires its catalog entry.
@@ -54,12 +48,8 @@ func NewStreamProducer(broadcast *moq.BroadcastProducer, track *moq.TrackProduce
 }
 
 // Append adds payload at timestamp on the broadcast clock; nil is untimed.
-func (p *StreamProducer) Append(payload []byte, timestamp *time.Duration) error {
-	at, err := bridge.OptionalDuration(timestamp, "timestamp")
-	if err != nil {
-		return err
-	}
-	return p.inner.Append(payload, at)
+func (p *StreamProducer) Append(payload []byte, timestamp *moq.Timestamp) error {
+	return p.inner.Append(payload, timestamp)
 }
 
 // Finish closes the track and retires its catalog entry.

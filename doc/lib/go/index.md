@@ -16,14 +16,16 @@ linux/amd64, linux/arm64, darwin/arm64 (macOS 12.3+), windows/amd64.
 `moq.dev/moq/media` owns catalogs, encoded imports, and container consumers.
 Construct `NewAudioTrackProducer` / `NewVideoTrackProducer` from a broadcast, an init record,
 and a `Named` or `Requested` target. `NewCatalogProducer` holds its broadcast weakly;
-catalog writes fail with `ErrClosed` after the broadcast closes. Media timestamps use `time.Duration`.
+catalog writes fail with `ErrClosed` after the broadcast closes. Media timestamps are exact
+`moq.Timestamp` records (`Value` at `Scale` units per second), so a 90 kHz tick survives a read and republish;
+`TimestampFromDuration` and `TimestampToDuration` convert.
 A missing data timestamp stays untimed; the library never substitutes zero or now.
 Raw tracks with a `nil` timescale are untimed on both publish and receive.
 `TrackInfo.Compress` on a raw track sends each group DEFLATE-compressed to opt-in `moq-lite-07-wip` peers; other peers, and every reader here, get the original frames. `@moq/net` cannot read a compressed track yet.
 `moq.dev/moq/flate` publishes opaque snapshot and stream payloads; its `Update` / `Append`
-and the JSON producers take a final `*time.Duration` timestamp argument (`nil` for untimed).
+and the JSON producers take a final `*moq.Timestamp` argument (`nil` for untimed).
 JSON consumers return a `*Timed` holding the value and that timestamp; `SnapshotConsumer.Latest`
-skips to the newest state where `Next` yields each one. Read timestamps are rounded down to a whole microsecond.
+skips to the newest state where `Next` yields each one. A read timestamp is at the track's timescale.
 Whole-frame media writes require caller time; container imports keep their own timeline handling.
 Timed raw/data tracks require caller-supplied timestamps. Use `CatalogProducer.Now()` to stamp a locally
 created event on the broadcast clock; reading it fixes that clock for later media producers.
@@ -90,15 +92,14 @@ for event, err := range announced.All(ctx) {
 
 ```go
 import (
-    "time"
     moqvideo "moq.dev/moq/video"
 )
 
 // Publish encoded frames, or raw pixels with the codec inside the binding.
-// opusInit, packet, pts, and rgba come from your encoder or capture source.
+// opusInit, packet, pts (90 kHz ticks), and rgba come from your encoder or capture source.
 broadcast, _ := client.CreateBroadcast("my-stream.hang")
 audio, _ := moqmedia.NewAudioTrackProducer(broadcast, moqmedia.Named{}, moqmedia.AudioInit{Format: moqmedia.AudioFormatOpus, Data: opusInit})
-timestamp := 20 * time.Millisecond
+timestamp := moq.Timestamp{Value: 960, Scale: 48_000} // 20 ms on the Opus sample clock
 _ = audio.WriteFrame(moq.Frame{Payload: packet, Timestamp: &timestamp})
 _ = audio.Cut() // audio has no keyframes, so this is what gives it groups
 
@@ -109,7 +110,7 @@ video, _ := moqvideo.NewProducer(catalogProducer, moqvideo.ProducerOptions{
     Output: moqvideo.EncoderOutput{Codec: moq.VideoCodecH264, Kind: moq.AutoEncoder()},
     Track: &track,
 })
-_ = video.Write(moqvideo.Frame{Timestamp: time.Duration(pts) * time.Microsecond, Data: rgba})
+_ = video.Write(moqvideo.Frame{Timestamp: moq.Timestamp{Value: pts, Scale: 90_000}, Data: rgba})
 epoch := moq.MintEpoch() // a fresh epoch per run
 _ = broadcast.Announce(moq.AnnounceRoute{Epoch: &epoch})
 _ = audio.Finish()
