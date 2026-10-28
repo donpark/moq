@@ -677,10 +677,11 @@ fn round(duration: Duration) -> Duration {
 /// local subscription keeps the media wanted, so an on-demand publisher produces the media that an
 /// HLS export, which reads only the records, describes and fetches.
 ///
-/// Driven by the record track's wakeups rather than a task, since nothing here owns a runtime: a
-/// wake runs on the waking thread, which kio does only outside its own locks. The waker holds this
-/// weakly, so dropping the [`Recorder`] ends the subscription and the registration together. Both
-/// track handles are weak, so neither keeps its track open.
+/// Driven by the record track's wakeups rather than a task, since nothing here owns a runtime. A
+/// wake polls inline on the waking thread, reading the record track, so it relies on kio and
+/// moq-net waking a track's waiters only once its lock is released. The waker holds this weakly, so
+/// dropping the [`Recorder`] ends the subscription and the registration together. Both track
+/// handles are weak, so neither keeps its track open.
 struct Lend {
 	records: moq_net::track::Demand,
 	media: moq_net::track::Consumer,
@@ -1269,6 +1270,36 @@ mod test {
 		assert!(demand.wanted().is_some());
 		drop(recorder);
 		assert_eq!(demand.wanted(), None, "the recorder is gone");
+	}
+
+	/// A join over the record track's refresh ratio is answered by the next record's fresh group,
+	/// whose demand wake reaches the lend only once the track's lock is released, not under it.
+	#[tokio::test]
+	async fn a_refreshing_join_keeps_lending() {
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let media = broadcast.create_track("video", None).unwrap();
+		let demand = media.demand();
+		let tracks = Tracks::new(&broadcast);
+		let mut recorder = tracks.track("video", hinted()).unwrap();
+		recorder.lend(&media);
+
+		let hls = tracks.hls("video").unwrap();
+		let _first = Consumer::subscribe(&broadcast.consume(), &hls).await.unwrap();
+		// Enough records that a join outweighs the refresh ratio and asks for a fresh group.
+		for group in 0..64 {
+			recorder.frame(group, ms(group * 4_000));
+		}
+		let records = broadcast.consume().track("video.hls").unwrap();
+		let before = records.subscribe(None).await.unwrap().largest().await;
+		let _late = Consumer::subscribe(&broadcast.consume(), &hls).await.unwrap();
+		recorder.frame(64, ms(64 * 4_000));
+
+		let after = records.subscribe(None).await.unwrap().largest().await;
+		assert!(
+			after.map(|at| at.group) > before.map(|at| at.group),
+			"the join was answered with a fresh group"
+		);
+		assert!(demand.wanted().is_some(), "the readers still want the media");
 	}
 
 	#[test]
