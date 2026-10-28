@@ -395,7 +395,7 @@ impl Recv {
 	}
 }
 
-/// Chunks returned from [`recv::Stream::read()`][crate::RecvStream::read].
+/// Chunks returned from [`Stream::read()`].
 ///
 /// ### Note: Finalization Needed
 /// Bytes read from the stream are not released from the congestion window until
