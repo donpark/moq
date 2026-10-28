@@ -871,6 +871,10 @@ impl Drop for Serve {
 
 /// The snapshot a joining FETCH inherits from its subscription.
 #[derive(Clone)]
+#[allow(
+	clippy::large_enum_variant,
+	reason = "one per live subscription, and the small variants refuse at once; an allow, since the size gap varies by feature set"
+)]
 enum Joined<G> {
 	/// This subscription's filter is not supported by the joining FETCH handler.
 	Unsupported,
@@ -11971,7 +11975,13 @@ mod serve_tests {
 	async fn a_joining_fetch_outlives_its_subscription_but_not_its_token() {
 		const PAYLOAD: &[u8] = b"joined-prefix";
 		for (version, end) in JOINING_DRAFTS.into_iter().flat_map(|version| {
-			[JoinEnd::Ended, JoinEnd::TokenEnded, JoinEnd::Narrowed, JoinEnd::RevokedAfter].map(|end| (version, end))
+			[
+				JoinEnd::Ended,
+				JoinEnd::TokenEnded,
+				JoinEnd::Narrowed,
+				JoinEnd::RevokedAfter,
+			]
+			.map(|end| (version, end))
 		}) {
 			let token = end != JoinEnd::Ended;
 			let origin = crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce();
@@ -12069,7 +12079,10 @@ mod serve_tests {
 
 			let mut subscription = Some(subscription);
 			if end == JoinEnd::Narrowed {
-				enforced.as_ref().expect("a token").update(crate::auth::Grant::default());
+				enforced
+					.as_ref()
+					.expect("a token")
+					.update(crate::auth::Grant::default());
 				// The subscription reads the update first, and the fetch still sees it. The
 				// subscription's request then waits on the fetch, which holds its token's slot.
 				let serving = subscription.as_mut().expect("still serving");
