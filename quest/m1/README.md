@@ -154,7 +154,6 @@ surface and zero-copy texture import, land before the cut.
 - [Main is no slower than release](/quest/m1/release-perf/README.md) - every benchmark where main is slower than release is fixed or accepted with a reason, checked by a final paired run before the cut
 - [Interop coverage](/quest/m1/interop-coverage/README.md) - the riskiest moq-transport features moq-net exposes get cross-implementation tests over drafts 18 and 22
 - [Calibrate the paired nightly benchmarks](/quest/m1/bench-ci.md) - A/A and deliberately slowed Nightly runs set the paired comparison's threshold, so its regression alerts can be trusted
-- [HLS opt-in for gateways](/quest/m1/hls-opt-in-gateways.md) - SRT, RTMP, WebRTC ingest and the bindings can publish HLS records
 - [HLS and DASH segment conformance](/quest/m1/hls-conformance.md) - nightly ffprobe checks that advertised timing, sync flags, and bytes match the media served
 - [App-limited BBR3 estimate ages](/quest/m1/bbr-app-limited.md) - an app-limited BBR3 estimate falls within seconds after the path drops
 - [Aborted epoch reads keep their cause](/quest/m1/epoch-abort-cause.md) - an aborted read through an epoch route ends with its own error, not NotFound
@@ -167,7 +166,6 @@ surface and zero-copy texture import, land before the cut.
 - [Next Object on a cold Rust copy](/quest/m1/next-object-cold-copy.md) - a join after an upstream group report starts at the first frame received, never skipping
 - [Container consumers buffer by backpressure](/quest/m1/container-backpressure.md) - Rust and JS container consumers decode ahead only a byte budget, so a hostile publisher cannot grow them
 - [One moq-ffi build definition](/quest/m1/ffi-build-flags.md) - every binding takes moq-ffi's default features from one place
-- [A reported drop means the same everywhere](/quest/m1/resume-drop-final.md) - Rust and JS agree whether a group reported dropped can still be served
 - [moq-clock moves into kio::clock](/quest/m1/kio-clock.md) - moq-clock and its test macro become `kio::clock` and `#[kio::test]` before the cut publishes them
 - [Poll-first async](/quest/m1/poll-first/README.md) - library crates compile no coroutines by default: async wrappers are generated from `poll_*` and gated behind an `async` feature
 
