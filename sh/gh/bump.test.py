@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location("bump", Path(__file__).with_name("bump.py"))
 bump = importlib.util.module_from_spec(spec)
@@ -78,8 +79,21 @@ class BumpTest(unittest.TestCase):
             "swift/Sources/Moq/Moq.swift": "",
             "kt/gradle.properties": "moqffi.version=0.0.0-dev\nmoq.version=0.4.0\n",
             "kt/moq/src/jvmMain/Moq.kt": "",
+            "dart/moq/pubspec.yaml": "name: moq\nversion: 0.1.0\n",
+            "dart/moq/lib/moq.dart": "",
+            "c/moq/VERSION": "0.8.0\n",
+            "c/moq/src/moq.c": "",
+            "cpp/moq/VERSION": "0.1.0\n",
+            "cpp/moq/src/moq.cpp": "",
+            "cpp/moq/FFI_VERSION": "# Unset until published.\n",
+            "cpp/moq/FFI_SHA256.json": "{}\n",
+            "cpp/obs/VERSION": "0.7.0\n",
+            "cpp/obs/src/plugin.cpp": "",
         })
         self.commit("initial")
+        # Every tag-published package has released its current version.
+        for tag in ("moq-dart-v0.1.0", "c-v0.8.0", "cpp-v0.1.0", "obs-moq-v0.7.0"):
+            self.git("tag", tag)
 
     def tearDown(self):
         os.chdir(self.cwd)
@@ -102,6 +116,19 @@ class BumpTest(unittest.TestCase):
 
     def planned(self) -> dict[str, str]:
         return {b.package.name: b.new for b in bump.plan("HEAD")}
+
+    def pending(self, assets: set[str] = frozenset()) -> dict[str, str | None]:
+        with mock.patch.object(bump, "release_assets", return_value=assets):
+            return {t.name: t.blocker for t in bump.pending("HEAD")}
+
+    def pin(self, version: str) -> set[str]:
+        """Pin the C and C++ packages to moq-ffi `version`, returning its asset names."""
+        assets = {bump.ffi.name(version, target) + ".tar.gz" for target in bump.ffi.TARGETS}
+        self.commit("chore: pin moq-ffi", {
+            "cpp/moq/FFI_VERSION": f"# Pinned.\n{version}\n",
+            "cpp/moq/FFI_SHA256.json": json.dumps({asset: "0" * 64 for asset in assets}) + "\n",
+        })
+        return assets
 
     def test_nothing_changed(self):
         self.assertEqual(self.planned(), {})
@@ -179,6 +206,78 @@ class BumpTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bun.lock does not carry @moq/a 0.1.0"):
             bump.apply(bump.plan("HEAD"), self.root)
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_tagged_package_bumps_after_a_change_since_its_tag(self):
+        self.commit("test(dart): more tests", {"dart/moq/test/moq_test.dart": ""})
+        self.assertEqual(self.planned(), {})
+        self.commit("fix(dart): a backport", {"dart/moq/lib/moq.dart": "// fix\n"})
+        self.assertEqual(self.planned(), {"moq (Dart)": "0.1.1"})
+        self.assertEqual(self.pending(), {})
+
+    def test_untagged_version_awaits_its_tag_instead_of_a_bump(self):
+        self.commit("chore: bump dart", {"dart/moq/pubspec.yaml": "name: moq\nversion: 0.1.1\n"})
+        self.commit("fix(dart): after the bump", {"dart/moq/lib/moq.dart": "// fix\n"})
+        self.assertEqual(self.planned(), {})
+        self.assertEqual(self.pending(), {"moq-dart-v0.1.1": None})
+
+    def test_cpp_and_obs_release_together(self):
+        self.commit("fix(obs): plugin only", {"cpp/obs/src/plugin.cpp": "// fix\n"})
+        self.assertEqual(self.planned(), {"moq (C++)": "0.1.1", "obs-moq (OBS)": "0.7.1"})
+        alongside = {b.package.name: b.alongside for b in bump.plan("HEAD")}
+        self.assertEqual(alongside, {"moq (C++)": "obs-moq (OBS)", "obs-moq (OBS)": None})
+
+    def test_cpp_release_bumps_obs(self):
+        self.commit("fix(cpp): library only", {"cpp/moq/src/moq.cpp": "// fix\n"})
+        self.assertEqual(self.planned(), {"moq (C++)": "0.1.1", "obs-moq (OBS)": "0.7.1"})
+
+    def test_untagged_cpp_bumps_a_released_obs(self):
+        self.commit("chore: bump cpp", {"cpp/moq/VERSION": "0.2.0\n"})
+        self.assertEqual(self.planned(), {"obs-moq (OBS)": "0.7.1"})
+
+    def test_obs_never_pushes_its_own_tag(self):
+        self.commit("chore: bump obs", {"cpp/obs/VERSION": "0.8.0\n"})
+        self.assertEqual(self.planned(), {"moq (C++)": "0.1.1"})
+        self.assertEqual(self.pending(), {})
+
+    def test_ffi_pin_change_releases_c_and_cpp(self):
+        self.pin("0.4.20")
+        self.assertEqual(self.planned(), {"moq (C)": "0.8.1", "moq (C++)": "0.1.1", "obs-moq (OBS)": "0.7.1"})
+
+    def test_c_and_cpp_tags_wait_for_the_pinned_ffi_release(self):
+        self.commit("chore: bump", {
+            "dart/moq/pubspec.yaml": "name: moq\nversion: 0.1.1\n",
+            "c/moq/VERSION": "0.8.1\n",
+            "cpp/moq/VERSION": "0.1.1\n",
+        })
+        self.assertEqual(self.pending(), {
+            "moq-dart-v0.1.1": None,
+            "c-v0.8.1": "cpp/moq/FFI_VERSION pins no single moq-ffi release",
+            "cpp-v0.1.1": "cpp/moq/FFI_VERSION pins no single moq-ffi release",
+        })
+        assets = self.pin("0.4.20")
+        missing = sorted(assets)[-1]
+        blocked = self.pending(assets - {missing})
+        self.assertIn(missing, blocked["c-v0.8.1"])
+        self.assertEqual(self.pending(assets), {"moq-dart-v0.1.1": None, "c-v0.8.1": None, "cpp-v0.1.1": None})
+
+    def test_tag_pushes_only_unblocked_tags(self):
+        remote_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(remote_dir.cleanup)
+        remote = Path(remote_dir.name)
+        subprocess.run(["git", "init", "--quiet", "--bare", str(remote)], check=True)
+        self.git("remote", "add", "origin", str(remote))
+        head = self.commit("chore: bump", {"dart/moq/pubspec.yaml": "name: moq\nversion: 0.1.1\n", "c/moq/VERSION": "0.8.1\n"})
+        with mock.patch.object(bump, "release_assets", return_value=set()):
+            bump.push_tags()
+        pushed = subprocess.run(["git", "ls-remote", "--tags", str(remote)], capture_output=True, text=True, check=True)
+        self.assertEqual(pushed.stdout, f"{head}\trefs/tags/moq-dart-v0.1.1\n")
+
+    def test_missing_tagged_packages_are_skipped(self):
+        # A `release` before the cut that brings C, C++, and OBS.
+        self.git("rm", "--quiet", "-r", "c", "cpp")
+        self.commit("chore: drop c and cpp")
+        self.assertEqual(self.planned(), {})
+        self.assertEqual(self.pending(), {})
 
     def test_patch(self):
         self.assertEqual(bump.patch("0.9.9"), "0.9.10")

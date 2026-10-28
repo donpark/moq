@@ -3,24 +3,19 @@ name: Release bump
 # release-plz bumps Rust crates on `release`. This opens one PR that
 # patch-bumps every other package whose version a human owns and whose sources
 # changed since that version shipped, so a backport publishes once the PR
-# merges. See sh/gh/bump.py for which packages it covers.
+# merges. For packages a tag publishes (Dart, C, C++), it then pushes each tag
+# the versions on `release` lack. See sh/gh/bump.py for which packages it
+# covers.
 permissions:
   contents: read
 
 on:
+  # Every push, not only those touching a package: a C or C++ tag waiting on
+  # its pinned moq-ffi release retries on the next one.
   push:
     branches: [release]
-    paths:
-      - "js/**"
-      - "py/moq-rs/**"
-      - "swift/**"
-      - "kt/**"
-      - "bun.lock"
-      - "uv.lock"
-      - "sh/gh/bump.py"
-      - ".github/workflows/release-bump.yml"
-  # Regenerating the PR by hand. Dispatch it on `release`; the job refuses any
-  # other ref.
+  # Regenerating the PR, or retrying a tag, by hand. Dispatch it on `release`;
+  # the job refuses any other ref.
   workflow_dispatch:
 
 # Each run rebuilds the PR from the pushed `release`, so a newer push makes an
@@ -37,7 +32,7 @@ jobs:
 
     steps:
       # The app's token, as release-plz uses, so the PR it opens runs the
-      # Release gate.
+      # Release gate and the tags it pushes run their release workflows.
       - name: Generate GitHub token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         id: generate-token
@@ -52,6 +47,13 @@ jobs:
           token: ${{ steps.generate-token.outputs.token }}
 
       - uses: ./.github/actions/just
+
+      # Before the PR step, which moves HEAD to the bump commit. A version the
+      # bump PR raises is tagged on the push its merge makes.
+      - name: Push release tags
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+        run: just gh bump tag
 
       - name: Open or update the bump PR
         env:

@@ -71,7 +71,7 @@ test:
 release *args:
     sh/gh/release.sh "$@"
 
-# Patch-bump hand-versioned packages with unreleased changes: `just gh bump check|apply|pr`.
+# Patch-bump and tag hand-versioned packages with unreleased changes: `just gh bump check|apply|pr|tag`.
 [positional-arguments]
 bump *args:
     python3 sh/gh/bump.py "$@"
