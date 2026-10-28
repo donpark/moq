@@ -1043,6 +1043,12 @@ export class Subscriber {
 			return;
 		}
 
+		// This reader cannot preserve a partial group's frame indices, so refuse it before
+		// publishing anything that would number its first received frame as zero.
+		if (group.frameStart !== 0) {
+			throw new ProtocolViolation(`group ${group.sequence} starts at frame ${group.frameStart}`);
+		}
+
 		const { track, timescale, tail } = entry;
 		const producer = new netGroup.Producer(group.sequence);
 		const read = tail.open(group.sequence);
