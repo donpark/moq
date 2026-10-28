@@ -807,8 +807,9 @@ async fn capture_loop<S: CaptureSource>(
 		producer.report_bitrate(ceiling);
 		// Per encoder, since a fresh one opens with a keyframe that serves every earlier ask.
 		let mut forced = Cuts::new(served);
-		// The camera's skips already reported, since each open counts from zero.
-		let mut reported = 0;
+		// The camera's skips already accounted for, from its first read on: frames it replaced
+		// while this encoder was still opening are startup, not frames the encoder fell behind on.
+		let mut reported = None;
 
 		loop {
 			// Race the next frame against the last viewer leaving so we release the
@@ -839,8 +840,10 @@ async fn capture_loop<S: CaptureSource>(
 			let Some(mut frame) = frame else { break };
 			// Frames the camera replaced while this loop was encoding or retuning.
 			let skipped = camera.skipped();
-			producer.report_skipped(skipped - reported);
-			reported = skipped;
+			if let Some(reported) = reported {
+				producer.report_skipped(skipped - reported);
+			}
+			reported = Some(skipped);
 			frame.timestamp = map_capture_timestamp(capture_epoch, frame.timestamp)?;
 			let count = counted.read().count;
 			// A backend that cannot cut leaves every group to its cadence.
@@ -1392,7 +1395,7 @@ mod tests {
 		}
 
 		/// The catalog's stats carry the encoder's target and every frame the camera replaced
-		/// before the loop read it.
+		/// before the loop read it, once the loop has read its first.
 		#[tokio::test]
 		async fn stats_report_the_target_and_skipped_frames() {
 			tokio::task::LocalSet::new()
@@ -1401,7 +1404,11 @@ mod tests {
 					let mut track = fixture.subscribe().await;
 					let camera = fixture.camera();
 
-					// Back to back, so the loop only ever sees the second.
+					// Replaced before the first read, while the encoder was still opening: not a skip.
+					camera.push_at(surface(), Instant::now());
+					camera.push_at(surface(), Instant::now());
+					read(&mut track).await;
+					// Back to back once encoding, so the loop only ever sees the second.
 					camera.push_at(surface(), Instant::now());
 					camera.push_at(surface(), Instant::now());
 					read(&mut track).await;
