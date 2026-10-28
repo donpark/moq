@@ -80,9 +80,9 @@ model of whichever ROUTE/ANNOUNCE shape is on `main` rather than adding a
 second one. Account for TAKEOVER in announcement IDs, compression bases,
 snapshot counts, route filtering, duplicate-advertisement rules and
 retirement. Update the lite draft and existing identity/compatibility docs in
-the implementation PR, and add a takeover section to the
-[identity and recovery guide](/quest/m1/identity-guide.md) if that has
-landed; the guide does not replace inline docs.
+the implementation PR, and add a takeover section to the identity and
+recovery guide (`doc/concept/identity.md`), whose cold-start step and
+lazy-job lifecycle it changes; the guide does not replace inline docs.
 
 Tests with controlled time: first view before/after takeover; absent reader;
 invalid/retired predecessor; same ID after Restart; two workers at one prefix;
@@ -107,4 +107,3 @@ ANNOUNCE_TAKEOVER; published versions retain their framing.
 - [Routes and announces](/quest/m1/cluster-routing/routes.md) - the route layer whose ANNOUNCE_START layout overlaps this one's
 - [IETF takeover](/quest/m1/ietf-takeover.md) - negotiated IETF counterpart
 - [Retired requests](https://github.com/moq-dev/moq/pull/5294) - replacements never substitute content into held handles
-- [Identity and recovery guide](/quest/m1/identity-guide.md) - explains takeover alongside restart and legacy behavior
