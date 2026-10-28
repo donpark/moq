@@ -377,3 +377,42 @@ test("Consumer reads a finished marker group's end before skipping under pressur
 		warn.mockRestore();
 	}
 });
+
+test("Consumer reads a group whose frame fails to read as cut short while the reader waits", async () => {
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format: new Format("data"),
+		maxDelay: Milli(5_000),
+	});
+	try {
+		const stalled = track.createGroup(0);
+		write(stalled, 0);
+		expect(await consumer.next()).toMatchObject({ kind: "frame", group: 0 });
+		const next = track.createGroup(1);
+		write(next, 10_000);
+		next.finish();
+
+		// The reader parks on group 0, then a frame lands whose payload fails once read, as a compressed
+		// slice that will not inflate does. The read that takes it fails the group.
+		const pending = within(consumer.next());
+		await flush();
+		const payload = encodeFrame(PAYLOAD, 5_000 as Micro);
+		let armed = false;
+		stalled.writeFrame({
+			get payload() {
+				if (armed) throw new Error("the slice will not inflate");
+				return payload;
+			},
+			timestamp: Time.Timestamp.now(),
+		});
+		armed = true;
+
+		expect(await pending).toMatchObject({ kind: "gap" });
+		expect(await within(consumer.next())).toMatchObject({ kind: "frame", group: 1, frame: { timestamp: 10_000 } });
+	} finally {
+		consumer.close();
+		track.close();
+		warn.mockRestore();
+	}
+});

@@ -267,15 +267,21 @@ export class Consumer {
 	// next()'s alone: it reads the transport's state as it stands, so nothing here settles a group
 	// behind its back.
 	async #watch(group: Group) {
-		while (!this.#stopped(group)) {
-			await group.consumer.readable();
-			if (this.#stopped(group)) return;
-			this.#look();
+		try {
+			while (!this.#stopped(group)) {
+				await group.consumer.readable();
+				if (this.#stopped(group)) return;
+				this.#look();
+				this.#notify?.();
+				this.#notify = undefined;
+				if (group.fault || group.consumer.done) return;
+				// A frame left unread behind a full max buffer waits for room or for the group to lead.
+				if (!this.#admits(group)) await this.#park();
+			}
+		} finally {
+			// However the watch ends, the reader looks at the group again: it may have ended or failed.
 			this.#notify?.();
 			this.#notify = undefined;
-			if (group.fault || group.consumer.done) return;
-			// A frame left unread behind a full max buffer waits for room or for the group to lead.
-			if (!this.#admits(group)) await this.#park();
 		}
 	}
 
@@ -290,7 +296,14 @@ export class Consumer {
 			let ahead = false;
 			for (const group of this.#groups) {
 				while (!group.fault && this.#admits(group)) {
-					const wire = group.consumer.tryReadFrame();
+					let wire: Moq.Group.Frame | undefined;
+					try {
+						wire = group.consumer.tryReadFrame();
+					} catch {
+						// The transport failed the group, such as on a slice that would not inflate. It now
+						// reads as ended with that error, which next() takes as a cut tail.
+						break;
+					}
 					if (!wire) break;
 					this.#decode(group, wire);
 					decoded = true;
