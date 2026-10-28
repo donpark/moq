@@ -58,6 +58,23 @@ class PerGroupDecodeTimes(unittest.TestCase):
         lost = self.PTS[:10] + self.PTS[11:]
         self.assertEqual(len(holes.holes(sorted(lost), holes.step(sorted(self.PTS)))), 1)
 
+    def grade(self, kept: list[int]) -> int:
+        def stream(index):
+            dts, pts = [self.DTS[i] for i in index], [self.PTS[i] for i in index]
+            return holes.Stream(
+                {"codec_name": "h264", "time_base": "1/90000"}, dts, pts, [True] * len(pts),
+                tuple(Fraction(t, 90_000) for t in (min(pts), max(pts), dts[-1])),
+            )
+        with patch.object(holes, "probe", side_effect=[{"0x101": stream(kept)}, {"0x101": stream(range(50))}]), \
+                patch.object(sys, "argv", ["holes.py", "capture.ts", "source.ts"]), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exit:
+            holes.main()
+        return exit.exception.code
+
+    def test_main_grades_presentation_timestamps(self):
+        self.assertEqual(self.grade(range(50)), 0)
+        self.assertEqual(self.grade([i for i in range(50) if i != 10]), 1)
+
 
 class Shed(unittest.TestCase):
     # Four groups of 25 frames, each opening on a sync frame, with each P picture decoded ahead
