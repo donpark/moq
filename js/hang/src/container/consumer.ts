@@ -251,7 +251,8 @@ export class Consumer {
 				// backlog comes in sequence order, not arrival order, so an arrival can lower those below it.
 				const next = this.#groups.at(index);
 				if (next && next.late < group.late) group.late = next.late;
-				for (let i = index - 1; i >= 0 && this.#groups[i].late > group.late; i--) this.#groups[i].late = group.late;
+				for (let i = index - 1; i >= 0 && this.#groups[i].late > group.late; i--)
+					this.#groups[i].late = group.late;
 				this.#groups.splice(index, 0, group);
 				// Group overhead alone can fill the max buffer, past which next() moves on from a stalled head.
 				if (this.#full()) {
