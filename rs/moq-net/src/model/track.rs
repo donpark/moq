@@ -5602,6 +5602,10 @@ enum Inner {
 /// [`Subscriber::poll_peek_group`]. It holds the group and the step that moves past it,
 /// so taking it never asks the cursor again: a route or bound that moved meanwhile cannot
 /// lose it.
+#[allow(
+	clippy::large_enum_variant,
+	reason = "a plain read, the hot path, passes its group on the stack instead of allocating"
+)]
 pub(super) enum Reserved {
 	Plain(Peeked),
 	Resume(Box<super::resume::Candidate>),
