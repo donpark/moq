@@ -24,6 +24,7 @@ pub struct Client {
 	extensions: setup::Extensions,
 	auth: Option<crate::auth::Handle>,
 	allocator: Option<crate::bandwidth::Allocator>,
+	viewers: Option<crate::bandwidth::Viewers>,
 	implementation: Option<String>,
 }
 
@@ -86,6 +87,22 @@ impl Client {
 	/// The registry the next session probes for.
 	fn allocator(&self) -> crate::bandwidth::Allocator {
 		self.allocator.clone().unwrap_or_default()
+	}
+
+	/// Share `viewers` with every session this client dials.
+	///
+	/// Each session sends what they add up to as its PROBE target, and its
+	/// [`Session::viewers`](crate::Session::viewers) watches into the same registry, so
+	/// a viewer taken on one session still counts after a reconnect. Without one, each
+	/// session starts an empty registry of its own.
+	pub fn with_viewers(mut self, viewers: crate::bandwidth::Viewers) -> Self {
+		self.viewers = Some(viewers);
+		self
+	}
+
+	/// The registry the next session sends the target of.
+	fn viewers(&self) -> crate::bandwidth::Viewers {
+		self.viewers.clone().unwrap_or_default()
 	}
 
 	/// Restrict which protocol versions to offer, in preference order.
@@ -316,11 +333,14 @@ impl Client {
 			lite::Setup::default()
 		};
 
+		// One registry, which the subscriber sends and the session hands out.
+		let viewers = self.viewers();
 		let start = lite::start(lite::Config {
 			runtime: runtime.clone(),
 			stats: self.stats.clone(),
 			client: true,
 			limits: self.limits,
+			viewers: viewers.clone(),
 			session: session.clone(),
 			setup_stream: None,
 			publish,
@@ -344,7 +364,9 @@ impl Client {
 				auth: start.auth,
 				credential: start.credential,
 				estimate: Some(start.estimate),
+				peer_target: Some(start.peer_target),
 				bandwidth: self.allocator(),
+				viewers,
 				peer_implementation: start.peer_implementation,
 			},
 		))
@@ -418,7 +440,9 @@ impl Client {
 						auth,
 						credential,
 						estimate: None,
+						peer_target: None,
 						bandwidth: self.allocator(),
+						viewers: self.viewers(),
 						peer_implementation,
 					},
 				));
@@ -481,11 +505,14 @@ impl Client {
 		}
 
 		let stream = stream.with_version(v);
+		// One registry, which the subscriber sends and the session hands out.
+		let viewers = self.viewers();
 		let start = lite::start(lite::Config {
 			runtime: runtime.clone(),
 			stats: self.stats.clone(),
 			client: true,
 			limits: self.limits,
+			viewers: viewers.clone(),
 			session: session.clone(),
 			setup_stream: Some(stream),
 			publish: publish.clone(),
@@ -511,7 +538,9 @@ impl Client {
 				auth: start.auth,
 				credential: start.credential,
 				estimate: Some(start.estimate),
+				peer_target: Some(start.peer_target),
 				bandwidth: self.allocator(),
+				viewers,
 				peer_implementation: start.peer_implementation,
 			},
 		))

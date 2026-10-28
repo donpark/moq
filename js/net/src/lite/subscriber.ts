@@ -1792,7 +1792,7 @@ export class Subscriber {
 		return setup.probe;
 	}
 
-	async runProbe(signal?: AbortSignal): Promise<void> {
+	async runProbe(signal?: AbortSignal, target?: Getter<number>): Promise<void> {
 		if (!this.#probe) return;
 		if (this.version === Version.DRAFT_01 || this.version === Version.DRAFT_02) return;
 		const scope = new Effect();
@@ -1805,9 +1805,12 @@ export class Subscriber {
 		// input ends the session. Drop the estimates so consumers know they're stale.
 		try {
 			// Lite-05+ gates PROBE on the peer advertising Probe >= Report in its SETUP.
+			// Only a peer that probes up to a target is sent one; a Report-level peer ignores it.
+			let increase = false;
 			if (hasSetupStream(this.version) && this.#peerSetup) {
 				const level = await this.#peerProbeLevel(this.#peerSetup, scope);
 				if (level === undefined || level < ProbeLevel.Report) return;
+				increase = level >= ProbeLevel.Increase;
 			}
 			if (this.#goingAway() || abort.aborted) return;
 			const opening = Stream.open(this.#quic, { version: this.version });
@@ -1819,6 +1822,7 @@ export class Subscriber {
 			}
 			scope.cleanup(() => stream.close());
 			await scope.race(stream.writer.u53(StreamId.Probe));
+			if (target && increase) this.#sendTarget(stream, target, scope);
 			for (;;) {
 				const probe = await scope.race(Probe.decodeMaybe(stream.reader, this.version));
 				if (!probe) break;
@@ -1841,6 +1845,27 @@ export class Subscriber {
 			abort.removeEventListener("abort", stop);
 			this.#probe.set({});
 		}
+	}
+
+	// Send `target` on the PROBE stream whenever it changes, in order, while `scope` lives.
+	// Nothing is sent while it is zero, until it retracts a target already sent.
+	#sendTarget(stream: Stream, target: Getter<number>, scope: Effect): void {
+		let sent = 0;
+		let writing: Promise<void> = Promise.resolve();
+		scope.run((effect) => {
+			effect.get(target);
+			writing = writing
+				.then(async () => {
+					// The wire carries whole bits per second.
+					const next = Math.floor(target.peek());
+					if (next === sent) return;
+					sent = next;
+					// Zero reads as unknown on the wire, which retracts the last target.
+					await new Probe({ bitrate: next > 0 ? next : undefined }).encode(stream.writer, this.version);
+				})
+				// A failed write surfaces through the stream's reader, which ends the probe.
+				.catch(() => {});
+		});
 	}
 
 	/**

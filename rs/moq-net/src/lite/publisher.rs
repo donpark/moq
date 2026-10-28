@@ -90,6 +90,8 @@ struct Shared {
 	// untimed (see `wire_timestamp`).
 	runtime: crate::time::Deadlines,
 	estimate: kio::ProducerWeak<crate::session::Estimate>,
+	/// The peer's latest PROBE target, which the session's sender probes up to.
+	peer_target: kio::Producer<crate::bandwidth::Rate>,
 }
 
 /// Largest millisecond duration every implementation can carry losslessly.
@@ -128,6 +130,16 @@ fn cursor_floor(version: Version, start_group: Option<u64>, latest: Option<u64>)
 }
 
 impl Shared {
+	/// Record the peer's PROBE target, which only a session with a sender acts on.
+	fn set_peer_target(&self, target: crate::bandwidth::Rate) {
+		// An error means nothing follows the target, which is then moot.
+		if let Ok(mut current) = self.peer_target.write()
+			&& *current != target
+		{
+			*current = target;
+		}
+	}
+
 	/// Watches whether the session still lets us serve `broadcast` to the peer: our
 	/// grant, and the ceiling on what the peer may subscribe to.
 	fn gate(&self, broadcast: &crate::Path) -> crate::auth::Gate {
@@ -212,6 +224,7 @@ impl Publisher {
 				lister: crate::broadcast::Owner::new(),
 				runtime: config.runtime.clone(),
 				estimate: config.estimate,
+				peer_target: kio::Producer::new(crate::bandwidth::Rate::ZERO),
 			}),
 			runtime: config.runtime,
 			accept,
@@ -221,6 +234,11 @@ impl Publisher {
 }
 
 impl Publisher {
+	/// The peer's latest PROBE target, or zero while it asks for none.
+	pub fn peer_target(&self) -> kio::Consumer<crate::bandwidth::Rate> {
+		self.shared.peer_target.consume()
+	}
+
 	pub fn poll(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
 		if let Some(enforce) = &mut self.enforce
 			&& let Poll::Ready(res) = enforce.poll(&self.shared, waiter)
@@ -721,7 +739,10 @@ impl ProbeServe {
 	}
 
 	fn poll(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
-		match ready!(self.poll_probe(waiter)) {
+		let res = ready!(self.poll_probe(waiter));
+		// The stream carried the target, so it lapses with it.
+		self.shared.set_peer_target(crate::bandwidth::Rate::ZERO);
+		match res {
 			Ok(()) => tracing::debug!("probe stream closed"),
 			Err(err) => {
 				tracing::warn!(%err, "probe stream error");
@@ -740,11 +761,18 @@ impl ProbeServe {
 			// Deliver the previous estimate before weighing the next one.
 			ready!(stream.writer.poll_flush(&mut cx))?;
 
-			// Report ignores target values, but consumes them so buffered bytes
-			// cannot hide the peer's FIN or a malformed complete message.
+			// The peer's target, recorded for the session's sender. Without one the
+			// session ignores it, as a Report-level publisher must, but it is still
+			// consumed so buffered bytes cannot hide the peer's FIN or a malformed
+			// complete message.
 			loop {
 				match stream.reader.poll_decode_maybe::<lite::Probe>(&mut cx) {
-					Poll::Ready(Ok(Some(_))) => ready!(self.budget.poll_yield(waiter)),
+					Poll::Ready(Ok(Some(probe))) => {
+						let target = probe.bitrate.map(crate::bandwidth::Rate::from_bps);
+						self.shared
+							.set_peer_target(target.unwrap_or(crate::bandwidth::Rate::ZERO));
+						ready!(self.budget.poll_yield(waiter))
+					}
 					Poll::Ready(Ok(None)) => return Poll::Ready(Ok(())),
 					Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
 					Poll::Pending => break,
