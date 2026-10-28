@@ -8427,7 +8427,10 @@ mod tests {
 				..running_update()
 			};
 			update
-				.encode(&mut crate::coding::Encoder::new(&mut bytes, Version::Lite07.into()), Version::Lite07)
+				.encode(
+					&mut crate::coding::Encoder::new(&mut bytes, Version::Lite07.into()),
+					Version::Lite07,
+				)
 				.unwrap();
 		}
 		session.push(&bytes);
@@ -8481,7 +8484,11 @@ mod tests {
 		};
 		session.push(&update.encode_bytes(Version::Lite07).unwrap());
 		assert!(!drive(&mut serve).await, "the subscription ended");
-		assert_eq!(wakes.0.load(Ordering::Relaxed), 1, "a new priority did not reach the groups");
+		assert_eq!(
+			wakes.0.load(Ordering::Relaxed),
+			1,
+			"a new priority did not reach the groups"
+		);
 	}
 
 	/// A cold relay fills a bounded request from the group's head, so its cache does not
