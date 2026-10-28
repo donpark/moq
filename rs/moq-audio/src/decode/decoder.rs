@@ -125,6 +125,28 @@ impl Decoder {
 		}
 		Ok(decoded)
 	}
+
+	/// Recover one lost packet: the in-band forward error copy of the previous
+	/// frame `next` carries when it has one, concealment when it does not (and
+	/// when `next` is `None`). Recovery advances the decoder as if the lost
+	/// frame had decoded, so the arriving packet continues the stream instead of
+	/// starting over.
+	pub fn recover(&mut self, next: Option<&[u8]>) -> Result<Decoded, Error> {
+		let mut decoded = self.backend.recover(next)?;
+		let channels = self.backend.layout().channels() as usize;
+		let trim = self.delay_remaining.min(decoded.samples.len() / channels);
+		if trim > 0 {
+			decoded.samples.drain(..trim * channels);
+			self.delay_remaining -= trim;
+		}
+		Ok(decoded)
+	}
+
+	/// Native-rate frames one lost packet conceals, or `None` when this
+	/// decoder cannot conceal one.
+	pub fn conceal_len(&self) -> Option<usize> {
+		self.backend.conceal_len()
+	}
 }
 
 #[cfg(test)]

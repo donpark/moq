@@ -138,6 +138,13 @@ pub struct Settings {
 	pub bitrate: Option<moq_net::bandwidth::Rate>,
 	/// Enable Opus discontinuous transmission during silence.
 	pub dtx: bool,
+	/// Enable Opus in-band forward error correction: each packet carries a copy
+	/// of the previous one, so a receiver can recover a single lost packet
+	/// instead of concealing it. Opus only when the codec is [`Codec::Opus`].
+	///
+	/// This is the knob upstream removed as "ineffective"; it works when the
+	/// encoder also gets an expected loss rate (see the libopus backend).
+	pub fec: bool,
 	/// Encoded frame duration. Opus accepts 2.5 / 5 / 10 / 20 / 40 / 60 ms.
 	/// PCM accepts any duration containing a whole number of samples. AAC frames
 	/// are 1024 samples, so it accepts the duration that rounds to that at
@@ -157,6 +164,7 @@ impl Settings {
 			layout,
 			bitrate: None,
 			dtx: false,
+			fec: false,
 			frame_duration: Duration::from_millis(20),
 			kind: Kind::Auto,
 		}

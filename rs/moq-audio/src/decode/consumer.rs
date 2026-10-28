@@ -1,6 +1,7 @@
 //! Subscribe to an encoded audio track and emit raw PCM.
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -8,6 +9,9 @@ use super::decoder::{Config, Decoder};
 use crate::resample::{Remix, Resampler};
 use crate::{Activity, Error, Format, Frame, Layout};
 
+/// The largest [`Options::conceal`] a consumer accepts. Concealment covers
+/// loss bursts, not skips: a hole longer than this stays visible.
+const MAX_CONCEAL: Duration = Duration::from_secs(1);
 /// Where a consumer starts on a track that already holds groups.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -43,6 +47,15 @@ pub struct Options {
 	pub max_age: std::time::Duration,
 	/// Initial cached-group policy.
 	pub start: Start,
+	/// How much of a hole to fill with recovered audio before leaving it a hole.
+	///
+	/// Zero (the default) leaves every hole in the output, as
+	/// [`read`](Consumer::read) documents. Up to this much of an undeclared hole
+	/// is recovered instead: the lost frames conceal, and the one before the
+	/// arriving packet comes back from its in-band forward error copy when the
+	/// sender coded one. Longer holes stay holes, since hiding a skipped group
+	/// is worse than showing it. Refused above [`MAX_CONCEAL`].
+	pub conceal: Duration,
 }
 
 impl Options {
@@ -159,6 +172,14 @@ impl Consumer {
 		}
 		let track = subscriber;
 		let max_age = options.max_age.min(track.info().max_age);
+		// A conceal bound is developer policy, but the work and memory it
+		// permits are sized by a peer-controlled hole, so refuse absurd ones.
+		if options.conceal > MAX_CONCEAL {
+			return Err(Error::Unsupported(format!(
+				"conceal {:?} exceeds {MAX_CONCEAL:?}: it covers loss bursts, not skips",
+				options.conceal
+			)));
+		}
 		// The catalog says how the track is framed, and it is not always the legacy
 		// wire: `moq import fmp4` publishes CMAF. Reading a moof+mdat fragment as a
 		// varint timestamp plus a payload decodes to garbage rather than failing.
@@ -225,6 +246,9 @@ impl Consumer {
 	/// side stay anchored to their own packet timeline, so the hole is there to
 	/// see. "Doesn't continue" allows for the quantization the stamps carry, which
 	/// on a millisecond-stamped ingest is most of a millisecond.
+	/// With [`Options::conceal`] set, a hole the codec can cover is filled
+	/// instead and the timeline stays continuous; what it cannot cover remains
+	/// a hole.
 	pub async fn read(&mut self) -> Result<Option<Frame>, Error> {
 		loop {
 			if let Some(frame) = self.ready.pop_front() {
@@ -253,12 +277,35 @@ impl Consumer {
 			// phase reconstructs each batch's time from the marker rather than
 			// reading it off the packet, so there is nothing left to compare.
 			if self.end.is_none()
-				&& self
-					.next_start
-					.is_some_and(|next| discontinuous(next, mux_frame.timestamp))
-				&& let Some(frame) = self.gap()?
+				&& let Some(next) = self.next_start
+				&& discontinuous(next, mux_frame.timestamp)
 			{
-				self.ready.push_back(frame);
+				// What the resampler held from before the hole belongs before
+				// anything recovered over it, and recovery reads the prediction
+				// history a reset clears: drain first, then recover.
+				let tail = self.drain_tail()?;
+				let (recovered, covered) = self.recover(next, mux_frame.timestamp, &mux_frame.payload)?;
+				// A full recovery is not a gap: the decoder keeps the
+				// prediction the recovery built and the timeline continues
+				// where it would have. Covered zero (nothing recovered:
+				// overlap, too long, no concealment) leaves the hole to see.
+				let full = covered > 0
+					&& covered >= frames_between(next, mux_frame.timestamp, self.decoder.sample_rate())?;
+				let reset = if !full {
+					// What the codec could not fill is a discontinuity after
+					// all: prediction and timeline start over before the next
+					// packet.
+					self.gap()?
+				} else {
+					None
+				};
+				if let Some(frame) = tail {
+					self.ready.push_back(frame);
+				}
+				self.ready.extend(recovered);
+				if let Some(frame) = reset {
+					self.ready.push_back(frame);
+				}
 			}
 
 			let rate = self.decoder.sample_rate();
@@ -400,6 +447,101 @@ impl Consumer {
 		Ok(frame)
 	}
 
+	/// What the resampler was still holding from before a hole.
+	///
+	/// Those samples arrived before the hole and belong before it, so they come
+	/// out as their own frame rather than being filtered together with the audio
+	/// on the far side.
+	fn drain_tail(&mut self) -> Result<Option<Frame>, Error> {
+		let Some(resampler) = self.resampler.as_mut() else {
+			return Ok(None);
+		};
+		let held = resampler.held_at();
+		let skipped = resampler.skipped();
+		let pcm = resampler.drain()?;
+		self.tail(pcm, held, skipped)
+	}
+
+	/// Fill a hole with what the codec can produce: the lost frames conceal
+	/// except the one before the arriving packet, which comes back from that
+	/// packet's in-band forward error copy when the sender coded one.
+	///
+	/// Covers at most [`Options::conceal`], and only where the decoder can
+	/// conceal at all. Frames are stamped on the decoded timeline the frames
+	/// before the hole use, so a fully covered hole meets them exactly; the
+	/// covered count lets the caller tell a full recovery (which is not a gap)
+	/// from a partial one.
+	fn recover(
+		&mut self,
+		start: moq_net::Timestamp,
+		end: moq_net::Timestamp,
+		next_packet: &[u8],
+	) -> Result<(Vec<Frame>, usize), Error> {
+		let mut frames = Vec::new();
+		if end <= start
+			|| self.options.conceal.is_zero()
+			|| Duration::from(end.checked_sub(start)?) > self.options.conceal
+		{
+			return Ok((frames, 0));
+		}
+		let Some(conceal_len) = self.decoder.conceal_len() else {
+			return Ok((frames, 0));
+		};
+		let rate = self.decoder.sample_rate();
+		let channels = self.decoder.layout().channels() as usize;
+		let hole = frames_between(start, end, rate)?;
+		// The frames before the hole sit on the delay-shifted output timeline,
+		// so recovery starts there too and a full hole meets them exactly.
+		let base = rewind(start, self.delay_trimmed, rate)?.max(self.epoch.unwrap_or(start));
+		let mut covered = 0usize;
+		while covered < hole {
+			let remaining = hole - covered;
+			let decoded = self.decoder.recover((remaining <= conceal_len).then_some(next_packet))?;
+			let activity = decoded.activity;
+			let mut samples = decoded.samples;
+			let mut length = samples.len() / channels;
+			if length == 0 {
+				break;
+			}
+			// The last recovered frame stops where the hole does, so the audio
+			// meets the arriving packet exactly.
+			if length > remaining {
+				length = remaining;
+				samples.truncate(length * channels);
+			}
+			let decoded_at = advance(base, covered, rate)?;
+			let (pcm, timestamp) = match self.resampler.as_mut() {
+				Some(r) => {
+					let held = if r.pending_frames() == 0 {
+						decoded_at
+					} else {
+						r.held_at().unwrap_or(decoded_at)
+					};
+					let skipped = r.skipped();
+					let pcm = r.process(&samples, decoded_at)?;
+					(pcm, rewind(held, skipped, self.resolved_sample_rate)?)
+				}
+				None => (samples, decoded_at),
+			};
+			let resampled = self.resampler.is_some();
+			if resampled {
+				self.spans.push_back(ActivitySpan {
+					end: advance(decoded_at, length, rate)?,
+					activity,
+				});
+			}
+			if !pcm.is_empty() {
+				let activity = if resampled {
+					self.activity_at(timestamp)
+				} else {
+					activity
+				};
+				frames.push(self.frame(pcm, timestamp, activity)?);
+			}
+			covered += length;
+		}
+		Ok((frames, covered))
+	}
 	/// The tail the resampler is still holding when the track ends, once.
 	///
 	/// Without it the last partial chunk is dropped, which is up to a chunk of

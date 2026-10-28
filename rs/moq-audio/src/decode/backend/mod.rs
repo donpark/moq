@@ -30,6 +30,20 @@ pub(crate) trait Backend: Send + std::panic::UnwindSafe + std::panic::RefUnwindS
 	/// and [`layout`](Self::layout), untrimmed.
 	fn decode(&mut self, packet: &[u8]) -> Result<Decoded, Error>;
 
+	/// Recover one lost packet: the in-band forward error copy of the previous
+	/// frame `next` carries when it has one, concealment when it does not (and
+	/// when `next` is `None`). The recovered length is the last packet's, the
+	/// same assumption [`decode`](Self::decode)'s concealment path makes.
+	fn recover(&mut self, _next: Option<&[u8]>) -> Result<Decoded, Error> {
+		Err(Error::Unsupported("this backend cannot recover lost packets".into()))
+	}
+
+	/// Native-rate frames one lost packet conceals, or `None` when this backend
+	/// cannot conceal one.
+	fn conceal_len(&self) -> Option<usize> {
+		None
+	}
+
 	/// Drop codec history after a discontinuity, so the next packet does not
 	/// predict from audio that is no longer adjacent.
 	fn reset(&mut self) -> Result<(), Error>;
