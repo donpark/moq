@@ -530,8 +530,8 @@ impl<V: Serialize> TrackPair<V> {
 		}
 	}
 
-	/// Whether any consumer exists on either flavor.
-	fn is_used(&self) -> bool {
+	/// Whether anyone wants either flavor.
+	fn is_wanted(&self) -> bool {
 		self.plain.demand().wanted().is_some() || self.compressed.demand().wanted().is_some()
 	}
 
@@ -1176,14 +1176,14 @@ impl NodePublisher {
 		// Reclaim before adopting, so a request for a track just reclaimed is
 		// served again by this very drain.
 		self.presence.retain(|_, track| {
-			if track.pair.is_used() {
+			if track.pair.is_wanted() {
 				return true;
 			}
 			track.pair.finish();
 			false
 		});
 		self.prefixes.retain(|_, track| {
-			if track.pair.is_used() {
+			if track.pair.is_wanted() {
 				return true;
 			}
 			track.pair.finish();

@@ -1472,7 +1472,7 @@ mod tests {
 		rung.info().await.unwrap();
 
 		let fetching = rung.fetch_group(7, None);
-		let abandoned = tokio::time::timeout(std::time::Duration::from_secs(5), source_fetches.requested_fill())
+		let mut abandoned = tokio::time::timeout(std::time::Duration::from_secs(5), source_fetches.requested_fill())
 			.await
 			.expect("the fetch never reached the source")
 			.expect("the source track closed");
@@ -1481,7 +1481,9 @@ mod tests {
 		// Leave before a single source frame exists. Encoding can only happen
 		// if the handler keeps this fetch.
 		drop(fetching);
-		tokio::time::timeout(std::time::Duration::from_secs(5), abandoned.unused())
+		tokio::time::timeout(std::time::Duration::from_secs(5), async {
+			while abandoned.wanted_changed().await.is_some() {}
+		})
 			.await
 			.expect("the abandoned fetch kept its source fetch");
 

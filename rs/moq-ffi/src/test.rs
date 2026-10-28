@@ -2599,7 +2599,7 @@ async fn dynamic_track_serves_fetch_miss_and_priority() {
 }
 
 #[tokio::test]
-async fn fill_goes_unused_when_the_fetcher_leaves() {
+async fn fill_goes_unwanted_when_the_fetcher_leaves() {
 	let broadcast = MoqBroadcastProducer::new().unwrap();
 	let track = broadcast.publish_track("events".into(), None).unwrap();
 	let dynamic = track.requests().unwrap();
@@ -2610,19 +2610,20 @@ async fn fill_goes_unused_when_the_fetcher_leaves() {
 		.await
 		.expect("timed out waiting for fill")
 		.unwrap();
-	assert!(fill.is_used());
+	assert_eq!(fill.wanted_changed().await.unwrap(), Some(5));
 	assert!(fill.is_wanted(5));
 	assert!(!fill.is_wanted(6), "outside the fill");
 
 	fetch.abort();
-	tokio::time::timeout(TIMEOUT, fill.unused())
+	let wanted = tokio::time::timeout(TIMEOUT, fill.wanted_changed())
 		.await
-		.expect("timed out waiting for the abandoned fetch to become unused")
+		.expect("timed out waiting for the abandoned fetch to become unwanted")
 		.unwrap();
-	assert!(!fill.is_used());
+	assert_eq!(wanted, None);
+	assert_eq!(fill.wanted(), None);
 	tokio::time::timeout(TIMEOUT, fill.unwanted(5))
 		.await
-		.expect("an unused fill wants none of its groups")
+		.expect("an unwanted fill wants none of its groups")
 		.unwrap();
 	assert!(!fill.is_wanted(5));
 }
@@ -2640,7 +2641,7 @@ async fn dynamic_track_rejects_fetch_miss() {
 		.expect("timed out waiting for fill")
 		.unwrap();
 	fill.drop_groups(5, 6);
-	assert_eq!(fill.next(), None, "the dropped group is answered");
+	assert_eq!(fill.wanted(), None, "the dropped group is answered");
 
 	let result = tokio::time::timeout(TIMEOUT, fetch)
 		.await
