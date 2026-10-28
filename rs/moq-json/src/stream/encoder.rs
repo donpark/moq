@@ -90,6 +90,10 @@ pub struct Encoder<T> {
 	frames: usize,
 	bytes: u64,
 
+	/// The most bytes a group may hold. A field rather than the constant so a test can shrink it
+	/// to a size it can reach.
+	pub(super) max_group_bytes: u64,
+
 	_marker: PhantomData<fn(T)>,
 }
 
@@ -102,6 +106,7 @@ impl<T> Encoder<T> {
 			desynced: false,
 			frames: 0,
 			bytes: 0,
+			max_group_bytes: moq_net::group::MAX_CACHE_BYTES,
 			_marker: PhantomData,
 		}
 	}
@@ -153,9 +158,7 @@ impl<T: Serialize> Encoder<T> {
 		} else {
 			size
 		};
-		if self.frames >= moq_net::group::MAX_GROUP_FRAMES
-			|| self.bytes.saturating_add(bound) > moq_net::group::MAX_CACHE_BYTES
-		{
+		if self.frames >= moq_net::group::MAX_GROUP_FRAMES || self.bytes.saturating_add(bound) > self.max_group_bytes {
 			return Err(moq_net::Error::GroupTooLarge.into());
 		}
 

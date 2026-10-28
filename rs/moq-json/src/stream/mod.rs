@@ -433,15 +433,19 @@ mod test {
 		matches!(result, Err(crate::Error::Net(moq_net::Error::GroupTooLarge)))
 	}
 
+	/// A group budget small enough to fill cheaply, standing in for moq-net's 32 MiB cache.
+	const BUDGET: u64 = 32 * 1024;
+
 	/// A record past the group budget is refused before anything is written, so the log carries on:
 	/// the next record lands and decodes, which with compression proves the window never moved.
 	#[test]
 	fn an_oversized_record_is_refused_and_the_log_continues() {
 		for compression in [false, true] {
 			let (mut producer, track) = producer(config(compression));
+			producer.set_max_group_bytes(BUDGET);
 			producer.append(&json!({ "n": 0 })).unwrap();
 
-			let oversized = Value::String("x".repeat(moq_net::group::MAX_CACHE_BYTES as usize));
+			let oversized = Value::String("x".repeat(BUDGET as usize));
 			assert!(refused(producer.append(&oversized)), "compression={compression}");
 
 			producer.append(&json!({ "n": 1 })).unwrap();
@@ -460,7 +464,8 @@ mod test {
 	#[test]
 	fn a_compressed_log_is_charged_its_inflated_size() {
 		let (mut producer, track) = producer(compressed());
-		let half = Value::String("x".repeat(moq_net::group::MAX_CACHE_BYTES as usize / 2));
+		producer.set_max_group_bytes(BUDGET);
+		let half = Value::String("x".repeat(BUDGET as usize / 2));
 		producer.append(&half).unwrap();
 		assert!(refused(producer.append(&half)));
 		producer.finish().unwrap();

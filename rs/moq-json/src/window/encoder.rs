@@ -176,6 +176,10 @@ pub struct Encoder<T> {
 	/// Frames emitted into the current group, header included.
 	group_frames: usize,
 
+	/// The most bytes a group may hold, the cap both a header and the ops after it meet. A field
+	/// rather than the constant so a test can shrink it to a size it can reach.
+	max_group_bytes: u64,
+
 	/// Whether the next frame must be a header because a frame was lost. Kept separate from the
 	/// window, which a resync must never discard.
 	resync: bool,
@@ -198,6 +202,7 @@ impl<T> Encoder<T> {
 			flate: None,
 			group_bytes: 0,
 			group_frames: 0,
+			max_group_bytes: moq_net::group::MAX_CACHE_BYTES,
 			resync: true,
 			_marker: PhantomData,
 		}
@@ -285,7 +290,7 @@ impl<T> Encoder<T> {
 		};
 		self.group_frames += 1;
 		self.group_bytes = self.group_bytes.saturating_add(plain.max(payload.len() as u64));
-		if self.group_bytes > moq_net::group::MAX_CACHE_BYTES {
+		if self.group_bytes > self.max_group_bytes {
 			self.reset();
 			return Ok(None);
 		}
@@ -322,7 +327,7 @@ impl<T> Encoder<T> {
 	fn emit_header(&mut self, bytes: Vec<u8>) -> Result<Encoded> {
 		// A reader inflates the header whole, so its plaintext meets the group budget too.
 		let plain = bytes.len() as u64;
-		if plain > moq_net::group::MAX_CACHE_BYTES {
+		if plain > self.max_group_bytes {
 			return Err(Error::Json("window header exceeds the group cache limit".into()));
 		}
 
@@ -335,7 +340,7 @@ impl<T> Encoder<T> {
 			}
 			false => (Bytes::from(bytes), None),
 		};
-		if payload.len() as u64 > moq_net::group::MAX_CACHE_BYTES {
+		if payload.len() as u64 > self.max_group_bytes {
 			return Err(Error::Json("window header exceeds the group cache limit".into()));
 		}
 
@@ -457,11 +462,15 @@ impl<T: Serialize> Encoder<T> {
 mod test {
 	use super::*;
 
+	/// A group budget small enough to fill cheaply, standing in for moq-net's 32 MiB cache.
+	const BUDGET: u64 = 32 * 1024;
+
 	#[test]
 	fn an_op_that_would_evict_the_header_rolls_first() {
 		let mut encoder = Encoder::<String>::new(ProducerConfig::default().with_ops(true));
-		let first = "a".repeat(16 * 1024 * 1024);
-		let next = "b".repeat(15 * 1024 * 1024);
+		encoder.max_group_bytes = BUDGET;
+		let first = "a".repeat(16 * 1024);
+		let next = "b".repeat(15 * 1024);
 
 		let frame = encoder.push(&first).unwrap();
 		assert!(frame.keyframe);
@@ -477,7 +486,7 @@ mod test {
 
 		let frame = encoder.push(&next).unwrap();
 		assert!(frame.keyframe);
-		assert!(frame.payload.len() < moq_net::group::MAX_CACHE_BYTES as usize);
+		assert!(frame.payload.len() < BUDGET as usize);
 		frame.commit();
 	}
 
@@ -507,7 +516,8 @@ mod test {
 				..Default::default()
 			};
 			let mut encoder = Encoder::<String>::new(config);
-			let record = "x".repeat(moq_net::group::MAX_CACHE_BYTES as usize);
+			encoder.max_group_bytes = BUDGET;
+			let record = "x".repeat(BUDGET as usize);
 
 			let err = encoder.push(&record).err().expect("oversized header should fail");
 			assert!(err.to_string().contains("group cache limit"));
