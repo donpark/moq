@@ -2320,7 +2320,11 @@ mod test {
 			late.write_frame(ts(0), b"first".as_ref()).unwrap();
 			late.write_frame(ts(1), b"continued".as_ref()).unwrap();
 			late.finish().unwrap();
-			assert_eq!(read(&mut patient_held), Some(b"continued".to_vec()), "short_first={short_first}");
+			assert_eq!(
+				read(&mut patient_held),
+				Some(b"continued".to_vec()),
+				"short_first={short_first}"
+			);
 		}
 	}
 
