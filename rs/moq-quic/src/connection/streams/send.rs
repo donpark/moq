@@ -416,7 +416,8 @@ impl<'a> Stream<'a> {
 	/// Give up the stream's ID: its [`end`](Self::end) is no longer kept
 	///
 	/// The stream itself carries on, so finish or reset it first. Every later call on the ID
-	/// fails with [`Error::Closed`].
+	/// fails with [`Error::Closed`]. Without it, the end of every finished or reset stream is
+	/// kept for the connection's life.
 	pub fn release(self) {
 		if self.state.ends.remove(&self.id).is_some() {
 			return;
