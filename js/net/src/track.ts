@@ -466,9 +466,9 @@ export class Consumer {
 	/**
 	 * Open a live subscription to the track.
 	 *
-	 * The cursor starts at the group the subscription named (its floor), or 0.
-	 * {@link Subscription.maxDelay} is what asks for data: delivery skips everything above
-	 * the floor that the budget convicts, so the default budget of zero delivers only the
+	 * It reads only the groups its {@link Subscription.ranges} cover.
+	 * {@link Subscription.maxDelay} is what asks for data: delivery skips everything in range
+	 * that the budget convicts, so the default budget of zero delivers only the
 	 * latest group and a larger one reaches back over what it can still use.
 	 */
 	subscribe(options?: Subscription): Subscriber {
@@ -991,9 +991,9 @@ export class Producer {
 	/**
 	 * An independent {@link Subscriber} reading this track's groups.
 	 *
-	 * Its cursor starts at the group the subscription named (its floor), or 0.
-	 * {@link Subscription.maxDelay} is what asks for data: delivery skips everything above
-	 * the floor that the budget convicts, so the default budget of zero delivers only the
+	 * It reads only the groups its {@link Subscription.ranges} cover.
+	 * {@link Subscription.maxDelay} is what asks for data: delivery skips everything in range
+	 * that the budget convicts, so the default budget of zero delivers only the
 	 * latest group and a larger one reaches back over what it can still use.
 	 */
 	subscribe(options: Subscription = {}): Subscriber {
@@ -2487,12 +2487,14 @@ export class Subscriber {
 	 * Rust `with_range`.
 	 *
 	 * Both bounds are assigned, in either direction: an omitted start is group 0 and an
-	 * omitted end removes the cap. Lowering the floor or raising the cap offers the groups it
-	 * newly covers that the track still caches and this reader never handed out; a group is
-	 * never handed out twice. A local filter, not a request: it leaves the wire subscription
-	 * alone. One exception: on a track served across route changes, lowering the floor asks the
-	 * serving route again for the groups it newly covers within the subscription's groups, since
-	 * the route that delivered them may be gone. {@link largest} reports within these bounds.
+	 * omitted end removes the cap. They narrow the subscription's ranges, never widen them.
+	 * Lowering the floor or raising the cap offers the groups it newly covers that the track
+	 * still caches and this reader never handed out; a group is never handed out twice. A local
+	 * filter, not a request: it leaves the wire subscription alone, so to change what is asked
+	 * for, replace {@link Subscription.ranges} with {@link update}. One exception: on a track
+	 * served across route changes, lowering the floor asks the serving route again for the groups
+	 * it newly covers within the subscription's ranges, since the route that delivered them may
+	 * be gone. {@link largest} reports within these bounds.
 	 */
 	withRange(groups: Groups): this {
 		const before = this.#cursor.peek();
@@ -3018,8 +3020,9 @@ export class Subscriber {
 
 	/**
 	 * Update this subscription's options (e.g. priority), triggering a SUBSCRIBE_UPDATE to the
-	 * publisher. Replaces this reader's group bounds without redelivering groups already
-	 * read; an arrival reader can receive unread cached groups below its previous floor.
+	 * publisher. Replacing the ranges resolves them again, without redelivering groups already
+	 * read; an arrival reader can receive the unread groups it still holds that the new ranges
+	 * take in.
 	 * Mirrors the Rust `Subscriber::update`.
 	 */
 	update(options: Subscription) {
