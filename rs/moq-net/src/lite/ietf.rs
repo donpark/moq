@@ -1175,12 +1175,7 @@ mod hop_tests {
 			let info = moq_clock::timeout(TIMEOUT, copy.info()).await.unwrap().unwrap();
 			assert_eq!(
 				(info.max_age, info.timescale, info.priority, info.refresh),
-				(
-					Some(Duration::from_secs(7)),
-					Some(Timescale::MILLI),
-					9,
-					Some(0)
-				),
+				(Some(Duration::from_secs(7)), Some(Timescale::MILLI), 9, Some(0)),
 				"{offer:?}"
 			);
 			match negotiated {

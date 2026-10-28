@@ -37,10 +37,7 @@ fn produce_origin(hop: u64) -> moq_net::origin::Producer {
 
 fn write_group(track: &moq_net::track::Producer, sequence: u64) {
 	// A timed track's group starts at its sequence in seconds, so none rewinds.
-	let timestamp = track
-		.info()
-		.timescale
-		.map(|_| millis(sequence * 1000));
+	let timestamp = track.info().timescale.map(|_| millis(sequence * 1000));
 	let mut group = track.create_group(moq_net::group::Info { sequence }).unwrap();
 	group.write_frame(timestamp, &b"x"[..]).unwrap();
 	group.finish().unwrap();

@@ -5022,7 +5022,11 @@ mod serve_group_test {
 
 		for version in [Version::Lite06, Version::Lite07] {
 			let stamp = Stamp::new(version, Some(crate::Timescale::MILLI)).unwrap();
-			assert_eq!(stamp.wire(Some(stamped), &runtime).unwrap(), stamped.value(), "{version}");
+			assert_eq!(
+				stamp.wire(Some(stamped), &runtime).unwrap(),
+				stamped.value(),
+				"{version}"
+			);
 		}
 		let stamp = Stamp::new(Version::Lite06, None).unwrap();
 		assert_eq!(stamp.wire(None, &runtime).unwrap(), sent);
