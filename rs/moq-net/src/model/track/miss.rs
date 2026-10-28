@@ -21,7 +21,7 @@ use std::{
 	time::Duration,
 };
 
-use rangemap::{RangeInclusiveSet, RangeSet};
+use rangemap::{RangeInclusiveSet, RangeMap, RangeSet};
 
 pub(super) use super::fill::Asking;
 use super::fill::{Ask, FillState, Join};
@@ -49,8 +49,13 @@ pub(super) struct Misses {
 	/// Asked under the feed's start and refused, never asked again: given up once the feed
 	/// gives up on them, unless they arrive first.
 	refused: RangeSet<u64>,
-	/// The fills this reader waits on.
-	joins: Vec<Join>,
+	/// The fills this reader waits on, under the keys `holders` names them by.
+	joins: BTreeMap<u64, Join>,
+	/// The join holding each sequence: a reader's joins hold disjoint groups, so a change
+	/// touches only the joins holding what it changes, never every fill the reader asked.
+	holders: RangeMap<u64, u64>,
+	/// The key the next join takes.
+	next_join: u64,
 	/// What the reader asked its fills with last.
 	asking: Option<Asking>,
 	/// The sequences of `joins` still unanswered.
@@ -209,27 +214,50 @@ impl Misses {
 				return Some(slot.serving().clone());
 			}
 			self.filled.remove(&sequence);
-			self.release(sequence);
+			self.release(&RangeSet::from_iter([sequence..sequence + 1]));
 			self.give_up(sequence..sequence + 1, given_up);
 		}
 	}
 
-	/// Take `sequence` as handed out, if a fill answered it.
+	/// Take `sequence` as handed out, if a fill answered it: the group's own reader keeps it
+	/// wanted, or nothing does.
 	pub fn take_filled(&mut self, sequence: u64) {
 		if self.filled.remove(&sequence) {
-			self.release(sequence);
+			self.release(&RangeSet::from_iter([sequence..sequence + 1]));
 		}
 	}
 
-	/// Stop holding a filled `sequence` in its fill: handed out, the group's own reader
-	/// keeps it wanted, or nothing does.
-	fn release(&mut self, sequence: u64) {
-		let mut lost = RangeSet::new();
-		lost.insert(sequence..sequence + 1);
-		self.joins.retain_mut(|join| {
-			join.release(&lost);
-			!join.is_empty()
-		});
+	/// Hold `joins` until each fill answers and the reader takes what it filled.
+	fn hold(&mut self, joins: Vec<Join>) {
+		for join in joins {
+			debug_assert!(
+				self.holders.overlapping(&join.groups).next().is_none(),
+				"a reader asks only for what no join holds"
+			);
+			let key = self.next_join;
+			self.next_join += 1;
+			self.holders.insert(join.groups.clone(), key);
+			self.joins.insert(key, join);
+		}
+	}
+
+	/// Stop holding `lost` in the joins holding any of it, so their fills no longer owe it
+	/// this reader, and drop each join left holding nothing.
+	fn release(&mut self, lost: &RangeSet<u64>) {
+		let keys: BTreeSet<u64> = lost
+			.iter()
+			.flat_map(|run| self.holders.overlapping(run).map(|(_, key)| *key))
+			.collect();
+		for run in lost.iter() {
+			self.holders.remove(run.clone());
+		}
+		for key in keys {
+			let join = self.joins.get_mut(&key).expect("a holder names a join");
+			join.release(lost);
+			if join.is_empty() {
+				self.joins.remove(&key);
+			}
+		}
 	}
 
 	/// Ask every fill this reader waits on with `asking` from now on, queued or taken.
@@ -238,7 +266,7 @@ impl Misses {
 			return;
 		}
 		self.asking = Some(*asking);
-		for join in &mut self.joins {
+		for join in self.joins.values_mut() {
 			join.update(asking);
 		}
 	}
@@ -263,11 +291,7 @@ impl Misses {
 			if lowest < from {
 				self.filled = self.filled.split_off(&from);
 				self.wanted.remove(0..from);
-				let below = RangeSet::from_iter([0..from]);
-				self.joins.retain_mut(|join| {
-					join.release(&below);
-					!join.is_empty()
-				});
+				self.release(&RangeSet::from_iter([0..from]));
 			}
 			return;
 		}
@@ -281,13 +305,14 @@ impl Misses {
 			}
 		}
 		self.wanted = kept;
-		self.joins.retain_mut(|join| {
-			// By the join's whole span, not just what is unanswered: a filled group not
-			// taken yet is held too.
-			let inside: RangeSet<u64> = clip(join.groups.clone(), from, admitted).into_iter().collect();
-			join.release(&inside.gaps(&join.groups).collect());
-			!join.is_empty()
-		});
+		// By everything held, not just what is unanswered: a filled group not taken yet is
+		// held too.
+		let mut lost = RangeSet::new();
+		for (held, _) in self.holders.iter() {
+			let inside: RangeSet<u64> = clip(held.clone(), from, admitted).into_iter().collect();
+			lost.extend(inside.gaps(held));
+		}
+		self.release(&lost);
 	}
 
 	/// Take in what the joined fills answered, parking `waiter` on the rest. Returns the
@@ -300,20 +325,30 @@ impl Misses {
 		waiter: &kio::Waiter,
 	) -> RangeSet<u64> {
 		let mut retry = RangeSet::new();
-		let mut i = 0;
-		while i < self.joins.len() {
-			let join = &self.joins[i];
-			let wanted: RangeSet<u64> = self
-				.wanted
-				.overlapping(&join.groups)
-				.map(|run| run.start.max(join.groups.start)..run.end.min(join.groups.end))
+		// Only the joins holding something unanswered: one holding only filled groups until
+		// they are taken has nothing to answer.
+		let keys: BTreeSet<u64> = self
+			.wanted
+			.iter()
+			.flat_map(|run| self.holders.overlapping(run).map(|(_, key)| *key))
+			.collect();
+		let mut keys = keys.into_iter().peekable();
+		while let Some(&key) = keys.peek() {
+			let Some(join) = self.joins.get(&key) else {
+				keys.next();
+				continue;
+			};
+			let wanted: RangeSet<u64> = join
+				.held()
+				.iter()
+				.flat_map(|held| {
+					self.wanted
+						.overlapping(held)
+						.map(move |run| run.start.max(held.start)..run.end.min(held.end))
+				})
 				.collect();
 			if wanted.is_empty() {
-				// Holding only filled groups until they are taken, it has nothing to answer.
-				match join.is_empty() {
-					true => drop(self.joins.swap_remove(i)),
-					false => i += 1,
-				}
+				keys.next();
 				continue;
 			}
 			let answers = match join.outcome().poll(waiter, |outcome| {
@@ -336,7 +371,7 @@ impl Misses {
 					answers
 				}
 				Poll::Pending => {
-					i += 1;
+					keys.next();
 					continue;
 				}
 			};
@@ -366,7 +401,7 @@ impl Misses {
 				}
 			}
 			drop(state);
-			self.joins[i].release(&taken);
+			self.release(&taken);
 			// Judged again: the same join may have more to answer, or park the waiter now.
 		}
 		retry
@@ -612,10 +647,7 @@ impl Misses {
 		for run in arrived.iter() {
 			released.insert(run.clone());
 		}
-		self.joins.retain_mut(|join| {
-			join.release(&released);
-			!join.is_empty()
-		});
+		self.release(&released);
 		for run in stale.iter() {
 			self.give_up(run.clone(), given_up);
 		}
@@ -649,7 +681,7 @@ impl Misses {
 				self.wanted.remove(groups.clone());
 				self.settle(&state.read(), groups, given_up);
 			}
-			self.joins.extend(joins);
+			self.hold(joins);
 		}
 	}
 

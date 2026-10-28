@@ -367,6 +367,11 @@ impl Join {
 			.map(drop)
 	}
 
+	/// The part of the fill the reader still reads.
+	pub(super) fn held(&self) -> &RangeSet<u64> {
+		&self.held
+	}
+
 	/// Whether the reader holds none of the fill any more.
 	pub(super) fn is_empty(&self) -> bool {
 		self.held.is_empty()
