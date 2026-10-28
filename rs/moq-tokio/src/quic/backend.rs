@@ -595,8 +595,11 @@ pub(crate) struct Server {
 /// as long as anything holds its handle, so dropping the endpoint leaves the port
 /// bound until every accepted session is gone too. Taking the socket out of this
 /// slot closes it regardless.
+///
+/// Every datagram it reads goes through the listener's [`Divert`](super::demux::Divert),
+/// which leaves only QUIC for the endpoint.
 #[derive(Clone, Debug)]
-struct Socket {
+pub(crate) struct Socket {
 	io: Arc<RwLock<Option<Arc<tokio::net::UdpSocket>>>>,
 	state: Arc<moq_sock::udp::UdpSocketState>,
 	local: net::SocketAddr,
@@ -605,10 +608,11 @@ struct Socket {
 	blocked: Arc<Blocked>,
 	/// When a send error was last logged, shared so a busy server logs one per interval.
 	last_send_error: Arc<Mutex<Option<driver::Instant>>>,
+	divert: super::demux::Divert,
 }
 
 impl Socket {
-	fn new(socket: std::net::UdpSocket) -> std::io::Result<Self> {
+	fn new(socket: std::net::UdpSocket, divert: super::demux::Divert) -> std::io::Result<Self> {
 		let state = moq_sock::udp::UdpSocketState::new((&socket).into())?;
 		let local = socket.local_addr()?;
 		let io = tokio::net::UdpSocket::from_std(socket)?;
@@ -618,6 +622,7 @@ impl Socket {
 			local,
 			blocked: Default::default(),
 			last_send_error: Default::default(),
+			divert,
 		})
 	}
 
@@ -625,6 +630,46 @@ impl Socket {
 	/// group retains a handle of its own.
 	fn release(&self) {
 		self.io.write().unwrap().take();
+	}
+
+	/// Whether [`Self::release`] closed the socket.
+	pub(crate) fn is_released(&self) -> bool {
+		self.io.read().unwrap().is_none()
+	}
+
+	/// Whether the socket is AF_INET6, so an IPv4 destination needs its mapped form.
+	pub(crate) fn is_ipv6(&self) -> bool {
+		self.local.is_ipv6()
+	}
+
+	/// Send `transmit`, or register `cx` to retry once the socket is writable.
+	pub(crate) fn poll_transmit(
+		&self,
+		transmit: &moq_sock::udp::Transmit<'_>,
+		cx: &mut Context<'_>,
+	) -> Poll<std::io::Result<()>> {
+		let io = self.io.read().unwrap();
+		// Released: the datagram is lost, which UDP always allows.
+		let Some(io) = io.as_deref() else {
+			return Poll::Ready(Ok(()));
+		};
+		loop {
+			match io.try_io(tokio::io::Interest::WRITABLE, || {
+				self.state.try_send(io.into(), transmit)
+			}) {
+				Ok(()) => return Poll::Ready(Ok(())),
+				Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+				Err(err) => {
+					let mut last = self.last_send_error.lock().unwrap();
+					return Poll::Ready(driver::send_failed(&mut last, err, transmit));
+				}
+			}
+			// Every connection sends from its own task, but tokio keeps one waker per
+			// direction, so register a fan-out to all of them instead of this task's.
+			self.blocked.push(cx.waker());
+			let waker = Waker::from(self.blocked.clone());
+			ready!(io.poll_send_ready(&mut Context::from_waker(&waker)))?;
+		}
 	}
 }
 
@@ -648,7 +693,7 @@ impl driver::AsyncUdpSocket for Socket {
 		loop {
 			ready!(io.poll_recv_ready(cx))?;
 			match io.try_io(tokio::io::Interest::READABLE, || self.state.recv(io.into(), bufs, meta)) {
-				Ok(res) => return Poll::Ready(Ok(res)),
+				Ok(received) => return Poll::Ready(Ok(self.divert.split(bufs, meta, received))),
 				// `try_io` clears readiness only for `WouldBlock`; retrying any other error
 				// would spin, since `poll_recv_ready` completes at once and the recv fails again.
 				Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -676,28 +721,7 @@ impl driver::UdpSender for Socket {
 		transmit: &moq_sock::udp::Transmit<'_>,
 		cx: &mut Context<'_>,
 	) -> Poll<std::io::Result<()>> {
-		let io = self.io.read().unwrap();
-		// Released: the datagram is lost, which UDP always allows.
-		let Some(io) = io.as_deref() else {
-			return Poll::Ready(Ok(()));
-		};
-		loop {
-			match io.try_io(tokio::io::Interest::WRITABLE, || {
-				self.state.try_send(io.into(), transmit)
-			}) {
-				Ok(()) => return Poll::Ready(Ok(())),
-				Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-				Err(err) => {
-					let mut last = self.last_send_error.lock().unwrap();
-					return Poll::Ready(driver::send_failed(&mut last, err, transmit));
-				}
-			}
-			// Every connection sends from its own task, but tokio keeps one waker per
-			// direction, so register a fan-out to all of them instead of this task's.
-			self.blocked.push(cx.waker());
-			let waker = Waker::from(self.blocked.clone());
-			ready!(io.poll_send_ready(&mut Context::from_waker(&waker)))?;
-		}
+		self.poll_transmit(transmit, cx)
 	}
 
 	fn max_transmit_segments(&self) -> usize {
@@ -735,6 +759,7 @@ pub(crate) struct Options {
 	pub quic: crate::quic::Config,
 	pub member: Option<listen::Socket>,
 	pub tls: crate::tls::Serve,
+	pub demux: super::demux::Demux,
 }
 
 impl Server {
@@ -744,6 +769,7 @@ impl Server {
 			quic,
 			member,
 			tls: served,
+			demux,
 		} = options;
 		let mut transport = driver::TransportConfig::default();
 		let quic = quic.resolve();
@@ -798,6 +824,9 @@ impl Server {
 		let load_balancer = config.load_balancer();
 
 		let mut endpoint_config = driver::EndpointConfig::default();
+		// The demux, and the shard steering filter, tell QUIC from the WebRTC media
+		// path by the fixed bit, so peers must never be invited to clear it.
+		endpoint_config.grease_quic_bit(false);
 		// First, since it also keys the default connection ID generator. The ones
 		// below validate a predecessor's IDs without it.
 		if let Some(secret) = &config.reset.secret {
@@ -810,8 +839,6 @@ impl Server {
 			if load_balancer.is_some() {
 				return Err(Error::ShardWithQuicLb);
 			}
-			// The steering filter recognizes short headers by their fixed bit.
-			endpoint_config.grease_quic_bit(false);
 			tracing::debug!(
 				index = shard.index(),
 				count = shard.count(),
@@ -852,7 +879,8 @@ impl Server {
 		};
 
 		// Create the generic QUIC endpoint.
-		let socket = Socket::new(socket).map_err(Error::CreateEndpoint)?;
+		let socket = Socket::new(socket, demux.divert()).map_err(Error::CreateEndpoint)?;
+		demux.attach(socket.clone());
 		let quic = driver::Endpoint::new_with_abstract_socket(endpoint_config, Some(tls), Box::new(socket.clone()))
 			.map_err(Error::CreateEndpoint)?;
 
@@ -1078,7 +1106,7 @@ mod tests {
 		socket
 			.bind(&net::SocketAddr::from((net::Ipv6Addr::LOCALHOST, 0)).into())
 			.unwrap();
-		let socket = Socket::new(socket.into()).unwrap();
+		let socket = Socket::new(socket.into(), crate::quic::demux::Demux::default().divert()).unwrap();
 
 		let transmit = moq_sock::udp::Transmit {
 			destination: net::SocketAddr::new(net::Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(), 1),
@@ -1128,6 +1156,98 @@ mod tests {
 		);
 	}
 
+	/// QUIC and the WebRTC media path share the listening port: a QUIC session
+	/// connects while a WebRTC peer's ICE check, DTLS, and RTP reach the feed and
+	/// its reply leaves from the same port, and a public STUN query is dropped.
+	#[tokio::test]
+	async fn one_port_serves_quic_and_webrtc() {
+		let demux = crate::quic::demux::Demux::default();
+		let feed = demux.webrtc();
+		let quic = crate::quic::Config::default();
+		let config = listen::Config {
+			bind: Some("[::]:0".parse().unwrap()),
+			tls: crate::tls::Listen {
+				generate: vec!["localhost".into()],
+				..Default::default()
+			},
+			..Default::default()
+		};
+		let tls = config.tls.load().unwrap();
+		let server = Server::new(Options {
+			config,
+			quic: quic.clone(),
+			member: None,
+			tls,
+			demux: demux.clone(),
+		})
+		.expect("server init");
+		let port = server.local_addr().expect("local addr").port();
+		let addr = net::SocketAddr::from((net::Ipv4Addr::LOCALHOST, port));
+
+		let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let check: &[u8] = &[
+			0x00, 0x01, 0x00, 0x08, 0x21, 0x12, 0xa4, 0x42, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x00, 0x06, 0x00,
+			0x03, b'a', b':', b'b', 0,
+		];
+		let query = &check[..20];
+		let query = [&[0x00, 0x01, 0x00, 0x00][..], &query[4..]].concat();
+		let sent: [&[u8]; 3] = [check, &[0x16, 0xfe, 0xfd, 1], &[0x80, 0x00, 0, 1]];
+		peer.send_to(&query, addr).await.unwrap();
+		for datagram in sent {
+			peer.send_to(datagram, addr).await.unwrap();
+		}
+
+		let mut tls_config = crate::tls::Connect::default();
+		tls_config.fingerprint = server.certificates().fingerprints();
+		let config = connect::Config {
+			bind: Some("127.0.0.1:0".parse().unwrap()),
+			tls: tls_config,
+			..Default::default()
+		};
+		let tls = config.tls.build().expect("tls config");
+		let client = Client::new(&config, &quic).expect("client init");
+		let url: Url = format!("moqt://localhost:{port}/test").parse().unwrap();
+		let versions = moq_net::Versions::default();
+		let dial = client.connect(&tls, url.into(), &versions);
+		let accept = async {
+			let incoming = server.accept().await.expect("incoming connection");
+			super::accept(incoming, versions.alpns()).await
+		};
+		let webrtc = async {
+			let mut received = Vec::new();
+			for _ in sent {
+				let datagram = feed.recv().await.expect("feed open");
+				assert_eq!(datagram.remote, peer.local_addr().unwrap());
+				received.push(datagram.data.to_vec());
+			}
+			feed.send(&moq_sock::udp::Transmit {
+				destination: peer.local_addr().unwrap(),
+				ecn: None,
+				contents: b"reply",
+				segment_size: None,
+				src_ip: None,
+			})
+			.await
+			.unwrap();
+			let mut buf = [0; 16];
+			let (len, from) = peer.recv_from(&mut buf).await.unwrap();
+			(received, buf[..len].to_vec(), from.port())
+		};
+		let (session, received) = tokio::time::timeout(Duration::from_secs(5), async {
+			let (session, received) = tokio::join!(async { tokio::try_join!(dial, accept) }, webrtc);
+			(session, received)
+		})
+		.await
+		.expect("timed out");
+		session.expect("QUIC beside WebRTC");
+
+		let (received, reply, from) = received;
+		assert_eq!(received, sent.map(<[u8]>::to_vec));
+		assert_eq!(reply, b"reply");
+		assert_eq!(from, port);
+		assert_eq!(demux.counters().get(crate::quic::demux::Discard::Stun), 1);
+	}
+
 	async fn pinned_connection(bind: &str, host_name: Option<&str>) {
 		let quic = crate::quic::Config::default();
 		let config = listen::Config {
@@ -1144,6 +1264,7 @@ mod tests {
 			quic: quic.clone(),
 			member: None,
 			tls,
+			demux: Default::default(),
 		})
 		.expect("server init");
 		let addr = server.local_addr().expect("local addr");
@@ -1250,6 +1371,7 @@ mod tests {
 			quic: quic.clone(),
 			member: None,
 			tls,
+			demux: Default::default(),
 		})
 		.expect("server init");
 		let addr = server.local_addr().expect("local addr");
