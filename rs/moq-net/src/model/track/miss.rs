@@ -244,18 +244,15 @@ impl Misses {
 	/// Stop holding `lost` in the joins holding any of it, so their fills no longer owe it
 	/// this reader, and drop each join left holding nothing.
 	fn release(&mut self, lost: &RangeSet<u64>) {
-		let keys: BTreeSet<u64> = lost
-			.iter()
-			.flat_map(|run| self.holders.overlapping(run).map(|(_, key)| *key))
-			.collect();
 		for run in lost.iter() {
-			self.holders.remove(run.clone());
-		}
-		for key in keys {
-			let join = self.joins.get_mut(&key).expect("a holder names a join");
-			join.release(lost);
-			if join.is_empty() {
-				self.joins.remove(&key);
+			while let Some((held, &key)) = self.holders.overlapping(run).next() {
+				self.holders.remove(held.start.max(run.start)..held.end.min(run.end));
+				// Releases all of `lost` the join holds, so its other pieces find nothing.
+				let join = self.joins.get_mut(&key).expect("a holder names a join");
+				join.release(lost);
+				if join.is_empty() {
+					self.joins.remove(&key);
+				}
 			}
 		}
 	}
