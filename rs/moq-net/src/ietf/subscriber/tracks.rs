@@ -510,6 +510,12 @@ impl Subscriber {
 		// made stay ours.
 		tracing::debug!(prefix = %crate::path::Rooted(self.origin.root(), prefix), "subscribe_tracks cancelled");
 		let Stream { mut writer, mut reader } = stream;
+		// The request never reached the peer whole, so it holds nothing to wait on.
+		if !writer.is_flushed() {
+			reader.abort(&Error::Cancel);
+			writer.abort(&Error::Cancel);
+			return Ok(());
+		}
 		match request_stream::fin_cancels(self.version) {
 			true => {
 				let _ = writer.finish();
@@ -632,9 +638,11 @@ impl Subscriber {
 		);
 		let mut messages = Messages::new(self.session.clone(), self.control.client());
 		let accepted = async {
-			stream
-				.writer
-				.encode_message(&ietf::Subscribe {
+			// Flushed while waiting for the answer, so the entry going still ends a request
+			// the peer's send window holds back.
+			stream.writer.buffer_message(
+				ietf::Subscribe::ID,
+				&ietf::Subscribe {
 					max_age: None,
 					new_group: None,
 					request_id,
@@ -651,9 +659,12 @@ impl Subscriber {
 					range_filters: false,
 					authorization_token: None,
 					epoch: self.epoch.clone(),
-				})
-				.await?;
-			let mut response = std::pin::pin!(self.read_subscribe_response(&mut stream, &mut messages));
+				},
+			)?;
+			let mut response = std::pin::pin!(async {
+				std::future::poll_fn(|cx| stream.writer.poll_flush(cx)).await?;
+				self.read_subscribe_response(&mut stream, &mut messages).await
+			});
 			let answered = kio::wait(|waiter| {
 				if gone(waiter) {
 					return Poll::Ready(None);
@@ -905,6 +916,9 @@ impl Subscriber {
 				if session.poll_closed(&mut cx).is_ready() {
 					return Poll::Ready(Step::Closed);
 				}
+				if let Poll::Ready(Err(err)) = upstream.stream.writer.poll_flush(&mut cx) {
+					return Poll::Ready(Step::Message(Err(err)));
+				}
 				if let Poll::Ready(handoff) = handoff.poll(waiter, |handoff| match handoff.gone || handoff.wanted {
 					true => Poll::Ready(()),
 					false => Poll::Pending,
@@ -967,7 +981,13 @@ impl Subscriber {
 		};
 		tracing::debug!(broadcast = %key.0, track = %key.1, ?end, "held subscription ended");
 		self.remove_subscribe(upstream.request_id);
-		let _ = upstream.stream.writer.finish();
+		// A pause still held back would go out truncated behind a FIN.
+		match upstream.stream.writer.is_flushed() {
+			true => {
+				let _ = upstream.stream.writer.finish();
+			}
+			false => upstream.stream.writer.abort(&Error::Cancel),
+		}
 		// A failed upstream fails the copy, as it would while forwarding. TRACK_ENDED leaves it
 		// idle: the end is past groups it never saw, so a returning reader's SUBSCRIBE learns
 		// where, as for a copy whose subscription was cancelled.
@@ -1077,14 +1097,15 @@ impl Subscriber {
 		});
 	}
 
-	/// Pause a subscription nobody reads that is its track's entry, and hold it again.
-	pub(super) async fn pause(&self, key: TrackKey, mut upstream: Upstream) {
+	/// Pause a subscription nobody reads that is its track's entry, and hold it again. The
+	/// held watch flushes the pause, so the entry going still ends it under send pressure.
+	pub(super) fn pause(&self, key: TrackKey, mut upstream: Upstream) {
 		self.park_subscribe(upstream.request_id);
 		let pause = Forward {
 			forward: false,
 			..Default::default()
 		};
-		match self.write_forward(&mut upstream.stream.writer, &pause).await {
+		match self.buffer_forward(&mut upstream.stream.writer, &pause) {
 			Ok(()) => {
 				upstream.owed += 1;
 				tracing::debug!(broadcast = %key.0, track = %key.1, "subscription paused");
@@ -1127,15 +1148,17 @@ impl Subscriber {
 		}
 	}
 
-	/// Set a held subscription's Forward State with REQUEST_UPDATE.
-	pub(super) async fn write_forward(
+	/// Buffer the REQUEST_UPDATE setting a held subscription's Forward State, for the
+	/// caller to flush.
+	pub(super) fn buffer_forward(
 		&self,
 		writer: &mut Writer<crate::transport::boxed::SendStream, Version>,
 		forward: &Forward,
 	) -> Result<(), Error> {
 		let request_id = self.control.next_request_id();
-		writer
-			.encode_message(&ietf::SubscribeUpdate {
+		writer.buffer_message(
+			ietf::SubscribeUpdate::ID,
+			&ietf::SubscribeUpdate {
 				max_age: forward.max_age,
 				request_id,
 				subscriber_priority: forward.priority.map(super::super::priority::to_wire),
@@ -1144,8 +1167,8 @@ impl Subscriber {
 				authorization_token: None,
 				new_group: forward.new_group,
 				fill: forward.fill,
-			})
-			.await
+			},
+		)
 	}
 
 	/// Check the answer to a REQUEST_UPDATE a held subscription still owes. It carries
