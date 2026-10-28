@@ -10,7 +10,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use unsafe_libopus::{
 	OPUS_APPLICATION_AUDIO, OPUS_GET_BITRATE_REQUEST, OPUS_GET_LOOKAHEAD_REQUEST, OPUS_OK, OPUS_RESET_STATE,
-	OPUS_SET_BITRATE_REQUEST, OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST, OpusEncoder, opus_encode_float,
+	OPUS_SET_BITRATE_REQUEST, OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+	OpusEncoder, opus_encode_float,
 	opus_encoder_create, opus_encoder_ctl_impl, opus_encoder_destroy, varargs,
 };
 
@@ -322,6 +323,17 @@ impl Encoder {
 			i32::from(config.fec),
 			"OPUS_SET_INBAND_FEC",
 		)?;
+		if config.fec {
+			// Without an expected loss rate libopus writes no forward error copy
+			// at all, leaving the knob half-wired: the copy needs something to
+			// allocate against. 10% is the conservative speech default.
+			Self::set_opus_ctl(
+				inner,
+				OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+				10,
+				"OPUS_SET_PACKET_LOSS_PERC",
+			)?;
+		}
 		Self::set_opus_ctl(inner, OPUS_SET_DTX_REQUEST, i32::from(config.dtx), "OPUS_SET_DTX")?;
 
 		let bitrate = Self::get_opus_ctl(inner, OPUS_GET_BITRATE_REQUEST, "OPUS_GET_BITRATE")?;

@@ -81,6 +81,15 @@ pub struct Config {
 	pub latency_max: Option<Duration>,
 	/// Where to start on a track that already holds groups.
 	pub start: Start,
+	/// How much of a hole to fill with recovered audio before leaving it a hole.
+	///
+	/// Zero (the default) leaves every hole in the output, as
+	/// [`read`](Consumer::read) documents. Up to this much of an undeclared hole
+	/// is recovered instead: the lost frames conceal, and the one before the
+	/// arriving packet comes back from its in-band forward error copy when the
+	/// sender coded one. Longer holes stay holes, since hiding a skipped group
+	/// is worse than showing it.
+	pub conceal: Duration,
 }
 
 impl Config {
@@ -115,6 +124,9 @@ struct Opus {
 	inner: *mut OpusDecoder,
 	pre_skip_remaining: usize,
 	max_frame_size: usize,
+	/// Frames per channel in the last packet that decoded, which is what a lost
+	/// packet most likely carried. `None` until one has.
+	last_frame_size: Option<usize>,
 	in_dtx: bool,
 }
 
@@ -173,6 +185,7 @@ impl Decoder {
 				inner,
 				pre_skip_remaining,
 				max_frame_size,
+				last_frame_size: None,
 				in_dtx: false,
 			}),
 			sample_rate,
@@ -324,6 +337,9 @@ impl Decoder {
 				if samples < 0 {
 					return Err(crate::opus::decode_error(samples));
 				}
+				if !packet.is_empty() {
+					opus.last_frame_size = Some(samples as usize);
+				}
 				out.truncate(samples as usize * self.channel_count as usize);
 				let trim_frames = opus.pre_skip_remaining.min(samples as usize);
 				if trim_frames > 0 {
@@ -377,6 +393,67 @@ impl Decoder {
 					activity: Activity::Active,
 				})
 			}
+		}
+	}
+
+	/// Recover one lost packet: the in-band forward error copy of the previous
+	/// frame `next` carries when it has one, concealment when it does not (and
+	/// when `next` is `None`). libopus conceals when the `decode_fec` request
+	/// finds no copy, so one call covers both.
+	///
+	/// The recovered length is the last packet's, the same assumption the
+	/// concealment path makes, and the copy decodes at the reduced rate the
+	/// sender coded it at. Classified as the loss it covers rather than as
+	/// `next`, whose own activity says nothing about the frame before it.
+	pub fn recover(&mut self, next: Option<&[u8]>) -> Result<Decoded, Error> {
+		let opus = match &mut self.backend {
+			Backend::Opus(opus) => opus,
+			_ => return Err(Error::Unsupported("only opus recovers lost packets".into())),
+		};
+		let frame_size = opus.last_frame_size.ok_or_else(|| {
+			Error::Decode("opus packet lost before any packet decoded, so no length to conceal".into())
+		})?;
+		let (packet, fec) = match next {
+			Some(next) if !next.is_empty() => (next, 1),
+			_ => (&[][..], 0),
+		};
+		let mut out = vec![0.0f32; frame_size * self.channel_count as usize];
+		// SAFETY: `inner` owns a live OpusDecoder; packet/out slices are
+		// bounded by the lengths we pass.
+		let samples = unsafe {
+			opus_decode_float(
+				&mut *opus.inner,
+				packet.as_ptr(),
+				packet.len() as i32,
+				out.as_mut_ptr(),
+				frame_size as i32,
+				fec,
+			)
+		};
+		if samples < 0 {
+			return Err(crate::opus::decode_error(samples));
+		}
+		out.truncate(samples as usize * self.channel_count as usize);
+		let trim_frames = opus.pre_skip_remaining.min(samples as usize);
+		if trim_frames > 0 {
+			let trim_samples = trim_frames * self.channel_count as usize;
+			out.copy_within(trim_samples.., 0);
+			out.truncate(out.len() - trim_samples);
+			opus.pre_skip_remaining -= trim_frames;
+		}
+		let activity = crate::opus::activity(&[], opus.in_dtx);
+		opus.in_dtx = activity.is_dtx();
+		Ok(Decoded { samples: out, activity })
+	}
+
+	/// Native-rate frames one lost packet conceals, or `None` when this
+	/// decoder cannot conceal one.
+	pub fn conceal_len(&self) -> Option<usize> {
+		match &self.backend {
+			Backend::Opus(opus) => opus.last_frame_size,
+			Backend::Pcm { .. } => None,
+			#[cfg(feature = "aac")]
+			Backend::Aac(_) => None,
 		}
 	}
 }
@@ -508,5 +585,88 @@ mod tests {
 		catalog.bitrate = Some(1);
 
 		assert!(matches!(Decoder::new(&catalog), Err(Error::Unsupported(_))));
+	}
+
+	/// Stepped-frequency sines: a lost frame's content cannot be guessed from
+	/// its neighbors, so a recovered in-band copy must come measurably closer
+	/// to the original than concealment does.
+	fn stepped_sine_packets(fec: bool) -> Vec<bytes::Bytes> {
+		use crate::encode::{Config as EncodeConfig, Encoder as EncodeEncoder, Input};
+
+		let input = Input {
+			format: Format::F32,
+			sample_rate: 48_000,
+			channels: 1,
+		};
+		let mut config = EncodeConfig::new(input);
+		config.fec = fec;
+		let mut encoder = EncodeEncoder::new(&config).unwrap();
+		(1..=6)
+			.map(|step| {
+				let freq = 440.0 * step as f32;
+				let pcm: Vec<f32> = (0..encoder.frame_size())
+					.map(|n| (std::f32::consts::TAU * freq * n as f32 / 48_000.0).sin() * 0.5)
+					.collect();
+				encoder.encode(&pcm).unwrap().payload
+			})
+			.collect()
+	}
+
+	fn opus_catalog() -> hang::catalog::AudioConfig {
+		let head = moq_mux::codec::opus::Config::new(48_000, 1).encode().unwrap();
+		let mut catalog = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48_000, 1);
+		catalog.description = Some(head);
+		catalog
+	}
+
+	/// A lost packet comes back whole from the next packet's in-band copy,
+	/// closer to the original than concealment manages.
+	#[test]
+	fn opus_recover_uses_the_in_band_copy_of_the_lost_frame() {
+		let packets = stepped_sine_packets(true);
+		let mut clean = Decoder::new(&opus_catalog()).unwrap();
+		let decoded: Vec<Vec<f32>> = packets
+			.iter()
+			.map(|packet| clean.decode(packet).unwrap().samples)
+			.collect();
+
+		// Lose the fourth of six; the fifth carries its in-band copy.
+		let mut recovered = Decoder::new(&opus_catalog()).unwrap();
+		for packet in &packets[..3] {
+			recovered.decode(packet).unwrap();
+		}
+		let fec = recovered.recover(Some(&packets[4])).unwrap().samples;
+
+		let mut concealed = Decoder::new(&opus_catalog()).unwrap();
+		for packet in &packets[..3] {
+			concealed.decode(packet).unwrap();
+		}
+		let plc = concealed.recover(None).unwrap().samples;
+
+		assert_eq!(fec.len(), decoded[3].len());
+		let mse = |a: &[f32], b: &[f32]| {
+			a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>() / a.len() as f32
+		};
+		assert!(
+			mse(&fec, &decoded[3]) * 2.0 < mse(&plc, &decoded[3]),
+			"the in-band copy should beat concealment against the original: fec={} plc={}",
+			mse(&fec, &decoded[3]),
+			mse(&plc, &decoded[3]),
+		);
+	}
+
+	/// Without a next packet there is nothing to recover from: the loss
+	/// conceals at the last packet's length, still active because the audio
+	/// around it was.
+	#[test]
+	fn opus_recover_without_a_next_packet_conceals() {
+		let packets = stepped_sine_packets(false);
+		let mut decoder = Decoder::new(&opus_catalog()).unwrap();
+		for packet in &packets[..3] {
+			decoder.decode(packet).unwrap();
+		}
+		let concealed = decoder.recover(None).unwrap();
+		assert_eq!(concealed.samples.len(), 960);
+		assert!(!concealed.activity.is_dtx());
 	}
 }

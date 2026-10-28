@@ -199,12 +199,19 @@ impl Consumer {
 			// phase reconstructs each batch's time from the marker rather than
 			// reading it off the packet, so there is nothing left to compare.
 			if self.end.is_none()
-				&& self
-					.next_start
-					.is_some_and(|next| discontinuous(next, mux_frame.timestamp))
-				&& let Some(frame) = self.gap()?
+				&& let Some(next) = self.next_start
+				&& discontinuous(next, mux_frame.timestamp)
 			{
-				self.ready.push_back(frame);
+				// What the resampler held from before the hole belongs before
+				// anything recovered over it, and recovery reads the prediction
+				// history the gap reset clears: drain, recover, then reset.
+				let tail = self.drain_tail()?;
+				let recovered = self.recover(next, mux_frame.timestamp, &mux_frame.payload)?;
+				self.gap()?;
+				if let Some(frame) = tail {
+					self.ready.push_back(frame);
+				}
+				self.ready.extend(recovered);
 			}
 
 			let rate = self.decoder.sample_rate();
@@ -321,31 +328,111 @@ impl Consumer {
 		Ok(())
 	}
 
-	/// Reset codec prediction and resampling state at a hole, returning whatever the
-	/// resampler was still holding from before it.
+	/// Reset codec prediction and timeline state at a hole.
 	///
-	/// Those samples arrived before the hole and belong before it, so they come
-	/// out as their own frame rather than being filtered together with the audio
-	/// on the far side. The resampler starts over from there, which is what makes
-	/// the next packet's output stamp from the packet itself: nothing is buffered
-	/// to reach back over.
-	fn gap(&mut self) -> Result<Option<Frame>, Error> {
+	/// The resampler starts over from the next packet's own timeline: nothing
+	/// is buffered to reach back over the hole. What it held before the hole
+	/// came out already, via [`drain_tail`](Self::drain_tail).
+	fn gap(&mut self) -> Result<(), Error> {
 		self.decoder.reset_prediction()?;
-
-		let mut frame = None;
-		if let Some(resampler) = self.resampler.as_mut() {
-			let held = resampler.held_at();
-			let skipped = resampler.skipped();
-			let pcm = resampler.drain()?;
-			frame = self.tail(pcm, held, skipped)?;
-		}
 
 		self.next_start = None;
 		self.spans.clear();
 		self.trailing = Activity::Active;
 		self.epoch = None;
 		self.delay_trimmed = 0;
-		Ok(frame)
+		Ok(())
+	}
+
+	/// What the resampler was still holding from before a hole.
+	///
+	/// Those samples arrived before the hole and belong before it, so they come
+	/// out as their own frame rather than being filtered together with the audio
+	/// on the far side.
+	fn drain_tail(&mut self) -> Result<Option<Frame>, Error> {
+		let Some(resampler) = self.resampler.as_mut() else {
+			return Ok(None);
+		};
+		let held = resampler.held_at();
+		let skipped = resampler.skipped();
+		let pcm = resampler.drain()?;
+		self.tail(pcm, held, skipped)
+	}
+
+	/// Fill a hole with what the codec can produce: the lost frames conceal
+	/// except the one before the arriving packet, which comes back from that
+	/// packet's in-band forward error copy when the sender coded one.
+	///
+	/// Covers at most [`Config::conceal`], and only where the decoder can
+	/// conceal at all. Frames are stamped into the hole and stop exactly where
+	/// the arriving packet resumes.
+	fn recover(
+		&mut self,
+		start: moq_net::Timestamp,
+		end: moq_net::Timestamp,
+		next_packet: &[u8],
+	) -> Result<Vec<Frame>, Error> {
+		let mut frames = Vec::new();
+		if self.config.conceal.is_zero() {
+			return Ok(frames);
+		}
+		let Some(conceal_len) = self.decoder.conceal_len() else {
+			return Ok(frames);
+		};
+		if std::time::Duration::from(end.checked_sub(start)?) > self.config.conceal {
+			return Ok(frames);
+		}
+		let rate = self.decoder.sample_rate();
+		let channels = self.decoder.channel_count().max(1) as usize;
+		let hole = frames_between(start, end, rate)?;
+		let mut covered = 0usize;
+		while covered < hole {
+			let remaining = hole - covered;
+			let decoded = self.decoder.recover((remaining <= conceal_len).then_some(next_packet))?;
+			let activity = decoded.activity;
+			let mut samples = decoded.samples;
+			let mut length = samples.len() / channels;
+			if length == 0 {
+				break;
+			}
+			// The last recovered frame stops where the hole does, so the audio
+			// meets the arriving packet exactly.
+			if length > remaining {
+				length = remaining;
+				samples.truncate(length * channels);
+			}
+			let decoded_at = advance(start, covered, rate)?;
+			let (pcm, timestamp) = match self.resampler.as_mut() {
+				Some(r) => {
+					let held = if r.pending_frames() == 0 {
+						decoded_at
+					} else {
+						r.held_at().unwrap_or(decoded_at)
+					};
+					let skipped = r.skipped();
+					let pcm = r.process(&samples, decoded_at)?;
+					(pcm, rewind(held, skipped, self.resolved_sample_rate)?)
+				}
+				None => (samples, decoded_at),
+			};
+			let resampled = self.resampler.is_some();
+			if resampled {
+				self.spans.push_back(ActivitySpan {
+					end: advance(decoded_at, length, rate)?,
+					activity,
+				});
+			}
+			if !pcm.is_empty() {
+				let activity = if resampled {
+					self.activity_at(timestamp)
+				} else {
+					activity
+				};
+				frames.push(self.frame(pcm, timestamp, activity)?);
+			}
+			covered += length;
+		}
+		Ok(frames)
 	}
 
 	/// The tail the resampler is still holding when the track ends, once.
@@ -1004,6 +1091,66 @@ mod tests {
 			third.timestamp,
 			advance(second.timestamp, second_frames, 48_000).unwrap()
 		);
+	}
+
+	/// A lost packet with `conceal` set is filled, not left as a hole: the
+	/// frame before the arriving packet comes back from its in-band copy and
+	/// the frames meet on both sides of the gap.
+	#[tokio::test]
+	async fn a_small_hole_is_filled_with_recovered_audio() {
+		let input = Input {
+			format: Format::F32,
+			sample_rate: 48_000,
+			channels: 1,
+		};
+		let mut config = crate::encode::Config::new(input);
+		config.fec = true;
+		let mut encoder = Encoder::new(&config).unwrap();
+		let catalog = encoder.catalog();
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast.create_track("audio", hang::container::track_info()).unwrap();
+		let subscriber = broadcast.consume();
+		let mut producer = moq_mux::container::Producer::new(track, moq_mux::catalog::hang::Container::Legacy);
+		let mut consumer = Consumer::new(
+			&subscriber,
+			&catalog,
+			"audio",
+			Config {
+				conceal: std::time::Duration::from_millis(120),
+				..Config::new()
+			},
+		)
+		.await
+		.unwrap();
+
+		// Six 20 ms packets with the fourth missing.
+		let pcm = vec![0.25f32; encoder.frame_size()];
+		for (packet, timestamp) in [0u64, 20_000, 40_000, 60_000, 80_000, 100_000].into_iter().enumerate() {
+			if packet == 3 {
+				continue;
+			}
+			producer
+				.write(moq_mux::container::Frame {
+					timestamp: Timestamp::from_micros(timestamp).unwrap(),
+					duration: None,
+					payload: encoder.encode(&pcm).unwrap().payload,
+					keyframe: true,
+				})
+				.unwrap();
+			producer.cut(None).unwrap();
+		}
+		producer.finish().unwrap();
+
+		let mut stamps = Vec::new();
+		while let Some(frame) = consumer.read().await.unwrap() {
+			stamps.push(frame.timestamp.as_micros());
+		}
+		// Stamps follow the fork's documented model: the epoch's pre-skip slides
+		// the first packets back (0, 13.5k, 33.5k), and a hole re-anchors each
+		// side to its own packet timeline, so the recovered frame lands where the
+		// missing packet would have said.
+		assert_eq!(stamps, [0, 13_500, 33_500, 60_000, 80_000, 100_000]);
 	}
 
 	#[tokio::test]
