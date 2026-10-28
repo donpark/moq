@@ -512,33 +512,38 @@ export class Consumer {
 		return true;
 	}
 
-	// Move on from the stalled active group once the max buffer is full, since it can hold no more of
-	// what it waits behind, to the next group even with nothing of it read yet: that one reads as the
-	// head, and each such skip refunds what the group left behind held. Only fires when the active group
-	// is fully consumed and still open, so we never drop frames the consumer hasn't seen. Returns true if
-	// a group was skipped.
+	// Move on from the stalled head once the max buffer is full, since it can hold no more of what it
+	// waits behind, to the next group even with nothing of it read yet: that one reads as the head, and
+	// each such skip refunds what the group left behind held. The head may be the active group or a
+	// backlog group admitted below it. Only fires when the head is fully consumed and still open, so we
+	// never drop frames the consumer hasn't seen. Returns true if a group was skipped.
 	#tryPressureSkip(): boolean {
 		if (this.#active === undefined || !this.#full()) return false;
 
-		const active = this.#groups[0];
-		if (!active || active.consumer.sequence !== this.#active) return false;
-		if (active.done || active.frames.length > 0) return false;
+		const head = this.#groups[0];
+		if (!head || head.consumer.sequence > this.#active) return false;
+		if (head.done || head.frames.length > 0) return false;
 
 		const next = this.#groups[1];
 		if (!next) return false;
 
 		this.#groups.shift();
 		console.warn(
-			`skipping a stalled group past the max buffer: track=${this.#track.name} ${active.consumer.sequence} -> ${next.consumer.sequence}`,
+			`skipping a stalled group past the max buffer: track=${this.#track.name} ${head.consumer.sequence} -> ${next.consumer.sequence}`,
 		);
-		// Still open, so its tail is lost unless the next group picks up where it ended, which nothing
-		// proves before its start is read.
-		const nextStart = next.frames.at(0)?.timestamp;
-		if (active.truncated || !ptsContiguous(active.end ?? this.#presentedEnd, nextStart)) this.#lost = true;
-		this.#recordPresented(active);
-		this.#active = next.consumer.sequence;
+		if (head.consumer.sequence === this.#active) {
+			// Still open, so its tail is lost unless the next group picks up where it ended, which nothing
+			// proves before its start is read.
+			const nextStart = next.frames.at(0)?.timestamp;
+			if (head.truncated || !ptsContiguous(head.end ?? this.#presentedEnd, nextStart)) this.#lost = true;
+			this.#recordPresented(head);
+			this.#active = next.consumer.sequence;
+		} else {
+			// A backlog group below the cursor, which stays put: what the group would still have delivered is lost.
+			this.#lost = true;
+		}
 
-		this.#discard(active);
+		this.#discard(head);
 		this.#updateBuffered();
 		return true;
 	}

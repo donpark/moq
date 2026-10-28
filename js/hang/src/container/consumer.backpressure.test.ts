@@ -232,3 +232,31 @@ for (const maxBuffer of [0, 256]) {
 		}
 	});
 }
+
+test("Consumer moves past a stalled backlog group below the cursor once the max buffer is full", async () => {
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format: new Format("data"),
+		maxDelay: Milli(5_000),
+		// Two groups' overhead: the backlog group and the active one leave no room for the newer group.
+		maxBuffer: 512,
+	});
+	try {
+		const active = track.createGroup(3);
+		write(active, 30_000);
+		expect(await consumer.next()).toMatchObject({ kind: "frame", group: 3 });
+
+		track.createGroup(1);
+		const newer = track.createGroup(4);
+		write(newer, 40_000);
+		newer.finish();
+
+		expect(await consumer.next()).toMatchObject({ kind: "gap" });
+		expect(await consumer.next()).toMatchObject({ kind: "frame", group: 4, frame: { timestamp: 40_000 } });
+	} finally {
+		consumer.close();
+		track.close();
+		warn.mockRestore();
+	}
+});
