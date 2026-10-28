@@ -174,7 +174,6 @@ fn verify_late_joiner(producer_config: snapshot::Config, compress: bool, ticks: 
 	yielded
 }
 
-
 fn main() {
 	const TICKS: u64 = 60;
 

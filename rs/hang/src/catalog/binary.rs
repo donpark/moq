@@ -97,7 +97,6 @@ pub struct BinaryConfig {
 	#[serde_as(as = "serde_with::DisplayFromStr")]
 	pub mode: Mode,
 
-
 	/// An optional media type for each payload (e.g. `image/jpeg`). Purely descriptive: a consumer
 	/// that doesn't recognize it can still read the track.
 	#[serde(default)]

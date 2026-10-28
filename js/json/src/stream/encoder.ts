@@ -75,7 +75,10 @@ export class Encoder<T> {
 
 		const payload = new TextEncoder().encode(text);
 		const budget = this.#budget;
-		if (budget.frames >= Group.MAX_GROUP_FRAMES || budget.bytes + payload.byteLength > Group.MAX_GROUP_CACHE_BYTES) {
+		if (
+			budget.frames >= Group.MAX_GROUP_FRAMES ||
+			budget.bytes + payload.byteLength > Group.MAX_GROUP_CACHE_BYTES
+		) {
 			throw new NetError.GroupTooLarge();
 		}
 

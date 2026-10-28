@@ -116,7 +116,10 @@ mod timestamps {
 			let info = moq_net::track::Info::default()
 				.with_timescale(scale)
 				.with_compress(compress);
-			let track = moq_net::broadcast::Info::new().produce().create_track("data", info).unwrap();
+			let track = moq_net::broadcast::Info::new()
+				.produce()
+				.create_track("data", info)
+				.unwrap();
 			let mut subscriber = track.subscribe(None);
 			let mut subscription = subscriber.subscription();
 			subscription.max_delay = None;

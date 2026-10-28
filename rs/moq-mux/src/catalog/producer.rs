@@ -1443,10 +1443,7 @@ mod test {
 		let catalog = Producer::<()>::new(&mut broadcast, Config::default()).unwrap();
 		let mut copy = catalog.clone();
 		let mut readers = Vec::new();
-		for name in [
-			hang::Catalog::DEFAULT_NAME,
-			moq_msf::DEFAULT_NAME,
-		] {
+		for name in [hang::Catalog::DEFAULT_NAME, moq_msf::DEFAULT_NAME] {
 			readers.push(broadcast.consume().track(name).unwrap().subscribe(None).await.unwrap());
 		}
 		catalog.abort(moq_net::Error::Unauthorized);
@@ -1525,11 +1522,7 @@ mod test {
 		let _recorder = catalog.enroll("video", None).unwrap();
 
 		let consumer = broadcast.consume();
-		for name in [
-			hang::Catalog::DEFAULT_NAME,
-			moq_msf::DEFAULT_NAME,
-			"video.hls",
-		] {
+		for name in [hang::Catalog::DEFAULT_NAME, moq_msf::DEFAULT_NAME, "video.hls"] {
 			let track = consumer.track(name).expect("track");
 			let info = track.info().await.expect("info");
 			assert_eq!(info.priority, PRIORITY.catalog, "{name} should rank with the catalog");

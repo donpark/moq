@@ -1578,8 +1578,7 @@ mod tests {
 		let b: Epoch = "01900000-0000-7000-8000-000000000002".parse().unwrap();
 		let c: Epoch = "01900000-0000-7000-8000-000000000003".parse().unwrap();
 		let d: Epoch = "01900000-0000-7000-8000-000000000004".parse().unwrap();
-		let mut merged =
-			Merged::<Keyed<Traffic>>::new(origin.consume(), &Config::new(), "traffic".into());
+		let mut merged = Merged::<Keyed<Traffic>>::new(origin.consume(), &Config::new(), "traffic".into());
 		let update = |epoch: Option<Epoch>| moq_net::announce::Announce {
 			prefix: path.clone(),
 			captures: None,
@@ -2225,9 +2224,7 @@ mod tests {
 				.create_broadcast(format!(".stats/node/{node}").as_str())
 				.expect("create broadcast");
 			source.announce(origin::Route::default()).expect("announce");
-			let track = source
-				.create_track(totals_track(), timed())
-				.expect("create track");
+			let track = source.create_track(totals_track(), timed()).expect("create track");
 			let config = moq_json::snapshot::Config::default().with_deltas(false);
 			Self {
 				_source: source,

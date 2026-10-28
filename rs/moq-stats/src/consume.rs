@@ -2,7 +2,10 @@
 
 use moq_net::{Path, broadcast};
 
-use crate::{GroupFrame, PrefixFrame, PresenceFrame, Result, TotalsFrame, group_track, prefix_track, presence_track, totals_track};
+use crate::{
+	GroupFrame, PrefixFrame, PresenceFrame, Result, TotalsFrame, group_track, prefix_track, presence_track,
+	totals_track,
+};
 
 /// Configuration for a [`Consumer`]. Empty for now; construct with
 /// [`Config::new`]. The struct is `#[non_exhaustive]`, so new options stay

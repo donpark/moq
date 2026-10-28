@@ -95,7 +95,6 @@ pub struct JsonConfig {
 	#[serde_as(as = "serde_with::DisplayFromStr")]
 	pub mode: Mode,
 
-
 	/// An optional identifier for the shape of each value, typically a JSON Schema URL. Purely
 	/// descriptive: a consumer that doesn't recognize it can still read the track.
 	#[serde(default)]

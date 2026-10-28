@@ -12,7 +12,9 @@ use moq_net::{Epoch, Path, broadcast, kio, origin, track};
 use serde::Serialize;
 use web_async::spawn;
 
-use crate::{Prefix, Totals, Usage, parse_prefix_track, parse_presence_track, prefix_track, presence_track, totals_track};
+use crate::{
+	Prefix, Totals, Usage, parse_prefix_track, parse_presence_track, prefix_track, presence_track, totals_track,
+};
 
 /// Settings for a [`Producer`]. Construct with [`Config::new`] and chain
 /// the `with_*` setters (e.g.
@@ -509,7 +511,11 @@ impl<V: Serialize> Output<V> {
 	}
 
 	/// Publish on the track `request` asked for, or create `name` without one.
-	fn adopt(broadcast: &broadcast::Producer, name: &str, request: Option<track::Request>) -> Result<Self, moq_net::Error> {
+	fn adopt(
+		broadcast: &broadcast::Producer,
+		name: &str,
+		request: Option<track::Request>,
+	) -> Result<Self, moq_net::Error> {
 		match request {
 			Some(request) => Ok(Self::new(request.accept(info()))),
 			None => Self::create(broadcast, name),
@@ -1191,14 +1197,7 @@ impl NodePublisher {
 
 	/// Hold a requested prefix track, publishing its current counters so the
 	/// subscription resolves at once. Cumulative from here on.
-	fn adopt_prefix(
-		&mut self,
-		report: &Report,
-		path: Path,
-		request: Option<track::Request>,
-		tick: u64,
-		stamp: Stamp,
-	) {
+	fn adopt_prefix(&mut self, report: &Report, path: Path, request: Option<track::Request>, tick: u64, stamp: Stamp) {
 		// Defensive only, as in `adopt_presence`.
 		if self.prefixes.contains_key(path.as_str()) {
 			if let Some(request) = request {
@@ -1317,7 +1316,8 @@ mod tests {
 	#[test]
 	fn a_joiner_over_the_ratio_gets_a_snapshot_next_interval() {
 		let broadcast = moq_net::broadcast::Info::new().produce();
-		let track = broadcast.create_track("t.json", info()).unwrap();
+		// Uncompressed, so the refresh ratio is judged on the plain frame sizes below.
+		let track = broadcast.create_track("t.json", info().with_compress(false)).unwrap();
 		let mut snapshot = Snapshot::<Frame<u64>>::new(track.clone(), moq_json::snapshot::Config::default());
 		let frame = |n| Frame {
 			entries: vec![(Path::from_static("a"), n)],
@@ -1733,14 +1733,57 @@ mod tests {
 			.collect()
 	}
 
+	/// A snapshot reader over a stats track, polled without blocking.
+	struct Reader<T>(moq_json::snapshot::Consumer<T>);
+
+	impl<T: serde::de::DeserializeOwned + Unpin> Reader<T> {
+		fn new(track: track::Subscriber) -> Self {
+			Self(moq_json::snapshot::Consumer::new(track, Default::default()))
+		}
+
+		/// The next reconstructed state, `None` once nothing more is buffered.
+		fn try_next(&mut self) -> Option<T> {
+			match self.0.poll_next(&kio::Waiter::noop()) {
+				Poll::Ready(Ok(Some(value))) => Some(value.value),
+				Poll::Ready(Err(err)) => panic!("read: {err}"),
+				Poll::Ready(Ok(None)) | Poll::Pending => None,
+			}
+		}
+
+		/// The newest buffered state, `None` when nothing is buffered.
+		fn try_last(&mut self) -> Option<T> {
+			let mut last = None;
+			while let Some(value) = self.try_next() {
+				last = Some(value);
+			}
+			last
+		}
+	}
+
+	async fn reader<T: serde::de::DeserializeOwned + Unpin>(
+		broadcast: &moq_net::broadcast::Consumer,
+		name: &str,
+	) -> Reader<T> {
+		Reader::new(
+			broadcast
+				.track(name)
+				.expect("track")
+				.subscribe(None)
+				.await
+				.expect("subscribe"),
+		)
+	}
+
 	/// The latest buffered totals frame.
 	async fn read_totals(broadcast: &moq_net::broadcast::Consumer) -> TotalsFrame {
-		let mut track = subscribe(broadcast, crate::TOTALS).await;
-		let mut last = next_frame(&mut track).await;
-		while let Some(frame) = try_next_frame(&mut track) {
-			last = frame;
-		}
-		serde_json::from_slice(&last.payload).expect("json parse")
+		let track = broadcast
+			.track(crate::TOTALS)
+			.expect("track")
+			.subscribe(None)
+			.await
+			.expect("subscribe");
+		let mut reader = moq_json::snapshot::Consumer::<TotalsFrame>::new(track, Default::default());
+		reader.latest().await.expect("read").expect("frame").value
 	}
 
 	/// The default tier's totals in the latest buffered totals frame.
@@ -1748,10 +1791,9 @@ mod tests {
 		read_totals(broadcast).await.get("").copied().unwrap_or_default()
 	}
 
-	/// Parse a presence frame off a track, `None` once nothing more is buffered.
-	fn try_presence(track: &mut track::Ordered) -> Option<PresenceFrame> {
-		let frame = try_next_frame(track)?;
-		Some(serde_json::from_slice(&frame.payload).expect("json parse"))
+	/// The next presence state off a track, `None` once nothing more is buffered.
+	fn try_presence(track: &mut Reader<PresenceFrame>) -> Option<PresenceFrame> {
+		track.try_next()
 	}
 
 	async fn subscribe(broadcast: &moq_net::broadcast::Consumer, name: &str) -> track::Ordered {
@@ -1762,13 +1804,6 @@ mod tests {
 			.await
 			.expect("subscribe")
 			.ordered()
-	}
-
-	/// The next group's first frame. Stats tracks are one frame per group, so this is
-	/// one published sample.
-	async fn next_frame(track: &mut track::Ordered) -> moq_net::frame::Frame {
-		let mut group = track.next_group().await.expect("ok").expect("group");
-		group.read_frame().await.expect("ok").expect("frame")
 	}
 
 	/// The same, without blocking: `None` once nothing more is buffered.
@@ -1820,17 +1855,12 @@ mod tests {
 			.request_broadcast(".stats/node/sjc", None)
 			.await
 			.expect("resolve");
-		let mut totals = subscribe(&broadcast, crate::TOTALS).await;
+		let mut totals = reader::<TotalsFrame>(&broadcast, crate::TOTALS).await;
 		let mut sent = |bytes: u64| {
 			counters.set_sent_bytes(bytes);
-			let mut last = None;
-			while let Some(frame) = try_next_frame(&mut totals) {
-				last = Some(frame);
-			}
-			last.map(|frame| {
-				let frame: TotalsFrame = serde_json::from_slice(&frame.payload).expect("json parse");
-				frame.get("").expect("the default tier").sessions.wire_tx
-			})
+			totals
+				.try_last()
+				.map(|frame| frame.get("").expect("the default tier").sessions.wire_tx)
 		};
 
 		sent(1);
@@ -2256,13 +2286,13 @@ mod tests {
 
 	/// Subscribe to `label`'s presence track on `broadcast`, driving a tick so
 	/// the producer adopts the request.
-	async fn hold_presence(broadcast: &moq_net::broadcast::Consumer, label: &str) -> track::Ordered {
+	async fn hold_presence(broadcast: &moq_net::broadcast::Consumer, label: &str) -> Reader<PresenceFrame> {
 		let subscribing = broadcast
 			.track(&presence_track(moq_net::Path::new(label).unwrap()))
 			.expect("track")
 			.subscribe(None);
 		drive_tick().await;
-		subscribing.await.expect("held").ordered()
+		Reader::new(subscribing.await.expect("held"))
 	}
 
 	/// A held presence track is cumulative from when it was first held: it
@@ -2353,7 +2383,7 @@ mod tests {
 			tokio::task::yield_now().await;
 		}
 		assert_eq!(tick(), 1, "held");
-		let mut track = subscribing.await.expect("held").ordered();
+		let mut track = Reader::new(subscribing.await.expect("held"));
 		assert_eq!(try_presence(&mut track), Some(PresenceFrame::new()), "held at zero");
 
 		// The label records while held: the same subscription carries it.
@@ -2396,27 +2426,22 @@ mod tests {
 		for subscribing in pending {
 			held.push(subscribing.await.expect("held"));
 		}
-
 	}
 
 	/// Subscribe to `path`'s prefix track on `broadcast`, driving a tick so the
 	/// producer adopts the request.
-	async fn hold_prefix(broadcast: &moq_net::broadcast::Consumer, path: &str) -> track::Ordered {
+	async fn hold_prefix(broadcast: &moq_net::broadcast::Consumer, path: &str) -> Reader<PrefixFrame> {
 		let subscribing = broadcast
 			.track(&prefix_track(moq_net::Path::new(path).unwrap()))
 			.expect("track")
 			.subscribe(None);
 		drive_tick().await;
-		subscribing.await.expect("held").ordered()
+		Reader::new(subscribing.await.expect("held"))
 	}
 
 	/// The latest buffered prefix frame, `None` when nothing is buffered.
-	fn last_prefix(track: &mut track::Ordered) -> Option<PrefixFrame> {
-		let mut last = None;
-		while let Some(frame) = try_next_frame(track) {
-			last = Some(serde_json::from_slice(&frame.payload).expect("json parse"));
-		}
-		last
+	fn last_prefix(track: &mut Reader<PrefixFrame>) -> Option<PrefixFrame> {
+		track.try_last()
 	}
 
 	#[test]
@@ -2616,7 +2641,7 @@ mod tests {
 			tokio::task::yield_now().await;
 		}
 		assert_eq!(tick(), 1, "held");
-		let mut track = subscribing.await.expect("held").ordered();
+		let mut track = Reader::new(subscribing.await.expect("held"));
 		assert_eq!(last_prefix(&mut track), Some(PrefixFrame::new()), "held at zero");
 
 		let _feed = feed(&registry, Tier::default(), "acme/live", true, 1, 7).await;
@@ -2840,13 +2865,9 @@ mod tests {
 				let _held = hold.then(|| {
 					let tick = drain.tick;
 					let stamp = drain.stamp(moq_clock::now());
-					drain.node.adopt_prefix(
-						&drain.report,
-						Path::from_static("room0"),
-						None,
-						tick,
-						stamp,
-					);
+					drain
+						.node
+						.adopt_prefix(&drain.report, Path::from_static("room0"), None, tick, stamp);
 					drain.node.prefixes["room0"].output.snapshot.track.subscribe(None)
 				});
 				drain.collect();

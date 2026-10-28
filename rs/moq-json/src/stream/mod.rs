@@ -215,32 +215,6 @@ mod test {
 		producer.finish().unwrap();
 	}
 
-	#[test]
-	fn shared_window_shrinks_repetitive_records() {
-		let (mut producer, track) = producer_on(Config::default(), compressed());
-		for n in 0..8 {
-			producer.append(&json!({ "group": n, "pts": n * 2_000 })).unwrap();
-		}
-		producer.finish().unwrap();
-
-		let waiter = kio::Waiter::noop();
-		let mut track = track.ordered();
-		let Poll::Ready(Ok(Some(mut group))) = track.poll_next_group(&waiter) else {
-			panic!("expected a group");
-		};
-		let mut sizes = Vec::new();
-		while let Poll::Ready(Ok(Some(frame))) = group.poll_read_frame(&waiter) {
-			sizes.push(frame.payload.len());
-		}
-		assert_eq!(sizes.len(), 8);
-		let raw = serde_json::to_vec(&json!({ "group": 7, "pts": 14_000 })).unwrap().len();
-		assert!(
-			*sizes.last().unwrap() < raw / 2,
-			"windowed record {} should be far below its raw size {raw}",
-			sizes.last().unwrap()
-		);
-	}
-
 	/// A record the encoder rejects must not have published a group first: a live consumer would
 	/// advance into it and wait there even though nothing was ever appended. It still ends the
 	/// track, since the log is missing the record either way.

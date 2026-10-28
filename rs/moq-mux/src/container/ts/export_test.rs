@@ -232,7 +232,7 @@ async fn a_follower_keeps_msf_after_catalog_eof() {
 	let epoch = moq_net::Epoch::mint();
 	let publish = || {
 		let broadcast = origin.create_broadcast("live").unwrap();
-		let mut track = broadcast
+		let track = broadcast
 			.create_track(moq_msf::DEFAULT_NAME, hang::Catalog::default_track_info())
 			.unwrap();
 		let msf = moq_msf::Catalog::<()>::new(Vec::new()).to_json().unwrap();
@@ -263,7 +263,7 @@ async fn a_follower_keeps_msf_after_catalog_eof() {
 	let mut follower = super::Follower::new(export)
 		.unwrap()
 		.with_follow(Duration::from_secs(1));
-	let (broadcast, mut track) = publish();
+	let (broadcast, track) = publish();
 	// Only the MSF catalog exists, so falling back to the default encoding cannot subscribe.
 	tokio::time::timeout(
 		Duration::from_secs(1),

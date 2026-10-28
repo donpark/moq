@@ -2251,9 +2251,8 @@ fn json_stream_publish_consume() {
 	let broadcast = publish_broadcast(origin, path);
 
 	let track_name = b"events";
-	let producer = id(unsafe {
-		moq_publish_json_stream(broadcast, track_name.as_ptr() as *const c_char, track_name.len())
-	});
+	let producer =
+		id(unsafe { moq_publish_json_stream(broadcast, track_name.as_ptr() as *const c_char, track_name.len()) });
 
 	let consume = request_broadcast(origin, path);
 
@@ -6302,9 +6301,7 @@ fn json_tracks_are_advertised_in_the_catalog() {
 		)
 	});
 	let events = b"events";
-	let stream = id(unsafe {
-		moq_publish_json_stream(broadcast, events.as_ptr() as *const c_char, events.len())
-	});
+	let stream = id(unsafe { moq_publish_json_stream(broadcast, events.as_ptr() as *const c_char, events.len()) });
 
 	let catalog = published_catalog(broadcast);
 	let entry = catalog.json.tracks.get("status").expect("snapshot track advertised");

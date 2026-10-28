@@ -868,7 +868,10 @@ mod test {
 		encoder.max_group_bytes = (serde_json::to_vec(&value).unwrap().len() + 500) as u64;
 		assert!(commit(&mut encoder, &value).unwrap().keyframe);
 		let rolled = commit(&mut encoder, &patched).expect("a rolled snapshot");
-		assert!(rolled.keyframe, "a 1 KB patch must not ride in a group with 500 bytes left");
+		assert!(
+			rolled.keyframe,
+			"a 1 KB patch must not ride in a group with 500 bytes left"
+		);
 		assert_eq!(
 			serde_json::from_slice::<Value>(&rolled.payload).unwrap(),
 			patched,

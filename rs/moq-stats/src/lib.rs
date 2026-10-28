@@ -313,7 +313,11 @@ mod tests {
 	fn presence_track_names_round_trip() {
 		for label in ["", "acme", "acme/live", "a.json", "x/presence.json", "publisher", "z"] {
 			let name = presence_track(moq_net::Path::new(label).unwrap());
-			assert_eq!(parse_presence_track(&name), Some(Path::try_from(label).unwrap()), "{name}");
+			assert_eq!(
+				parse_presence_track(&name),
+				Some(Path::try_from(label).unwrap()),
+				"{name}"
+			);
 		}
 
 		// Names no label produces, including ones with an empty segment, which would give

@@ -9,9 +9,9 @@ use crate::consumer::MoqTrackConsumer;
 use crate::consumer::{MoqAnchor, MoqOrder, MoqRange, MoqSubscription};
 use crate::error::{MoqError, MoqProtocolError, MoqProtocolKind};
 use crate::json::{
-	MoqJsonSnapshotConfig, MoqJsonSnapshotConsumer, MoqJsonSnapshotProducer,
-	MoqJsonStreamConsumer, MoqJsonStreamProducer, MoqJsonWindowConfig, MoqJsonWindowConsumer, MoqJsonWindowEvent,
-	MoqJsonWindowProducer, MoqJsonWindowTimed,
+	MoqJsonSnapshotConfig, MoqJsonSnapshotConsumer, MoqJsonSnapshotProducer, MoqJsonStreamConsumer,
+	MoqJsonStreamProducer, MoqJsonWindowConfig, MoqJsonWindowConsumer, MoqJsonWindowEvent, MoqJsonWindowProducer,
+	MoqJsonWindowTimed,
 };
 use crate::media::*;
 use crate::session::{
@@ -1262,21 +1262,16 @@ async fn data_writes_preserve_optional_timestamps() {
 			let payload = b"{\"n\":1}";
 			match kind {
 				"json snapshot" => {
-					let producer = MoqJsonSnapshotProducer::new(
-						&broadcast,
-						&track,
-						MoqJsonSnapshotConfig { deltas: false },
-					)
-					.unwrap();
+					let producer =
+						MoqJsonSnapshotProducer::new(&broadcast, &track, MoqJsonSnapshotConfig { deltas: false })
+							.unwrap();
 					producer
 						.update(String::from_utf8(payload.to_vec()).unwrap(), timestamp_us)
 						.unwrap();
 					producer.finish().unwrap();
 				}
 				"json stream" => {
-					let producer =
-						MoqJsonStreamProducer::new(&broadcast, &track)
-							.unwrap();
+					let producer = MoqJsonStreamProducer::new(&broadcast, &track).unwrap();
 					producer
 						.append(String::from_utf8(payload.to_vec()).unwrap(), timestamp_us)
 						.unwrap();
@@ -1490,8 +1485,7 @@ async fn json_demand() {
 	assert_eq!(stream_demand.name(), "events");
 	assert!(!snapshot_demand.wanted().is_some());
 
-	let snapshot_consumer =
-		MoqJsonSnapshotConsumer::new(&*subscribe(&broadcast, "status").await).unwrap();
+	let snapshot_consumer = MoqJsonSnapshotConsumer::new(&*subscribe(&broadcast, "status").await).unwrap();
 	let stream_consumer = MoqJsonStreamConsumer::new(&*subscribe(&broadcast, "events").await).unwrap();
 
 	tokio::time::timeout(TIMEOUT, snapshot_demand.until_wanted())
@@ -1868,10 +1862,7 @@ async fn json_consumer_takes_an_unread_track() {
 	let unread = subscribe(&broadcast, "events").await;
 	MoqJsonStreamConsumer::new(&unread).unwrap();
 	assert!(matches!(unread.recv_group().await, Err(MoqError::Cancelled)));
-	assert!(matches!(
-		MoqJsonStreamConsumer::new(&unread),
-		Err(MoqError::Closed)
-	));
+	assert!(matches!(MoqJsonStreamConsumer::new(&unread), Err(MoqError::Closed)));
 }
 
 #[tokio::test]
@@ -4318,11 +4309,7 @@ async fn data_children(
 			MoqJsonSnapshotConfig { deltas: true },
 		)
 		.unwrap(),
-		MoqJsonStreamProducer::new(
-			broadcast,
-			&track("json-stream"),
-		)
-		.unwrap(),
+		MoqJsonStreamProducer::new(broadcast, &track("json-stream")).unwrap(),
 		MoqJsonWindowProducer::new(
 			&track("json-window"),
 			MoqJsonWindowConfig {
@@ -4344,8 +4331,7 @@ async fn data_children(
 #[tokio::test(start_paused = true)]
 async fn closing_a_broadcast_ends_its_open_data_tracks() {
 	let broadcast = MoqBroadcastProducer::new().unwrap();
-	let ((json_snapshot, json_stream, json_window), readers) =
-		data_children(&broadcast).await;
+	let ((json_snapshot, json_stream, json_window), readers) = data_children(&broadcast).await;
 	broadcast.close().unwrap();
 	assert_left(readers).await;
 
@@ -7496,11 +7482,8 @@ async fn json_tracks_are_advertised_in_the_catalog() {
 		MoqJsonSnapshotConfig { deltas: true },
 	)
 	.unwrap();
-	let stream = MoqJsonStreamProducer::new(
-		&broadcast,
-		&broadcast.publish_track("events".into(), None).unwrap(),
-	)
-	.unwrap();
+	let stream =
+		MoqJsonStreamProducer::new(&broadcast, &broadcast.publish_track("events".into(), None).unwrap()).unwrap();
 
 	let catalog = published_catalog(&broadcast);
 	let entry = catalog.json.tracks.get("status").expect("snapshot track advertised");

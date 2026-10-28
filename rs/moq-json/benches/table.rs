@@ -67,7 +67,10 @@ impl Table {
 
 /// A stats track's encoder with and without merge-patch deltas.
 fn configs() -> [(&'static str, Config); 2] {
-	[("deltas", Config::default()), ("snapshots", Config::default().with_deltas(false))]
+	[
+		("deltas", Config::default()),
+		("snapshots", Config::default().with_deltas(false)),
+	]
 }
 
 fn table(c: &mut Criterion) {

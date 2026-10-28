@@ -860,7 +860,8 @@ impl Consume {
 				driver
 					.watch(async move {
 						let track = broadcast.track(&name)?.subscribe(None).await?;
-						let consumer = moq_json::snapshot::Consumer::<serde_json::Value>::new(track, Default::default());
+						let consumer =
+							moq_json::snapshot::Consumer::<serde_json::Value>::new(track, Default::default());
 						Self::run_json_snapshot(on_value, consumer, close).await
 					})
 					.await

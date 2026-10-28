@@ -59,7 +59,11 @@ impl<T: serde::Serialize> ReportTrack<T> {
 
 	/// Publish `value`, unless nobody subscribes.
 	fn update(&mut self, value: &T) {
-		if self.track.as_ref().is_some_and(|track| track.demand().wanted().is_some()) {
+		if self
+			.track
+			.as_ref()
+			.is_some_and(|track| track.demand().wanted().is_some())
+		{
 			self.write(value);
 		}
 	}
