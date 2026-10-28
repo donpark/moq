@@ -99,6 +99,14 @@ pub struct Config {
 	/// detection and shortest-path routing.
 	pub hop: Hop,
 
+	/// Longest hop path a session using this origin accepts or forwards (default 32).
+	///
+	/// Applies to moq-lite-03+ hop paths and the negotiated MoQ Cluster extension on
+	/// moq-transport. A forwarded path counts this origin's own hop too, including
+	/// when the receiving peer reconstructs that hop from the announce handshake.
+	/// Protocols without a hop path cannot reveal or bound the depth they hide.
+	pub max_hops: HopLimit,
+
 	/// The cache pool broadcasts under this origin charge their groups into. It flows
 	/// down the ownership chain (origin -> broadcast -> track -> group): a track opens
 	/// an account against it, and its groups charge through that. It has no byte target
@@ -161,6 +169,7 @@ impl Default for Config {
 		let pool = cache::Pool::new(cache::Config::default().with_expiry(cache::DEFAULT_EXPIRY));
 		Self {
 			hop: Hop::random(),
+			max_hops: HopLimit::default(),
 			pool,
 			cache_duration: Duration::MAX,
 			default_max_age: track::DEFAULT_MAX_AGE,
@@ -221,6 +230,32 @@ where
 /// diameter; appending past this limit returns [`InvalidHop::TooMany`] rather than
 /// silently truncating.
 pub(crate) const MAX_HOPS: usize = 32;
+
+/// The longest advertised hop path an origin accepts or forwards, from 1 to 32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HopLimit(usize);
+
+impl HopLimit {
+	/// A hop-path cap from 1 to 32, or `None` outside that range.
+	pub const fn new(max: usize) -> Option<Self> {
+		if max == 0 || max > MAX_HOPS {
+			None
+		} else {
+			Some(Self(max))
+		}
+	}
+
+	/// The maximum number of hops in an advertised path.
+	pub const fn get(self) -> usize {
+		self.0
+	}
+}
+
+impl Default for HopLimit {
+	fn default() -> Self {
+		Self(MAX_HOPS)
+	}
+}
 
 /// Bounded, loop-free list of [`Hop`] entries: the hop chain of a broadcast.
 ///
@@ -1127,12 +1162,18 @@ struct Horizon {
 	exclude: Option<Hop>,
 	/// Hide the routes that entered from a cluster peer ([`Consumer::local`]).
 	local: bool,
+	/// Hide the routes with no room for our hop under this cap, because this reader
+	/// forwards them ([`Consumer::forwardable`]). Selection then falls back to a
+	/// shorter route instead of withdrawing a prefix an in-cap path still reaches.
+	max_hops: Option<HopLimit>,
 }
 
 impl Horizon {
 	/// Whether `entry` may be observed or served through this horizon.
 	fn admits(&self, entry: &RouteEntry) -> bool {
-		!(self.local && entry.peer) && entry.visible_to(self.exclude)
+		!(self.local && entry.peer)
+			&& entry.visible_to(self.exclude)
+			&& self.max_hops.is_none_or(|max| entry.hops.len() < max.get())
 	}
 
 	/// This horizon as it applies to the routes covering `path`: an excluded peer
@@ -1144,10 +1185,17 @@ impl Horizon {
 	/// front on its next request, while what it already reads stays on the plain
 	/// front. That cannot loop, since the peer serves our requests through its own
 	/// split horizon, which never routes back through us.
+	///
+	/// The hop cap bounds what is advertised, not what serves a request, so it never
+	/// applies here.
 	fn effective(self, routes: &RouteTable, path: &Path) -> Self {
-		match self.exclude {
-			Some(peer) if routes.covering(path).any(|entry| !entry.visible_to(Some(peer))) => self,
-			_ => Self { exclude: None, ..self },
+		let horizon = Self { max_hops: None, ..self };
+		match horizon.exclude {
+			Some(peer) if routes.covering(path).any(|entry| !entry.visible_to(Some(peer))) => horizon,
+			_ => Self {
+				exclude: None,
+				..horizon
+			},
 		}
 	}
 }
@@ -1582,6 +1630,7 @@ pub struct Producer {
 	// Identity for this origin. Appended to route hops when re-announcing so
 	// downstream relays can detect loops and prefer the shortest path.
 	hop: Hop,
+	max_hops: HopLimit,
 
 	// The absolute patterns this handle may publish under.
 	scope: OriginScope,
@@ -1638,6 +1687,7 @@ impl Producer {
 		let pool = config.pool.clone();
 		let producer = Self {
 			hop: config.hop,
+			max_hops: config.max_hops,
 			scope: scope.clone(),
 			root: PathOwned::default(),
 			shared: shared.clone(),
@@ -1690,6 +1740,7 @@ impl Producer {
 	pub fn config(&self) -> Config {
 		Config {
 			hop: self.hop,
+			max_hops: self.max_hops,
 			pool: self.pool.clone(),
 			cache_duration: self.cache_duration,
 			default_max_age: self.default_max_age,
@@ -1708,6 +1759,11 @@ impl Producer {
 		self.default_max_age
 	}
 
+	// Sessions enforce the hop cap configured once on the origin.
+	pub(crate) fn max_hops(&self) -> HopLimit {
+		self.max_hops
+	}
+
 	/// A producer with *no* allowed prefixes: it can't publish anything and
 	/// advertises no subscribe interest (its `allowed()` is empty, so the
 	/// subscriber issues no ANNOUNCE_PLEASE). Used to fill an unset session half
@@ -1718,6 +1774,7 @@ impl Producer {
 		let (tasks, _) = TaskSet::new();
 		Self {
 			hop,
+			max_hops: HopLimit::default(),
 			scope: OriginScope::empty(),
 			root: PathOwned::default(),
 			shared: kio::Shared::new(OriginState::new(DEFAULT_UPDATE_HOLD)),
@@ -1913,6 +1970,7 @@ impl Producer {
 		let scope = self.scope.narrow(&rooted).ok_or(Error::Unauthorized)?;
 		Ok(Producer {
 			hop: self.hop,
+			max_hops: self.max_hops,
 			scope,
 			root,
 			shared: self.shared.clone(),
@@ -4159,6 +4217,7 @@ impl Consume<track::Consumer> for track::Consumer {
 pub struct Consumer {
 	// Identity of the origin this consumer was derived from.
 	hop: Hop,
+	max_hops: HopLimit,
 	scope: OriginScope,
 
 	// A prefix that is automatically stripped from all paths.
@@ -4201,6 +4260,7 @@ impl Consumer {
 	fn from_producer(producer: &Producer, stats: stats::Session) -> Self {
 		Self {
 			hop: producer.hop,
+			max_hops: producer.max_hops,
 			scope: producer.scope.clone(),
 			root: producer.root.clone(),
 			shared: producer.shared.clone(),
@@ -4228,6 +4288,14 @@ impl Consumer {
 	/// peer.
 	pub(crate) fn excluding(mut self, peer: Hop) -> Self {
 		self.horizon.exclude = Some(peer);
+		self
+	}
+
+	/// A clone whose announcements skip the routes this origin cannot forward: a
+	/// chain already at [`Config::max_hops`] has no room for our hop. Sessions whose
+	/// wire carries the hop path apply this to the routes they advertise.
+	pub(crate) fn forwardable(mut self) -> Self {
+		self.horizon.max_hops = Some(self.max_hops);
 		self
 	}
 
@@ -5087,6 +5155,53 @@ mod tests {
 			.iter()
 			.map(|prefix| Pattern::subtree(prefix).unwrap())
 			.collect()
+	}
+
+	#[test]
+	fn hop_limit_refuses_values_outside_the_wire_bound() {
+		for invalid in [0, 33, usize::MAX] {
+			assert_eq!(HopLimit::new(invalid), None);
+		}
+		for valid in [1, 6, 32] {
+			assert_eq!(HopLimit::new(valid).unwrap().get(), valid);
+		}
+		assert_eq!(HopLimit::default().get(), 32);
+		let config = Config {
+			max_hops: HopLimit::new(6).unwrap(),
+			..Default::default()
+		};
+		let (producer, _driver) = Producer::new(config);
+		let scoped = producer.scope("room", &Patterns::from(Pattern::all())).unwrap();
+		assert_eq!(scoped.config().max_hops.get(), 6);
+		assert_eq!(scoped.consume().forwardable().horizon.max_hops, HopLimit::new(6));
+	}
+
+	/// A forwarding cursor skips a route with no room for our hop and announces the
+	/// best one that has room, while requests still resolve through the full route.
+	#[tokio::test]
+	async fn forwardable_caps_announcements_but_not_requests() {
+		let producer = Config {
+			max_hops: HopLimit::new(2).unwrap(),
+			..Config::new(origin(1))
+		}
+		.produce();
+		let mut plain = producer.consume().announced();
+		let mut forwarded = producer.consume().forwardable().announced();
+
+		let _full = producer
+			.dynamic("room", Route::default().with_hops(hops(&[7, 8])).with_cost(1))
+			.unwrap();
+		assert_eq!(plain.assert_next_active("room").hops, hops(&[7, 8]));
+		forwarded.assert_next_wait();
+
+		let pending = producer.consume().forwardable().request_broadcast("room/alice");
+		assert!(pending.now_or_never().is_none(), "the cap must not refuse a request");
+
+		let _short = producer
+			.dynamic("room", Route::default().with_hops(hops(&[9])).with_cost(50))
+			.unwrap();
+		assert_eq!(forwarded.assert_next_active("room").hops, hops(&[9]));
+		plain.assert_next_wait();
 	}
 
 	#[test]

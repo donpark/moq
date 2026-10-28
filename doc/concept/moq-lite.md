@@ -93,6 +93,10 @@ puts a random ID, fresh per connection, in front of it to name the publisher. A 
 anonymous hop at any depth ranks below every fully identified route, whatever
 the costs say; among anonymous routes, cost keeps ordering.
 
+A relay operator can lower the [hop-path cap](/bin/relay/cluster#topology) to
+limit the detours explored after a withdrawal. It drops longer paths while
+preserving route selection among those within the cap.
+
 On moq-lite 07, an announcement may copy the head of its path and the tail of
 its relay chain from one still live on the same stream, so many broadcasts
 from a few origins behind the same relays stop repeating those bytes. Rust

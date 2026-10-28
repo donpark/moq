@@ -553,6 +553,15 @@ pub struct Config {
 	)]
 	pub id: Option<u64>,
 
+	/// Longest hop path accepted or forwarded, from 1 to 32 (default 32).
+	#[usage(
+		name = "cluster-max-hops",
+		long = "cluster-max-hops",
+		env = "MOQ_CLUSTER_MAX_HOPS",
+		setting = "cluster.max_hops"
+	)]
+	pub max_hops: Option<usize>,
+
 	/// Connect to one or more other cluster nodes. Each entry is a full URL, e.g.
 	/// `https://host/?jwt=TOKEN`, or an object with `url`, `cost`, `egress`,
 	/// and `token`; see [`Peer`]. A bare host or `host:port` is refused; pass the
@@ -992,6 +1001,9 @@ impl Cluster {
 		// keeping the first entry when dials spawn.
 		parse_peer_list(config.connect.clone(), None).context("invalid --cluster-connect peer list")?;
 		let mut origin_config = origin::Config::new(id);
+		if let Some(max) = config.max_hops {
+			origin_config.max_hops = origin::HopLimit::new(max).context("--cluster-max-hops must be from 1 to 32")?;
+		}
 		if let Some(cache) = cache {
 			origin_config.pool = cache.pool;
 			origin_config.cache_duration = cache.duration;
@@ -1951,6 +1963,31 @@ mod tests {
 
 	fn new_cluster(config: Config) -> anyhow::Result<Cluster> {
 		Cluster::new(Options::new(config))
+	}
+
+	#[tokio::test]
+	async fn cluster_hop_limit_reaches_the_shared_origin() {
+		assert_eq!(
+			new_cluster(Config::default()).unwrap().origin.config().max_hops.get(),
+			32
+		);
+		for cap in [1, 6, 32] {
+			let cluster = new_cluster(Config {
+				max_hops: Some(cap),
+				..Default::default()
+			})
+			.unwrap();
+			assert_eq!(cluster.origin.config().max_hops.get(), cap);
+		}
+		for cap in [0, 33, usize::MAX] {
+			let err = new_cluster(Config {
+				max_hops: Some(cap),
+				..Default::default()
+			})
+			.err()
+			.unwrap();
+			assert!(err.to_string().contains("--cluster-max-hops"), "{err}");
+		}
 	}
 
 	/// A grant's mount reaches the target for subscribe and refuses publish, both

@@ -320,6 +320,9 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 			tracing::debug!(route = %self.log_path(&path), "dropping announce; no room to stamp the chain");
 			return Ok(false);
 		}
+		if self.exceeds_hop_limit(&path, &hops) {
+			return Ok(false);
+		}
 
 		tracing::debug!(route = %self.log_path(&path), hops = hops.len(), "announce");
 
@@ -335,6 +338,16 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 		announced.attach(path, route, dynamic);
 
 		Ok(true)
+	}
+
+	/// Whether a received chain, as stamped, is longer than the origin's hop limit.
+	/// Lite01/02 carry no path, so their depth is hidden and never capped.
+	fn exceeds_hop_limit(&self, path: &PathOwned, hops: &crate::Hops) -> bool {
+		if matches!(self.version, Version::Lite01 | Version::Lite02) || hops.len() <= self.origin.max_hops().get() {
+			return false;
+		}
+		tracing::debug!(route = %self.log_path(path), hops = hops.len(), "dropping announce beyond hop limit");
+		true
 	}
 
 	/// The route to announce for a prefix this peer advertised, charging our
@@ -413,7 +426,7 @@ impl<S: crate::transport::poll::Session> Subscriber<S> {
 
 		// Named by this connection's stamp when the chain names no publisher, exactly as
 		// the announce was, so a restart of the same unnamed publisher stays in place.
-		if hops.stamp(self.stamp).is_err() {
+		if hops.stamp(self.stamp).is_err() || self.exceeds_hop_limit(&path, &hops) {
 			announced.declined(path);
 			return Ok(false);
 		}

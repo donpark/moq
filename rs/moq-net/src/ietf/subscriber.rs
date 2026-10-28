@@ -641,7 +641,8 @@ where
 	/// A negotiated peer supplies the path and cost, so the route is what the mesh
 	/// actually knows: the full chain, and the accumulated cost plus this link's price.
 	/// A path starting with 0 gets this connection's stamp in front of it; the 0s stay. An advertisement whose path already contains our own Hop ID looped back,
-	/// and neither forwarding it nor subscribing through it is safe.
+	/// and neither forwarding it nor subscribing through it is safe. One longer than
+	/// the origin's hop limit, stamp included, is discarded too.
 	fn route(&self, advert: Option<&cluster::Advert>, peer: &cluster::Peer) -> Option<Advertised> {
 		let Some(advert) = advert else {
 			return Some(Advertised {
@@ -657,6 +658,9 @@ where
 			.route(cluster::link_cost(self.cost, peer))
 			.with_via(self.via(peer));
 		route.hops.stamp(self.stamp).ok()?;
+		if route.hops.len() > self.origin.max_hops().get() {
+			return None;
+		}
 		Some(Advertised { route })
 	}
 
