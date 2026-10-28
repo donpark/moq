@@ -135,4 +135,3 @@ The historical samples locate candidates; they are not controlled benchmarks.
 - [Replay full-run failures against the selected gate](/quest/m0/ci/select-audit.md) - every dependency edge `just ci` misses is found and fixed with a test
 - [First shared FFI release](/quest/m0/ci/nightly-ffi-reuse.md) - condition: the backport merges and the next `moq-ffi-v*` tag runs `Release FFI`; verify the wrappers
 - [Fewer BTreeMap instantiations](/quest/m0/ci/btree-keys.md) - moq-net shares BTreeMap key and value types, kept only if its CPU time drops
-- [Halve the slowest tests' CPU](/quest/m0/ci/slow-tests.md) - the slowest 1% of tests take under half their 289 CPU-seconds, with coverage kept
