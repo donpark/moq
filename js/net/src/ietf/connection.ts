@@ -262,8 +262,7 @@ export class Connection implements Established {
 			}
 			case SubscribeUpdate.id: {
 				// REQUEST_UPDATE (0x02) is a follow-up, not a valid initial message
-				stream.abort(new Error("unexpected REQUEST_UPDATE as initial message"));
-				break;
+				throw new ProtocolViolation("unexpected REQUEST_UPDATE as initial message");
 			}
 			// Publisher handles incoming requests
 			case Subscribe.id: {
@@ -310,11 +309,9 @@ export class Connection implements Established {
 				// SUBSCRIBE_NAMESPACE there, and the message alone does not say which.
 				const legacy = this.#session.version === Version.DRAFT_14 || this.#session.version === Version.DRAFT_15;
 				if (this.#solicit !== undefined && !legacy) {
-					console.error(
+					throw new ProtocolViolation(
 						`unsolicited publish_namespace from a peer that implements MoQ Solicit: broadcast=${msg.trackNamespace}`,
 					);
-					this.#close();
-					break;
 				}
 
 				await this.#subscriber.runPublishNamespace(msg, stream);
