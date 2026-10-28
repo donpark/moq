@@ -775,9 +775,16 @@ impl<F: Container> Consumer<F> {
 			let idx = self
 				.pending
 				.partition_point(|g| g.group.sequence < reader.group.sequence);
-			// Arrivals only move forward, so the groups below this one keep their earliest arrival.
+			// Each group is late from the earliest arrival among it and the groups past it. A drained
+			// backlog comes in sequence order, not arrival order, so an arrival can lower those below it.
 			if let Some(next) = self.pending.get(idx) {
 				reader.late = reader.late.min(next.late);
+			}
+			for below in self.pending.range_mut(..idx).rev() {
+				if below.late <= reader.late {
+					break;
+				}
+				below.late = reader.late;
 			}
 			self.pending.insert(idx, reader);
 		}
@@ -4468,6 +4475,37 @@ mod tests {
 			});
 		}
 		assert_eq!(reads, ["frame 0 0", "frame 1 10000", "gap", "end 3"]);
+	}
+
+	/// A joining reader drains the backlog in sequence order, not arrival order, so a group can land
+	/// before the one below it is pulled: the hole before that lower group is late from the earlier one.
+	#[tokio::test(start_paused = true)]
+	async fn a_hole_in_a_drained_backlog_is_late_from_the_earliest_arrival_past_it() {
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let marker = |track: &mut moq_net::track::Producer, sequence: u64| {
+			let mut group = track.create_group(moq_net::group::Info { sequence }).unwrap();
+			group.write_frame(ts(sequence * 10_000), Bytes::new()).unwrap();
+			group.finish().unwrap();
+		};
+		write_group(&mut track, 0, &[ts(0)]);
+		marker(&mut track, 5);
+		tokio::time::advance(Duration::from_millis(900)).await;
+		marker(&mut track, 3);
+		tokio::time::advance(Duration::from_millis(100)).await;
+
+		let mut consumer = container_max_delay_only(track.subscribe(None), Duration::from_millis(500));
+		let waiter = kio::Waiter::noop();
+		let mut reads = Vec::new();
+		while let Poll::Ready(read) = consumer.poll_read(&waiter) {
+			reads.push(match read.unwrap() {
+				Some(Read::Frame { group, .. }) => format!("frame {group}"),
+				Some(Read::Gap { .. }) => "gap".to_string(),
+				Some(Read::End { group, .. }) => format!("end {group}"),
+				None => break,
+			});
+		}
+		// Group 5 landed a second ago, so the holes before groups 3 and 5 both expired.
+		assert_eq!(reads, ["frame 0", "gap", "end 3", "gap", "end 5"]);
 	}
 
 	/// No cap is too small to read through: the cursor's group and one successor are always pulled, so

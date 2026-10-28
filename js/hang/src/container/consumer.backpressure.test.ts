@@ -447,6 +447,36 @@ test("Consumer raises a malformed frame in a head promoted under pressure", asyn
 	}
 });
 
+test("Consumer raises a malformed group an age skip passes after the track finished", async () => {
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format: new Format("data"),
+		maxDelay: Milli(500),
+	});
+	try {
+		const first = track.createGroup(0);
+		write(first, 0);
+		first.finish();
+		const malformed = track.createGroup(1);
+		const later = track.createGroup(2);
+		track.finish();
+		expect(await within(consumer.next())).toMatchObject({ kind: "frame", group: 0 });
+		await flush();
+
+		// Group 1 holds a valid frame then a malformed one, and group 2 starts past the max delay, so the
+		// next read's decode skips group 1 for its age.
+		write(malformed, 10_000);
+		malformed.writeFrame({ payload: new Uint8Array([0x80]), timestamp: Time.Timestamp.now() });
+		write(later, 2_000_000);
+		await expect(within(consumer.next())).rejects.toThrow("buffer too short");
+	} finally {
+		consumer.close();
+		track.close();
+		warn.mockRestore();
+	}
+});
+
 test("Consumer reads a finished marker group's end before skipping under pressure", async () => {
 	const warn = spyOn(console, "warn").mockImplementation(() => {});
 	const track = new Track.Producer("test");

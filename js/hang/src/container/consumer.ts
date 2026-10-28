@@ -247,9 +247,11 @@ export class Consumer {
 				// This is used to cancel old groups.
 				let index = this.#groups.findIndex((other) => other.consumer.sequence > consumer.sequence);
 				if (index === -1) index = this.#groups.length;
-				// Arrivals only move forward, so the groups below this one keep their earliest arrival.
+				// Each group is late from the earliest arrival among it and the groups past it. A drained
+				// backlog comes in sequence order, not arrival order, so an arrival can lower those below it.
 				const next = this.#groups.at(index);
 				if (next && next.late < group.late) group.late = next.late;
+				for (let i = index - 1; i >= 0 && this.#groups[i].late > group.late; i--) this.#groups[i].late = group.late;
 				this.#groups.splice(index, 0, group);
 				// Group overhead alone can fill the max buffer, past which next() moves on from a stalled head.
 				if (this.#full()) {
@@ -651,6 +653,8 @@ export class Consumer {
 			if (this.#error) throw this.#error;
 			// Decode what has arrived, so every decision below sees it.
 			this.#look();
+			// Its skips can raise a fault, which a finished track's settled `#closed` cannot carry.
+			if (this.#error) throw this.#error;
 
 			const ended = this.#closed.peek();
 			if (this.#groups[0]?.consumer.sequence === this.#active || this.#groups.length === 0) {
