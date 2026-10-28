@@ -1099,11 +1099,17 @@ mod tests {
 		let mut window = Window::new(&[Range::groups(0..2), Range::groups(4..6)], None, &Untimed).unwrap();
 		let accounted = rangemap::RangeSet::from_iter([0..1, 4..6]);
 		assert!(window.covered_by(4, None, &accounted));
-		assert!(!window.covered_by(0, None, &accounted), "group 1 is owed below the old floor");
+		assert!(
+			!window.covered_by(0, None, &accounted),
+			"group 1 is owed below the old floor"
+		);
 
 		let accounted = rangemap::RangeSet::from_iter([0..2, 4..5]);
 		assert!(window.covered_by(0, Some(5), &accounted));
-		assert!(!window.covered_by(0, None, &accounted), "group 5 is owed past the old cap");
+		assert!(
+			!window.covered_by(0, None, &accounted),
+			"group 5 is owed past the old cap"
+		);
 		assert!(window.covered_by(1, Some(5), &accounted), "a raised floor resumes");
 	}
 

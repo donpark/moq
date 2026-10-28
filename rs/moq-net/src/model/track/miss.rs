@@ -214,7 +214,9 @@ impl Misses {
 				return Some(slot.serving().clone());
 			}
 			self.filled.remove(&sequence);
-			self.release(&RangeSet::from_iter([sequence..sequence + 1]));
+			let mut lost = RangeSet::new();
+			lost.insert(sequence..sequence + 1);
+			self.release(&lost);
 			self.give_up(sequence..sequence + 1, given_up);
 		}
 	}
@@ -223,7 +225,9 @@ impl Misses {
 	/// wanted, or nothing does.
 	pub fn take_filled(&mut self, sequence: u64) {
 		if self.filled.remove(&sequence) {
-			self.release(&RangeSet::from_iter([sequence..sequence + 1]));
+			let mut lost = RangeSet::new();
+			lost.insert(sequence..sequence + 1);
+			self.release(&lost);
 		}
 	}
 
@@ -288,7 +292,9 @@ impl Misses {
 			if lowest < from {
 				self.filled = self.filled.split_off(&from);
 				self.wanted.remove(0..from);
-				self.release(&RangeSet::from_iter([0..from]));
+				let mut below = RangeSet::new();
+				below.insert(0..from);
+				self.release(&below);
 			}
 			return;
 		}

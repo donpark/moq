@@ -1944,7 +1944,12 @@ fn bench_range_filling(c: &mut Criterion) {
 	}
 	for readers in [8, 64] {
 		for ranges in SERVED_RANGES {
-			sweep(readers, ranges, 8, BenchmarkId::new(format!("span_8/{readers}r"), ranges));
+			sweep(
+				readers,
+				ranges,
+				8,
+				BenchmarkId::new(format!("span_8/{readers}r"), ranges),
+			);
 		}
 	}
 	group.finish();
