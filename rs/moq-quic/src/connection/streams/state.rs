@@ -152,6 +152,8 @@ pub(crate) struct StreamsState {
 	/// Receive streams whose reader may progress without new credit, which holds eviction off:
 	/// every such stream, and possibly some that no longer are, trimmed by the stuck pass
 	pub(super) unlooked: FxHashSet<StreamId>,
+	/// A stuck pass waited on a lease out with its reader, so handing it back reruns the pass
+	pub(super) stuck_waiting: bool,
 	/// Credit still held by evicted readers that have not stopped their streams, which holds
 	/// further eviction off
 	pub(super) evicted_held: u64,
@@ -226,6 +228,7 @@ impl StreamsState {
 			evicted: 0,
 			peak_spent: 0,
 			unlooked: FxHashSet::default(),
+			stuck_waiting: false,
 			evicted_held: 0,
 			#[cfg(test)]
 			scans: 0,

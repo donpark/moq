@@ -336,7 +336,9 @@ impl Stream<'_> {
 	/// may have been stuck on this lease.
 	pub fn restore(&mut self, lease: Lease) -> ShouldTransmit {
 		self.put_back(lease);
-		ShouldTransmit(self.unstick())
+		// Only a stuck pass that waited reruns: a reader handing back what it looked at is not
+		// stuck itself, and one that is waits for more with its next lease.
+		ShouldTransmit(self.state.stuck_waiting && self.unstick())
 	}
 
 	/// Hand a lease back, returning the connection credit of every byte read from it or from an
@@ -539,6 +541,7 @@ impl StreamsState {
 	/// Returns `None` if nothing was evicted, or whether to transmit the `MAX_DATA` the evictions
 	/// freed; each evicted stream's reader is woken by a [`StreamEvent::Readable`].
 	pub(super) fn evict_if_stuck(&mut self) -> Option<ShouldTransmit> {
+		self.stuck_waiting = false;
 		if self.local_max_data > self.data_recvd {
 			return None;
 		}
@@ -589,12 +592,14 @@ impl StreamsState {
 			{
 				self.scans += 1;
 			}
-			let waiting = self
+			let recv = self
 				.recv
 				.get(&id)
 				.and_then(|slot| slot.as_ref()?.as_open_recv())
-				.is_some_and(|recv| !recv.stopped && unlooked(recv.unread_credit(), &recv.lease));
-			if waiting {
+				.filter(|recv| !recv.stopped && unlooked(recv.unread_credit(), &recv.lease));
+			if let Some(recv) = recv {
+				// Nothing else reruns the pass once the lease comes back.
+				self.stuck_waiting = recv.lease.out;
 				found = true;
 				break;
 			}
