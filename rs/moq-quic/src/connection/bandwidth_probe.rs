@@ -66,8 +66,9 @@ pub(super) enum Ready {
 	/// Not probing, or nothing in flight to resend: the application is all that limits the
 	/// sender
 	Idle,
-	/// Held back by the target or by the inflight the controller allows a probe, which limit
-	/// the sender as pacing does; a held-back pace ends at the instant given
+	/// Held back by the target, or once an attempt has begun by the inflight the controller
+	/// allows a probe, which limit the sender as pacing does; a held-back pace ends at the
+	/// instant given
 	Blocked(Option<Instant>),
 	/// Send one
 	Send,
@@ -177,6 +178,12 @@ impl Connection {
 			return Ready::Idle;
 		}
 		if self.path.in_flight.bytes + bytes > inflight {
+			// Before the first duplicate, media alone past the bound, as when another flow's queue
+			// inflates the round trip over BBR.min_rtt, is all the sender has: taking its samples
+			// as the path's would age BBR3's model down to the media
+			if self.bandwidth_probe.attempt.is_none() {
+				return Ready::Idle;
+			}
 			return Ready::Blocked(None);
 		}
 		let mtu = self.path.current_mtu();
@@ -213,6 +220,12 @@ impl Connection {
 			}
 		}
 		found.is_some()
+	}
+
+	/// Whether the last transmit reported the sender application-limited
+	#[cfg(test)]
+	pub(crate) fn app_limited(&self) -> bool {
+		self.app_limited
 	}
 
 	/// When each probe packet still in flight was sent, and the streams it resends data of
