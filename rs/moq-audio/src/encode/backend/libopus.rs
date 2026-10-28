@@ -3,8 +3,8 @@
 use bytes::Bytes;
 use unsafe_libopus::{
 	OPUS_APPLICATION_AUDIO, OPUS_GET_BITRATE_REQUEST, OPUS_GET_LOOKAHEAD_REQUEST, OPUS_OK, OPUS_RESET_STATE,
-	OPUS_SET_BITRATE_REQUEST, OPUS_SET_DTX_REQUEST, OpusEncoder, opus_encode_float, opus_encoder_create,
-	opus_encoder_ctl_impl, opus_encoder_destroy, varargs,
+	OPUS_SET_BITRATE_REQUEST, OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+	OpusEncoder, opus_encode_float, opus_encoder_create, opus_encoder_ctl_impl, opus_encoder_destroy, varargs,
 };
 
 use super::Backend;
@@ -70,6 +70,13 @@ impl Libopus {
 
 		if let Some(bitrate) = config.bitrate {
 			backend.set_rate(bitrate.as_bps())?;
+		}
+		if config.fec {
+			backend.set_ctl(OPUS_SET_INBAND_FEC_REQUEST, 1, "OPUS_SET_INBAND_FEC")?;
+			// Without an expected loss rate libopus writes no forward error copy
+			// at all, leaving the knob half-wired: the copy needs something to
+			// allocate against. 10% is the conservative speech default.
+			backend.set_ctl(OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10, "OPUS_SET_PACKET_LOSS_PERC")?;
 		}
 		backend.set_ctl(OPUS_SET_DTX_REQUEST, i32::from(config.dtx), "OPUS_SET_DTX")?;
 

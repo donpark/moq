@@ -198,6 +198,56 @@ impl Backend for Libopus {
 		Ok(Decoded { samples: out, activity })
 	}
 
+	/// Recover one lost packet from `next`'s in-band forward error copy when it
+	/// has one, conceal when it does not (and when `next` is `None`): libopus
+	/// conceals when the `decode_fec` request finds no copy, so one call covers
+	/// both. The copy decodes at the reduced rate the sender coded it at.
+	/// Classified as the loss it covers rather than as `next`, whose own
+	/// activity says nothing about the frame before it.
+	fn recover(&mut self, next: Option<&[u8]>) -> Result<Decoded, Error> {
+		let channels = self.layout.channels() as usize;
+		let frame_size = self.last_frame_size.ok_or_else(|| {
+			Error::Decode("opus packet lost before any packet decoded, so no length to conceal".into())
+		})?;
+		let (packet, fec) = match next {
+			Some(next) if !next.is_empty() => (next, 1),
+			_ => (&[][..], 0),
+		};
+		let mut out = vec![0.0f32; frame_size * channels];
+		// SAFETY: `inner` owns a live OpusMSDecoder; packet/out slices are bounded by
+		// the lengths we pass.
+		let samples = unsafe {
+			opus_multistream_decode_float(
+				self.inner,
+				packet.as_ptr(),
+				packet.len() as i32,
+				out.as_mut_ptr(),
+				frame_size as i32,
+				fec,
+			)
+		};
+		if samples < 0 {
+			return Err(opus::decode_error(samples));
+		}
+		out.truncate(samples as usize * channels);
+		if let Some(order) = self.reorder {
+			let mut vorbis = [0.0f32; 8];
+			for frame in out.chunks_exact_mut(channels) {
+				vorbis[..channels].copy_from_slice(frame);
+				for (sample, &from) in frame.iter_mut().zip(order) {
+					*sample = vorbis[from];
+				}
+			}
+		}
+		let activity = opus::multistream_activity(&[], self.streams, self.in_dtx);
+		self.in_dtx = activity.is_dtx();
+		Ok(Decoded { samples: out, activity })
+	}
+
+	fn conceal_len(&self) -> Option<usize> {
+		self.last_frame_size
+	}
+
 	fn reset(&mut self) -> Result<(), Error> {
 		// SAFETY: `inner` owns a live decoder and OPUS_RESET_STATE takes no arguments.
 		let rc = unsafe { opus_multistream_decoder_ctl_impl(self.inner, OPUS_RESET_STATE, varargs![]) };

@@ -13,6 +13,10 @@ use crate::jitter::{self, Target};
 use crate::resample::{Remix, Resampler};
 use crate::{Activity, Error, Format, Frame, Layout};
 
+/// The largest [`Options::conceal`] a consumer accepts. Concealment covers
+/// loss bursts, not skips: a hole longer than this stays visible.
+const MAX_CONCEAL: Duration = Duration::from_secs(1);
+
 /// One item of a [`Consumer`] read, in delivery order: decoded PCM, or a break in it.
 ///
 /// The decoded counterpart of [`moq_mux::container::Read`], and the same shape
@@ -87,6 +91,15 @@ pub struct Options {
 	/// the live-edge skip budget and adds no buffering. A fixed delay beyond the
 	/// track's retention is refused.
 	pub delay: Option<Duration>,
+	/// How much of a hole to fill with recovered audio before leaving it a hole.
+	///
+	/// Zero (the default) leaves every hole in the output, as
+	/// [`read`](Consumer::read) documents. Up to this much of an undeclared hole
+	/// is recovered instead: the lost frames conceal, and the one before the
+	/// arriving packet comes back from its in-band forward error copy when the
+	/// sender coded one. Longer holes stay holes, since hiding a skipped group
+	/// is worse than showing it. Refused above [`MAX_CONCEAL`].
+	pub conceal: Duration,
 }
 
 impl Options {
@@ -207,6 +220,14 @@ impl Consumer {
 				"playout delay {delay:?} exceeds the track's retention of {retention:?}"
 			)));
 		}
+		// A conceal bound is developer policy, but the work and memory it
+		// permits are sized by a peer-controlled hole, so refuse absurd ones.
+		if options.conceal > MAX_CONCEAL {
+			return Err(Error::Unsupported(format!(
+				"conceal {:?} exceeds {MAX_CONCEAL:?}: it covers loss bursts, not skips",
+				options.conceal
+			)));
+		}
 		// The catalog says how the track is framed, and it is not always the legacy
 		// wire: `moq import fmp4` publishes CMAF. Reading a moof+mdat fragment as a
 		// varint timestamp plus a payload decodes to garbage rather than failing.
@@ -289,6 +310,9 @@ impl Consumer {
 	/// side stay anchored to their own packet timeline, so the hole is there to
 	/// see. "Doesn't continue" allows for the quantization the stamps carry, which
 	/// on a millisecond-stamped ingest is most of a millisecond.
+	/// With [`Options::conceal`] set, a hole the codec can cover is filled
+	/// instead and the timeline stays continuous; what it cannot cover remains
+	/// a hole.
 	pub async fn read(&mut self) -> Result<Option<Read>, Error> {
 		loop {
 			if let Some(frame) = self.ready.pop_front() {
@@ -344,16 +368,36 @@ impl Consumer {
 				&& let Some(next) = self.next_start
 				&& discontinuous(next, timestamp)
 			{
-				if let Some(frame) = self.gap()? {
-					self.ready.push_back(Read::Frame(frame));
-				}
 				// From where the timeline should have continued to where it did, which an
 				// overlap leaves empty.
 				let start = next.convert(timestamp.scale())?.min(timestamp);
-				self.ready.push_back(Read::Gap {
-					timestamp: start,
-					duration: timestamp.checked_sub(start)?,
-				});
+				// What the resampler held from before the hole belongs before
+				// anything recovered over it, and recovery reads the prediction
+				// history a reset clears: drain first, then recover.
+				let tail = self.drain()?;
+				let (recovered, covered) = self.recover(start, timestamp, &mux_frame.payload)?;
+				// A full recovery is not a gap: the decoder keeps the
+				// prediction the recovery built and the timeline continues
+				// where it would have.
+				let full = covered > 0
+					&& covered >= frames_between(start, timestamp, self.decoder.sample_rate())?;
+				if !full {
+					// What the codec could not fill is a discontinuity after all:
+					// prediction and timeline start over before the next packet, and
+					// what recovery did not cover stays in the output to see.
+					self.gap()?;
+					let gap_start = advance(start, covered, self.decoder.sample_rate())?
+						.convert(timestamp.scale())?
+						.min(timestamp);
+					self.ready.push_back(Read::Gap {
+						timestamp: gap_start,
+						duration: timestamp.checked_sub(gap_start)?,
+					});
+				}
+				if let Some(frame) = tail {
+					self.ready.push_back(Read::Frame(frame));
+				}
+				self.ready.extend(recovered);
 			}
 
 			let rate = self.decoder.sample_rate();
@@ -526,6 +570,89 @@ impl Consumer {
 		let timestamp = resampler.held_at().map(|held| resampler.output_at(held)).transpose()?;
 		let pcm = resampler.drain()?;
 		self.tail(pcm, timestamp)
+	}
+
+	/// Fill a hole with what the codec can produce: the lost frames conceal
+	/// except the one before the arriving packet, which comes back from that
+	/// packet's in-band forward error copy when the sender coded one.
+	///
+	/// Covers at most [`Options::conceal`], and only where the decoder can
+	/// conceal at all. Frames are stamped on the decoded timeline the frames
+	/// before the hole use, so a fully covered hole meets them exactly; the
+	/// covered count lets the caller tell a full recovery (which is not a gap)
+	/// from a partial one.
+	fn recover(
+		&mut self,
+		start: moq_net::Timestamp,
+		end: moq_net::Timestamp,
+		next_packet: &[u8],
+	) -> Result<(Vec<Read>, usize), Error> {
+		let mut frames = Vec::new();
+		if end <= start
+			|| self.options.conceal.is_zero()
+			|| Duration::from(end.checked_sub(start)?) > self.options.conceal
+		{
+			return Ok((frames, 0));
+		}
+		let Some(conceal_len) = self.decoder.conceal_len() else {
+			return Ok((frames, 0));
+		};
+		let rate = self.decoder.sample_rate();
+		let channels = self.decoder.layout().channels() as usize;
+		let hole = frames_between(start, end, rate)?;
+		// The frames before the hole sit on the delay-shifted output timeline,
+		// so recovery starts there too and a full hole meets them exactly.
+		let base = rewind(start, self.delay_trimmed, rate)?.max(self.epoch.unwrap_or(start));
+		let mut covered = 0usize;
+		while covered < hole {
+			let remaining = hole - covered;
+			let decoded = self.decoder.recover((remaining <= conceal_len).then_some(next_packet))?;
+			let activity = decoded.activity;
+			let mut samples = decoded.samples;
+			let mut length = samples.len() / channels;
+			if length == 0 {
+				break;
+			}
+			// The last recovered frame stops where the hole does, so the audio
+			// meets the arriving packet exactly.
+			if length > remaining {
+				length = remaining;
+				samples.truncate(length * channels);
+			}
+			let decoded_at = advance(base, covered, rate)?;
+			let (pcm, timestamp) = match self.resampler.as_mut() {
+				Some(r) => {
+					let held = if r.pending_frames() == 0 {
+						decoded_at
+					} else {
+						r.held_at().unwrap_or(decoded_at)
+					};
+					let timestamp = r.output_at(held)?;
+					let pcm = r.process(&samples, decoded_at)?;
+					(pcm, timestamp)
+				}
+				None => (samples, decoded_at),
+			};
+			let resampled = self.resampler.is_some();
+			if resampled {
+				self.spans.push_back(ActivitySpan {
+					end: advance(decoded_at, length, rate)?,
+					activity,
+				});
+			}
+			if !pcm.is_empty() {
+				let activity = if resampled {
+					self.activity_at(timestamp)
+				} else {
+					activity
+				};
+				if let Some(frame) = self.frame(pcm, timestamp, activity)? {
+					frames.push(Read::Frame(frame));
+				}
+			}
+			covered += length;
+		}
+		Ok((frames, covered))
 	}
 
 	/// The tail the resampler is still holding when the track ends, once.
