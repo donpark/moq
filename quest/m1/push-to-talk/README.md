@@ -25,7 +25,7 @@ Decided 2026-10-28 (maintainer):
 - **Consumers hold a disabled rendition**, audio and video, by default, in
   every first-party consumer. The hang spec weakens from "must not select" to
   "should not select" a disabled rendition.
-- **The publisher keeps its encoder across a disable**, and push-to-talk gets a
+- **The publisher keeps its probe result across a disable**, and push-to-talk gets a
   mute that leaves capture open.
 - **Encoding no longer waits for demand**
   ([always-on encoding](/quest/m1/eager-encode/README.md)). A listener who
@@ -47,7 +47,7 @@ Record both in the PR.
 
 - [JS consumers hold a disabled rendition](/quest/m1/push-to-talk/hold-js.md) - watch keeps a disabled audio or video rendition subscribed, and the hang spec says "should not select"
 - [Rust consumers hold a disabled rendition](/quest/m1/push-to-talk/hold-rs.md) - moq-cli play, moq-ffi and moq-mux select follow the same rule
-- [Re-enable without a probe](/quest/m1/push-to-talk/reenable.md) - the JS audio encoder flips its catalog and encodes in the same tick as an unmute
+- [Re-enable without a probe](/quest/m1/push-to-talk/reenable.md) - the JS audio encoder reuses its probe, so an unmute flips the catalog at once and keeps capture timestamps
 - [A mute that keeps the mic](/quest/m1/push-to-talk/mute.md) - push-to-talk mutes without closing capture, so unmute skips getUserMedia and AudioContext setup
 
 ## Closes
