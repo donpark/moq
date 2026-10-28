@@ -1,4 +1,4 @@
-import { expect, jest, spyOn, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { Manual, Milli, Nano } from "@moq/clock";
 import { type Getter, Signal } from "@moq/signals";
 import type { Grant } from "../auth.ts";
@@ -1091,7 +1091,8 @@ test.each([
 	["lite-07 subscribe waiting on the TRACK_INFO", Version.DRAFT_07, false],
 	["lite-05 subscribe waiting on a stream slot for the TRACK", Version.DRAFT_05, true],
 ] as const)("a %s that times out leaves nothing behind", async (_, version, parked) => {
-	jest.useFakeTimers();
+	const clock = new Manual();
+	const installed = clock.install();
 	const warn = spyOn(console, "warn").mockImplementation(() => {});
 	const { quic, streams, opened } = fakeSession(parked ? [0] : []);
 	const subscriber = new Subscriber(quic, version, HopSchema.parse(1n));
@@ -1100,7 +1101,7 @@ test.each([
 		await opened(0);
 		if (!parked) await streams[0].reading;
 
-		jest.advanceTimersByTime(SUBSCRIBE_SETUP_TIMEOUT_MS);
+		await clock.advance(Nano.fromMilli(Milli(SUBSCRIBE_SETUP_TIMEOUT_MS)));
 		await track.closed;
 
 		if (parked) streams[0].release();
@@ -1120,13 +1121,14 @@ test.each([
 	} finally {
 		subscriber.close();
 		warn.mockRestore();
-		jest.useRealTimers();
+		installed.close();
 	}
 });
 
 // The SUBSCRIBE stream can open after the deadline too; it is reset without carrying a SUBSCRIBE.
 test("a lite subscribe that times out waiting on a stream slot for the SUBSCRIBE sends nothing on it", async () => {
-	jest.useFakeTimers();
+	const clock = new Manual();
+	const installed = clock.install();
 	const warn = spyOn(console, "warn").mockImplementation(() => {});
 	const { quic, streams, opened } = fakeSession([1]);
 	const subscriber = new Subscriber(quic, Version.DRAFT_05, HopSchema.parse(1n));
@@ -1136,11 +1138,11 @@ test("a lite subscribe that times out waiting on a stream slot for the SUBSCRIBE
 		await streams[0].reading;
 		// TRACK_INFO lands halfway, so the SUBSCRIBE open's own deadline is still ahead when the
 		// setup deadline fires.
-		jest.advanceTimersByTime(SUBSCRIBE_SETUP_TIMEOUT_MS / 2);
+		await clock.advance(Nano.fromMilli(Milli(SUBSCRIBE_SETUP_TIMEOUT_MS / 2)));
 		await answerTrackInfo(streams[0]);
 		await opened(1);
 
-		jest.advanceTimersByTime(SUBSCRIBE_SETUP_TIMEOUT_MS / 2);
+		await clock.advance(Nano.fromMilli(Milli(SUBSCRIBE_SETUP_TIMEOUT_MS / 2)));
 		await track.closed;
 
 		streams[1].release();
@@ -1149,14 +1151,15 @@ test("a lite subscribe that times out waiting on a stream slot for the SUBSCRIBE
 	} finally {
 		subscriber.close();
 		warn.mockRestore();
-		jest.useRealTimers();
+		installed.close();
 	}
 });
 
 // A SUBSCRIBE write blocked on flow control may never let the setup settle, so the deadline
 // lets go of the held TRACK stream without waiting for it.
 test("a lite subscribe whose SUBSCRIBE write stalls past the deadline closes its TRACK stream", async () => {
-	jest.useFakeTimers();
+	const clock = new Manual();
+	const installed = clock.install();
 	const warn = spyOn(console, "warn").mockImplementation(() => {});
 	const { quic, streams, opened } = fakeSession([], [1]);
 	const subscriber = new Subscriber(quic, Version.DRAFT_05, HopSchema.parse(1n));
@@ -1167,13 +1170,13 @@ test("a lite subscribe whose SUBSCRIBE write stalls past the deadline closes its
 		await answerTrackInfo(streams[0]);
 		await (await opened(1)).writing;
 
-		jest.advanceTimersByTime(SUBSCRIBE_SETUP_TIMEOUT_MS);
+		await clock.advance(Nano.fromMilli(Milli(SUBSCRIBE_SETUP_TIMEOUT_MS)));
 		await track.closed;
 		await streams[0].aborted;
 	} finally {
 		subscriber.close();
 		warn.mockRestore();
-		jest.useRealTimers();
+		installed.close();
 	}
 });
 
