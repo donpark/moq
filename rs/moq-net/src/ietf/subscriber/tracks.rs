@@ -916,13 +916,18 @@ impl Subscriber {
 				if session.poll_closed(&mut cx).is_ready() {
 					return Poll::Ready(Step::Closed);
 				}
-				if let Poll::Ready(Err(err)) = upstream.stream.writer.poll_flush(&mut cx) {
-					return Poll::Ready(Step::Message(Err(err)));
-				}
-				if let Poll::Ready(handoff) = handoff.poll(waiter, |handoff| match handoff.gone || handoff.wanted {
-					true => Poll::Ready(()),
-					false => Poll::Pending,
-				}) {
+				// A held subscription is handed over only once flushed, so resumes and pauses
+				// can't pile up behind a peer withholding credit.
+				let flushed = match upstream.stream.writer.poll_flush(&mut cx) {
+					Poll::Ready(Err(err)) => return Poll::Ready(Step::Message(Err(err))),
+					Poll::Ready(Ok(())) => true,
+					Poll::Pending => false,
+				};
+				if let Poll::Ready(handoff) =
+					handoff.poll(waiter, |handoff| match handoff.gone || (handoff.wanted && flushed) {
+						true => Poll::Ready(()),
+						false => Poll::Pending,
+					}) {
 					return Poll::Ready(match handoff.gone {
 						true => Step::Gone,
 						false => Step::Wanted,
@@ -1279,7 +1284,11 @@ mod tests {
 	}
 
 	fn harness(version: Version) -> Harness {
-		let (session, peer) = memory::pair(memory::Config::default());
+		harness_with(version, memory::Config::default())
+	}
+
+	fn harness_with(version: Version, config: memory::Config) -> Harness {
+		let (session, peer) = memory::pair(config);
 		let (tasks, mut task_set) = TaskSet::new();
 		let driver = moq_clock::sim::spawn(async move { kio::wait(|waiter| task_set.poll(waiter)).await });
 		let subscriber = Subscriber::new(
@@ -1320,9 +1329,10 @@ mod tests {
 			.expect("the subscriber sent nothing")
 	}
 
+	/// One message in one write, so a peer holding one message per stream still delivers it.
 	async fn write<'m, M: ietf::Message<'m> + std::fmt::Debug>(stream: &mut PeerStream, id: u64, msg: &M) {
-		stream.writer.varint(id).await.unwrap();
-		stream.writer.encode(msg).await.unwrap();
+		stream.writer.buffer_message(id, msg).unwrap();
+		std::future::poll_fn(|cx| stream.writer.poll_flush(cx)).await.unwrap();
 		settle().await;
 	}
 
@@ -1440,8 +1450,7 @@ mod tests {
 			let mut stream = Stream::open(&mut crate::driver::Transport::new(self.peer.clone()), self.version)
 				.await
 				.unwrap();
-			stream.writer.varint(ietf::Publish::ID).await.unwrap();
-			stream.writer.encode(&publish).await.unwrap();
+			stream.writer.encode_message(&publish).await.unwrap();
 
 			let mut ours = Stream::accept(&mut self.subscriber.session.clone(), self.version)
 				.await
@@ -1457,6 +1466,42 @@ mod tests {
 			});
 			let (id, body) = read(&mut stream).await;
 			(stream, id, body)
+		}
+	}
+
+	/// Readers coming and going while the peer withholds credit on a held track never pile
+	/// updates up behind it: the held subscription is handed over only once its pause is out,
+	/// and a reader leaving meanwhile stops waiting for it.
+	#[moq_clock::test]
+	async fn churn_under_withheld_credit_buffers_one_resume_and_pause() {
+		for version in [Version::Draft18, Version::Draft22] {
+			// One message in flight per stream, so a peer that stops reading withholds credit.
+			let config = memory::Config {
+				stream_buffer: 0,
+				..Default::default()
+			};
+			let mut h = harness_with(version, config);
+			let _listing = h.establish().await;
+			let mut video = h.publish("video", 1).await;
+
+			for _ in 0..3 {
+				let (track, reader, serving) = h.read_track("video").await;
+				settle().await;
+				drop(reader);
+				drop(track);
+				moq_clock::timeout(TIMEOUT, serving)
+					.await
+					.unwrap_or_else(|_| panic!("{version}: the abandoned resume stayed alive"))
+					.unwrap();
+			}
+
+			let mut updates = Vec::new();
+			while let Ok(Ok(id)) = moq_clock::timeout(TIMEOUT, video.reader.varint()).await {
+				let body: ietf::Body = video.reader.decode().await.unwrap();
+				assert_eq!(id, ietf::SubscribeUpdate::ID, "{version}");
+				updates.push(body.message::<ietf::SubscribeUpdate>(version).unwrap().forward);
+			}
+			assert_eq!(updates, [Some(true), Some(false)], "{version}");
 		}
 	}
 

@@ -2940,7 +2940,7 @@ impl Subscriber {
 		&mut self,
 		broadcast_path: &Path,
 		track_name: &str,
-		target: Target,
+		mut target: Target,
 		group_fetches: &mut TaskSet,
 		gate: &mut crate::auth::Gate,
 	) -> Option<Idle> {
@@ -2979,20 +2979,49 @@ impl Subscriber {
 		let adopted = match &self.want(&key) {
 			None => None,
 			Some(handoff) => {
-				let adopted = kio::wait(|waiter| {
-					if gate.poll_denied(waiter).is_ready() {
-						return Poll::Ready(Err(Error::Unauthorized));
-					}
-					validity.check(waiter)?;
-					Self::poll_handoff(handoff, waiter).map(Ok)
-				})
-				.await;
-				match adopted {
-					Ok(adopted) => adopted,
-					Err(err) => {
-						self.unwant(key, handoff);
-						target.fail(err);
-						return None;
+				// The handoff waits for the held stream to flush, which a peer withholding
+				// credit can stall, so nobody wanting the track any more ends the wait too.
+				enum Abandon {
+					Failed(Error),
+					Unused,
+				}
+				loop {
+					let adopt = kio::wait(|waiter| {
+						if gate.poll_denied(waiter).is_ready() {
+							return Poll::Ready(Err(Abandon::Failed(Error::Unauthorized)));
+						}
+						if let Err(err) = validity.check(waiter) {
+							return Poll::Ready(Err(Abandon::Failed(err)));
+						}
+						if let Poll::Ready(adopted) = Self::poll_handoff(handoff, waiter) {
+							return Poll::Ready(Ok(adopted));
+						}
+						let unwanted = match &mut target {
+							Target::Request(request) => crate::util::poll_unwanted(&mut request.demand(), waiter),
+							Target::Resume(idle) => crate::util::poll_unwanted(&mut idle.demand, waiter),
+						};
+						unwanted.map(|_| Err(Abandon::Unused))
+					})
+					.await;
+					match adopt {
+						Ok(adopted) => break adopted,
+						Err(Abandon::Failed(err)) => {
+							self.unwant(key, handoff);
+							target.fail(err);
+							return None;
+						}
+						// Nobody wants the track: a resumed copy lingers again, a request is refused.
+						Err(Abandon::Unused) => match target {
+							Target::Resume(idle) => {
+								self.unwant(key, handoff);
+								return Some(idle);
+							}
+							Target::Request(ref request) if request.reject_unused(Error::Cancel) => {
+								self.unwant(key, handoff);
+								return None;
+							}
+							Target::Request(_) => continue,
+						},
 					}
 				}
 			}
