@@ -15,7 +15,7 @@ narrower budget is served after a widening, as a cold relay would.
 ## Plan
 
 Decided 2026-10-27 (maintainer): this runs after
-[Linear fill path](/quest/m1/subscribe-ranges/fill-linear.md), since both edit
+[Range count cost](/quest/m1/subscribe-ranges/fill-linear.md), since both edit
 `given_up` in `rs/moq-net/src/model/track/miss.rs`, and before
 [Rust groups by start](/quest/m1/time-addressing/model.md), which requires it
 because runs keyed by group sequence convert mechanically to starts.
