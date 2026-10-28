@@ -58,7 +58,10 @@ CARGO_PROFILE=()
 
 echo "swift check: building moq-ffi for $HOST_TARGET..."
 # The shared default build (.cargo/config.toml), whose `openh264` the tests rely on.
-(cd "$WORKSPACE_DIR" && cargo build-ffi ${CARGO_PROFILE[@]+"${CARGO_PROFILE[@]}"})
+# Cargo resolves the alias, and a relative CARGO_TARGET_DIR, from the working
+# directory, so the build and the metadata below both run in the workspace.
+cd "$WORKSPACE_DIR"
+cargo build-ffi ${CARGO_PROFILE[@]+"${CARGO_PROFILE[@]}"}
 
 TARGET_BASE=$(cargo metadata --format-version 1 --manifest-path "$WORKSPACE_DIR/Cargo.toml" --no-deps |
     sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
