@@ -146,9 +146,12 @@ impl BroadcastState {
 			return Some(live);
 		}
 		for (_, cached) in &mut self.demands {
-			// A handle that stops polling must not pin every track it was handed.
+			// A handle that stops polling must not pin every track it was handed. Headroom
+			// for as many tracks as survive defers the next scan until the inbox doubles,
+			// so a full inbox losing one track doesn't rescan it on every insert.
 			if cached.len() == cached.capacity() {
 				cached.retain(|track| !track.is_closed());
+				cached.reserve(cached.len());
 			}
 			cached.push(weak.clone());
 		}
