@@ -29,6 +29,7 @@ mod key_id;
 mod path;
 mod request;
 mod set;
+mod subject;
 mod wire;
 
 pub mod lease;
@@ -52,3 +53,4 @@ pub use key_id::*;
 pub use moq_pattern::{InvalidPattern, Pattern, Patterns, Segment, Specificity};
 pub use request::*;
 pub use set::*;
+pub use subject::Subject;

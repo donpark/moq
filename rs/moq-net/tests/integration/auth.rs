@@ -59,6 +59,7 @@ cases!(
 	a_broadcast_withdrawn_while_its_token_waits_is_not_refused,
 	tokens_union_and_withdrawing_one_shrinks_it,
 	an_update_replaces_one_tokens_grant,
+	a_token_naming_another_subject_is_refused,
 	a_revoked_grant_withdraws_and_can_be_restored,
 	a_refused_token_reports_the_code,
 	a_refused_setup_token_grants_nothing,
@@ -375,6 +376,7 @@ fn grant(publish: &[&str], subscribe: &[&str]) -> Grant {
 		publish: patterns(publish),
 		subscribe: patterns(subscribe),
 		expires: None,
+		subject: None,
 	}
 }
 
@@ -811,6 +813,67 @@ async fn an_update_replaces_one_tokens_grant(version: &'static str) {
 	.expect("timed out");
 }
 
+fn subject(name: &str) -> auth::Subject {
+	auth::Subject {
+		issuer: Some("https://auth.example".into()),
+		name: name.into(),
+	}
+}
+
+fn granted_to(name: &str, publish: &[&str]) -> Grant {
+	Grant {
+		subject: Some(subject(name)),
+		..grant(publish, &[])
+	}
+}
+
+/// Every grant a session issues names one subject: a token naming another is refused,
+/// whether it arrives new or as an update, while one naming nobody joins either way. The
+/// connection's credential keeps its subject too.
+async fn a_token_naming_another_subject_is_refused(version: &'static str) {
+	within(async {
+		let mut pair = connect(Options {
+			version: Some(version),
+			client_publish: Some(produce_origin(2)),
+			server_subscribe: Some(produce_origin(1)),
+			server_requests: true,
+			..Default::default()
+		})
+		.await;
+		let mut issued = serve(pair.requests.take().unwrap(), |token| match token {
+			b"" | b"alice" => Some(granted_to("alice", &["a"])),
+			b"bob" => Some(granted_to("bob", &["b"])),
+			b"anonymous" => Some(grant(&["c"], &[])),
+			_ => None,
+		});
+		let (_, _setup) = issued.next().await.unwrap();
+
+		let err = pair.client.auth().add("bob").await.expect_err("another subject");
+		assert!(matches!(err, Error::Session(SessionError::Unauthorized)), "{err:?}");
+		let (_, _bob_issued) = issued.next().await.unwrap();
+		let (_alice, _) = pair.client.auth().add("alice").await.unwrap();
+		let (_, _alice_issued) = issued.next().await.unwrap();
+		let (anonymous, _) = pair.client.auth().add("anonymous").await.unwrap();
+		let (_, anonymous_issued) = issued.next().await.unwrap();
+		assert_eq!(granted(&pair.client).await, grant(&["a", "c"], &[]));
+
+		assert!(matches!(
+			pair.server.auth().authorize(&granted_to("bob", &["a"])),
+			Err(Error::Unauthorized)
+		));
+		pair.server.auth().authorize(&granted_to("alice", &["a", "c"])).unwrap();
+
+		anonymous_issued.update(granted_to("bob", &["c"]));
+		assert!(matches!(
+			anonymous.closed().await,
+			Error::Session(SessionError::Unauthorized)
+		));
+		wait_for(pair.client.auth().grant(), |g| g == &Some(grant(&["a"], &[]))).await;
+	})
+	.await
+	.expect("timed out");
+}
+
 /// A revocation withdraws what the grant covered, even though the broadcast stays in
 /// the shared origin, and an empty union can be authorized again.
 async fn a_revoked_grant_withdraws_and_can_be_restored(version: &'static str) {
@@ -1144,7 +1207,7 @@ async fn a_live_subscription_survives_union_renewal(version: &'static str) {
 			..Default::default()
 		})
 		.await;
-		pair.server.auth().authorize(&Grant::default());
+		pair.server.auth().authorize(&Grant::default()).unwrap();
 		let mut requests = pair.requests.take().unwrap();
 		let _setup = requests.next().await.unwrap().accept(Grant::default());
 		let auth = pair.client.auth();
@@ -1293,6 +1356,7 @@ async fn a_grant_too_large_for_one_message_is_unsupported(version: &'static str)
 				publish: huge.clone(),
 				subscribe: Patterns::new(),
 				expires: None,
+				subject: None,
 			}),
 			_ => None,
 		});
@@ -1333,6 +1397,7 @@ async fn a_grant_update_too_large_for_one_message_is_unsupported(version: &'stat
 			publish: huge,
 			subscribe: Patterns::new(),
 			expires: None,
+			subject: None,
 		});
 		let err = token.closed().await;
 		assert!(matches!(err, Error::Unsupported), "{err:?}");
@@ -1373,6 +1438,7 @@ async fn pattern_grants_arrive_exactly(version: &'static str) {
 				publish,
 				subscribe,
 				expires: None,
+				subject: None,
 			})
 		};
 		let mut issued = serve(pair.requests.take().unwrap(), table);
@@ -1607,7 +1673,10 @@ async fn a_narrowing_deafens_one_path(version: &'static str) {
 		let mut video_sub = remote.track("h264").unwrap().subscribe(prefs()).await.unwrap();
 		video_sub.recv_group().await.unwrap().unwrap();
 
-		pair.server.auth().authorize(&grant(&[], &["room/alice/video"]));
+		pair.server
+			.auth()
+			.authorize(&grant(&[], &["room/alice/video"]))
+			.unwrap();
 
 		let err = ended(&mut audio_sub).await;
 		assert!(unauthorized(&err), "{err:?}");
@@ -1680,7 +1749,7 @@ async fn a_narrowing_aborts_what_the_peer_published(version: &'static str) {
 		let mut cam_sub = remote.track("h264").unwrap().subscribe(prefs()).await.unwrap();
 		cam_sub.recv_group().await.unwrap().unwrap();
 
-		pair.server.auth().authorize(&grant(&["room/bob/cam"], &[]));
+		pair.server.auth().authorize(&grant(&["room/bob/cam"], &[])).unwrap();
 
 		let err = ended(&mut mic_sub).await;
 		assert!(unauthorized(&err), "{err:?}");
@@ -1726,7 +1795,7 @@ async fn a_narrowing_resets_a_fetch_in_flight(version: &'static str) {
 		let frame = fetched.read_frame().await.unwrap().expect("first frame");
 		assert_eq!(frame.payload.as_ref(), b"first");
 
-		pair.server.auth().authorize(&grant(&[], &["room/y"]));
+		pair.server.auth().authorize(&grant(&[], &["room/y"])).unwrap();
 
 		let err = loop {
 			match fetched.read_frame().await {
@@ -1787,13 +1856,16 @@ async fn a_widening_brings_back_a_deafened_path(version: &'static str) {
 		let mut sub = remote.track("opus").unwrap().subscribe(prefs()).await.unwrap();
 		sub.recv_group().await.unwrap().unwrap();
 
-		pair.server.auth().authorize(&grant(&[], &["room/alice/video"]));
+		pair.server
+			.auth()
+			.authorize(&grant(&[], &["room/alice/video"]))
+			.unwrap();
 		let err = ended(&mut sub).await;
 		assert!(unauthorized(&err), "{err:?}");
 		wait_announced(&received.consume(), "room/alice/audio", false).await;
 		drop((sub, remote));
 
-		pair.server.auth().authorize(&grant(&[], &["room"]));
+		pair.server.auth().authorize(&grant(&[], &["room"])).unwrap();
 		wait_announced(&received.consume(), "room/alice/audio", true).await;
 		let remote = received.consume().routed_broadcast("room/alice/audio").await.unwrap();
 		let mut sub = remote.track("opus").unwrap().subscribe(prefs()).await.unwrap();
@@ -1839,10 +1911,10 @@ async fn a_widening_brings_back_what_the_peer_published(version: &'static str) {
 		.await;
 		wait_announced(&relay.consume(), "room/bob/mic", true).await;
 
-		pair.server.auth().authorize(&grant(&["room/bob/cam"], &[]));
+		pair.server.auth().authorize(&grant(&["room/bob/cam"], &[])).unwrap();
 		wait_announced(&relay.consume(), "room/bob/mic", false).await;
 
-		pair.server.auth().authorize(&grant(&["room"], &[]));
+		pair.server.auth().authorize(&grant(&["room"], &[])).unwrap();
 		wait_announced(&relay.consume(), "room/bob/mic", true).await;
 		let remote = relay.consume().routed_broadcast("room/bob/mic").await.unwrap();
 		let mut sub = remote.track("opus").unwrap().subscribe(prefs()).await.unwrap();

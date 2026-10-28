@@ -2715,10 +2715,12 @@ mod announce_test {
 		let waiter = kio::Waiter::noop();
 		assert!(run.poll(&mut stream, &consumer, &mut announced, &waiter).is_pending());
 		let auth = crate::auth::Link::new(false);
-		auth.handle().authorize(&crate::auth::Grant {
-			subscribe: crate::Pattern::literal("b").unwrap().into(),
-			..Default::default()
-		});
+		auth.handle()
+			.authorize(&crate::auth::Grant {
+				subscribe: crate::Pattern::literal("b").unwrap().into(),
+				..Default::default()
+			})
+			.unwrap();
 		let Poll::Ready(restricted) = auth.poll_permit(crate::auth::Direction::Publish, &mut 0, &waiter) else {
 			panic!("the changed grant is ready");
 		};
@@ -2757,7 +2759,7 @@ mod announce_test {
 		let waiter = kio::Waiter::noop();
 		assert!(run.poll(&mut stream, &consumer, &mut announced, &waiter).is_pending());
 		let auth = crate::auth::Link::new(false);
-		auth.handle().authorize(&crate::auth::Grant::default());
+		auth.handle().authorize(&crate::auth::Grant::default()).unwrap();
 		let Poll::Ready(restricted) = auth.poll_permit(crate::auth::Direction::Publish, &mut 0, &waiter) else {
 			panic!("the changed grant is ready");
 		};
@@ -3178,10 +3180,11 @@ mod announce_test {
 				.map(|path| crate::Pattern::subtree(path).unwrap())
 				.collect(),
 			expires: None,
+			subject: None,
 		};
 		for anonymous in [false, true] {
 			let auth = crate::auth::Link::new(false);
-			auth.handle().authorize(&grant(&["cam"]));
+			auth.handle().authorize(&grant(&["cam"])).unwrap();
 			let mut h = harness_with(Version::Lite07, Some(auth.clone())).await;
 
 			// Same chain and cost, so only the instance changed. Both land before the loop polls.
@@ -3192,7 +3195,7 @@ mod announce_test {
 				None => route,
 			};
 			let _newer = h.origin.announce("cam", route).unwrap();
-			auth.handle().authorize(&grant(&["cam", "other"]));
+			auth.handle().authorize(&grant(&["cam", "other"])).unwrap();
 			moq_clock::sleep(crate::origin::Config::default().update_hold).await;
 			settle().await;
 			match h.wire.take_announces().as_slice() {
