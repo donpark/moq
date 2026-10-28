@@ -94,6 +94,7 @@ fn ietf_range_updates_interop() {
 					group_order: Some(ietf::GroupOrder::Ascending),
 					filter: Some(range(0, None)),
 					range_filters: false,
+					fill_timeout: None,
 				}),
 			));
 		} else {

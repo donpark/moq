@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, time::Duration};
 
 use crate::{
 	Path,
@@ -128,10 +128,10 @@ pub struct Fetch<'a> {
 	/// MAX_FILTER_RANGES, so the request is refused rather than served unfiltered.
 	/// Never encoded; we send no range filters.
 	pub range_filters: bool,
-	/// Whether the request carried FILL_TIMEOUT (0x0A), a budget for waiting on upstream
-	/// that ends in Timed-Out gaps we cannot write, so the request is refused rather than
-	/// left to wait without it. Never encoded; we send no fill timeout.
-	pub fill_timeout: bool,
+	/// FILL_TIMEOUT (0x0A): the total time a relay may wait on upstream for objects it
+	/// lacks before reporting them as timed out. Zero asks for its cache alone, and `None`
+	/// leaves the wait to the relay. It bounds a wait, not how old a cached object may be.
+	pub fill_timeout: Option<Duration>,
 	/// Whether the requester wants Track Properties in FETCH_OK (INCLUDE_PROPERTIES,
 	/// draft-22). Always `true` before draft-22, which has no way to opt out.
 	pub properties_wanted: bool,
@@ -207,6 +207,7 @@ impl<'a> Message<'a> for Fetch<'a> {
 				self.fetch_type.encode(w, version)?;
 				let epoch = self.epoch.clone();
 				encode_params!(w, version,
+					0x0A => self.fill_timeout.map(fill_timeout_millis),
 					0x20 => self.subscriber_priority,
 					0x22 => group_order,
 					epoch::EPOCH_PARAM => epoch,
@@ -226,6 +227,7 @@ impl<'a> Message<'a> for Fetch<'a> {
 				// INCLUDE_PROPERTIES defaults to 1, so only the opt-out is worth bytes.
 				let include_properties = (!self.properties_wanted).then_some(false);
 				encode_params!(w, version,
+					0x0A => self.fill_timeout.map(fill_timeout_millis),
 					0x20 => self.subscriber_priority,
 					0x21 => *filter,
 					0x22 => group_order,
@@ -259,7 +261,7 @@ impl<'a> Message<'a> for Fetch<'a> {
 						subscriber_priority,
 						group_order,
 						false,
-						fill_timeout.is_some(),
+						fill_timeout.map(Duration::from_millis),
 						true,
 						epoch,
 					)
@@ -302,7 +304,7 @@ impl<'a> Message<'a> for Fetch<'a> {
 						subscriber_priority,
 						group_order,
 						range_filters,
-						fill_timeout.is_some(),
+						fill_timeout.map(Duration::from_millis),
 						// Defaults to 1, so an absent parameter means the requester wants them.
 						include_properties.unwrap_or(true),
 						epoch,
@@ -331,6 +333,11 @@ impl<'a> Message<'a> for Fetch<'a> {
 			epoch,
 		})
 	}
+}
+
+/// FILL_TIMEOUT's milliseconds, rounded up so a positive budget never asks for the cache alone.
+pub(super) fn fill_timeout_millis(timeout: Duration) -> u64 {
+	u64::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -455,33 +462,70 @@ pub enum FetchObject {
 		properties: Option<Vec<u8>>,
 	},
 
-	/// An End of Range marker: every Location between the prior Object and this one,
-	/// inclusive, does not exist (`0x8C`), is unknown (`0x10C`), or timed out (`0x20C`).
+	/// An End of Range marker: every Location after the prior Object or marker, through
+	/// this one inclusive, shares the [`RangeEnd`] status.
 	///
-	/// The Group and Object IDs are the same delta fields an [`Self::Object`] carries.
+	/// Its Group and Object IDs are absolute, unlike an [`Self::Object`]'s deltas: a delta
+	/// always names another group, which could not end a range inside the prior Object's.
+	/// moxygen reads them the same way. They become the prior Location for what follows.
 	EndOfRange {
-		/// The raw Serialization Flags, which is which of the three it is.
-		reason: u64,
-		/// The Group ID Delta.
+		/// Why the range's objects are absent.
+		kind: RangeEnd,
+		/// The last Group ID covered.
 		group: u64,
-		/// The Object ID Delta.
+		/// The last Object ID covered.
 		object: u64,
 	},
 }
 
-impl FetchObject {
-	/// The Serialization Flags values that mark an End of Range instead of an Object.
-	const END_OF_RANGE: &'static [u64] = &[0x8C, 0x10C, 0x20C];
+/// Why an End of Range's objects are absent from a fetch stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeEnd {
+	/// They do not exist (`0x8C`).
+	NonExistent,
+	/// Their status is unknown (`0x10C`), which is also how draft 18 reports a fill timeout.
+	Unknown,
+	/// The FILL_TIMEOUT ran out before they arrived (`0x20C`, draft 22).
+	TimedOut,
+}
+
+impl RangeEnd {
+	fn flags(self) -> u64 {
+		match self {
+			Self::NonExistent => 0x8C,
+			Self::Unknown => 0x10C,
+			Self::TimedOut => 0x20C,
+		}
+	}
+
+	fn from_flags(flags: u64, version: Version) -> Option<Self> {
+		match (flags, version) {
+			(0x8C, _) => Some(Self::NonExistent),
+			(0x10C, _) => Some(Self::Unknown),
+			// Draft 18 lists only the first two values.
+			(0x20C, Version::Draft18) => None,
+			(0x20C, _) => Some(Self::TimedOut),
+			_ => None,
+		}
+	}
+
+	/// How `version` reports objects that FILL_TIMEOUT gave up on.
+	pub fn timed_out(version: Version) -> Self {
+		match version {
+			Version::Draft18 => Self::Unknown,
+			_ => Self::TimedOut,
+		}
+	}
 }
 
 impl Encode<Version> for FetchObject {
-	fn encode(&self, w: &mut Encoder<'_>, _: Version) -> Result<(), EncodeError> {
+	fn encode(&self, w: &mut Encoder<'_>, version: Version) -> Result<(), EncodeError> {
 		match self {
-			Self::EndOfRange { reason, group, object } => {
-				if !Self::END_OF_RANGE.contains(reason) {
-					return Err(EncodeError::InvalidState);
+			Self::EndOfRange { kind, group, object } => {
+				if RangeEnd::from_flags(kind.flags(), version) != Some(*kind) {
+					return Err(EncodeError::Version);
 				}
-				w.varint(*reason)?;
+				w.varint(kind.flags())?;
 				w.varint(*group)?;
 				w.varint(*object)?;
 			}
@@ -539,13 +583,11 @@ impl<'a> Decode<'a, Version> for FetchObject {
 		let flags = buf.varint()?;
 
 		// Anything at or above 128 is a named value rather than a set of flags, and only
-		// the three End of Range markers are defined.
+		// the End of Range markers are defined.
 		if flags >= 0x80 {
-			if !Self::END_OF_RANGE.contains(&flags) {
-				return Err(DecodeError::InvalidValue);
-			}
+			let kind = RangeEnd::from_flags(flags, version).ok_or(DecodeError::InvalidValue)?;
 			return Ok(Self::EndOfRange {
-				reason: flags,
+				kind,
 				group: buf.varint()?,
 				object: buf.varint()?,
 			});
@@ -625,7 +667,7 @@ mod tests {
 				end: Location { group: 10, object: 5 },
 			},
 			range_filters: false,
-			fill_timeout: false,
+			fill_timeout: None,
 			properties_wanted: true,
 			epoch: None,
 		};
@@ -701,7 +743,7 @@ mod tests {
 		assert_eq!(fetch.subscriber_priority, 64);
 		assert_eq!(fetch.group_order, GroupOrder::Ascending);
 		assert!(fetch.range_filters);
-		assert!(fetch.fill_timeout);
+		assert_eq!(fetch.fill_timeout, Some(Duration::from_millis(100)));
 		assert!(!fetch.properties_wanted);
 		assert_eq!(
 			fetch.fetch_type,
@@ -733,7 +775,7 @@ mod tests {
 				filter: Filter::Unfiltered,
 			},
 			range_filters: false,
-			fill_timeout: false,
+			fill_timeout: None,
 			properties_wanted: true,
 			epoch: None,
 		};
@@ -793,8 +835,56 @@ mod tests {
 			assert_eq!(decoded.is_ok(), ok, "{version}: {body:x?}");
 			if let Ok(fetch) = decoded {
 				assert_eq!(fetch.range_filters, body == &range_filter, "{version}");
-				assert_eq!(fetch.fill_timeout, body == &fill_timeout, "{version}");
+				let expected = (body == &fill_timeout).then_some(Duration::from_millis(32));
+				assert_eq!(fetch.fill_timeout, expected, "{version}");
 			}
+		}
+	}
+
+	/// FILL_TIMEOUT goes out in whole milliseconds on both drafts, rounded up so a positive
+	/// budget never becomes a request for the cache alone; zero stays zero.
+	#[test]
+	fn test_fetch_fill_timeout_round_trips() {
+		let standalone = Fetch {
+			request_id: RequestId(1),
+			subscriber_priority: 128,
+			group_order: GroupOrder::Any,
+			fetch_type: FetchType::Standalone {
+				namespace: Path::from_static("live"),
+				track: "video".into(),
+				start: Location { group: 0, object: 0 },
+				end: Location { group: 1, object: 0 },
+			},
+			range_filters: false,
+			fill_timeout: None,
+			properties_wanted: true,
+			epoch: None,
+		};
+		let filtered = Fetch {
+			fetch_type: FetchType::Filtered {
+				namespace: Path::from_static("live"),
+				track: "video".into(),
+				filter: Filter::Unfiltered,
+			},
+			..standalone.clone()
+		};
+		for (version, fetch) in [(Version::Draft18, standalone), (Version::Draft22, filtered)] {
+			for (sent, read) in [
+				(Duration::ZERO, Duration::ZERO),
+				(Duration::from_micros(1), Duration::from_millis(1)),
+				(Duration::from_millis(1500), Duration::from_millis(1500)),
+			] {
+				let fetch = Fetch {
+					fill_timeout: Some(sent),
+					..fetch.clone()
+				};
+				let encoded = encode_message(&fetch, version);
+				let decoded: Fetch = decode_message(&encoded, version).unwrap();
+				assert_eq!(decoded.fill_timeout, Some(read), "{version}: {sent:?}");
+			}
+			let encoded = encode_message(&fetch, version);
+			let decoded: Fetch = decode_message(&encoded, version).unwrap();
+			assert_eq!(decoded.fill_timeout, None, "{version}");
 		}
 	}
 
@@ -917,17 +1007,45 @@ mod object_tests {
 	}
 
 	/// An End of Range is a named value rather than a set of flags, and its two IDs are
-	/// always present.
+	/// always present, up to the last Object ID a group can hold.
 	#[test]
 	fn an_end_of_range_carries_its_location() {
-		for reason in [0x8C, 0x10C, 0x20C] {
+		for kind in [RangeEnd::NonExistent, RangeEnd::Unknown, RangeEnd::TimedOut] {
 			let object = FetchObject::EndOfRange {
-				reason,
+				kind,
 				group: 3,
-				object: 7,
+				object: u64::MAX,
 			};
-			assert_eq!(round_trip(&object).1, object, "{reason:#x}");
+			assert_eq!(round_trip(&object).1, object, "{kind:?}");
 		}
+	}
+
+	/// Draft 18 has no Timed-Out range, so it reports a fill timeout as Unknown and refuses
+	/// the newer value either way.
+	#[test]
+	fn draft_18_has_no_timed_out_range() {
+		assert_eq!(RangeEnd::timed_out(Version::Draft18), RangeEnd::Unknown);
+		assert_eq!(RangeEnd::timed_out(Version::Draft22), RangeEnd::TimedOut);
+
+		let timed_out = FetchObject::EndOfRange {
+			kind: RangeEnd::TimedOut,
+			group: 3,
+			object: 7,
+		};
+		let mut buf = Vec::new();
+		let version = Version::Draft18;
+		assert!(
+			timed_out
+				.encode(&mut Encoder::new(&mut buf, version.into()), version)
+				.is_err()
+		);
+
+		let mut wire = Vec::new();
+		let mut encoder = Encoder::new(&mut wire, version.into());
+		for value in [0x20C, 3, 7] {
+			encoder.varint(value).unwrap();
+		}
+		assert!(FetchObject::decode_slice(&wire, version).is_err());
 	}
 
 	/// Every other value at or above 128 is undefined, and reading one as flags would

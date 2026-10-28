@@ -454,10 +454,15 @@ pub struct Fill {
 	/// deliver objects the peer excluded, so such a fill is refused rather than widened.
 	/// Never encoded; we send no range filters.
 	pub range_filters: bool,
+
+	/// FILL_TIMEOUT (0x0A), bounding the fill's wait on upstream as it bounds a FETCH's.
+	pub fill_timeout: Option<std::time::Duration>,
 }
 
 impl Fill {
-	/// LOCATION_FILTER, the only nested parameter that changes what we deliver.
+	/// FILL_TIMEOUT, which bounds how long the fill waits on upstream.
+	const FILL_TIMEOUT: u64 = 0x0A;
+	/// LOCATION_FILTER, the only nested parameter that changes which objects we deliver.
 	const LOCATION_FILTER: u64 = 0x21;
 
 	/// The parameters the draft allows inside FILL_PARAMETERS besides LOCATION_FILTER, and
@@ -488,14 +493,29 @@ impl Param for Fill {
 		let mut buf = Vec::new();
 		let mut inner = Encoder::new(&mut buf, w.form());
 
-		// Parameters sort by id; the later type is encoded as a delta.
-		inner.varint(u64::from(self.filter.is_some()) + u64::from(self.group_order.is_some()))?;
+		// Parameters sort by id; each after the first is encoded as a delta.
+		let count = [
+			self.fill_timeout.is_some(),
+			self.filter.is_some(),
+			self.group_order.is_some(),
+		];
+		inner.varint(count.iter().filter(|present| **present).count() as u64)?;
+		let mut prev = 0;
+		let mut key = |inner: &mut Encoder<'_>, key: u64| {
+			let delta = key - prev;
+			prev = key;
+			inner.varint(delta)
+		};
+		if let Some(timeout) = self.fill_timeout {
+			key(&mut inner, Self::FILL_TIMEOUT)?;
+			inner.varint(super::fetch::fill_timeout_millis(timeout))?;
+		}
 		if let Some(filter) = self.filter {
-			inner.varint(Self::LOCATION_FILTER)?;
+			key(&mut inner, Self::LOCATION_FILTER)?;
 			filter.param_encode(&mut inner, version)?;
 		}
 		if let Some(order) = self.group_order {
-			inner.varint(if self.filter.is_some() { 1 } else { 0x22 })?;
+			key(&mut inner, 0x22)?;
 			order.param_encode(&mut inner, version)?;
 		}
 
@@ -513,6 +533,7 @@ impl Param for Fill {
 		let mut filter = None;
 		let mut group_order = None;
 		let mut range_filters = false;
+		let mut fill_timeout = None;
 		let mut prev = 0u64;
 		for i in 0..count {
 			let delta = buf.varint()?;
@@ -546,7 +567,12 @@ impl Param for Fill {
 					buf.bytes()?;
 				}
 				Framing::Varint => {
-					buf.varint()?;
+					let value = buf.varint()?;
+					if key == Self::FILL_TIMEOUT
+						&& fill_timeout.replace(std::time::Duration::from_millis(value)).is_some()
+					{
+						return Err(DecodeError::Duplicate);
+					}
 				}
 				Framing::Byte => {
 					if key == 0x22 {
@@ -571,6 +597,7 @@ impl Param for Fill {
 			filter,
 			group_order,
 			range_filters,
+			fill_timeout,
 		})
 	}
 }
@@ -588,6 +615,7 @@ mod fill_tests {
 				group_order: Some(super::super::GroupOrder::Any),
 				filter: None,
 				range_filters: false,
+				fill_timeout: None,
 			};
 			let mut bytes = Vec::new();
 			assert!(matches!(
@@ -633,6 +661,7 @@ mod fill_tests {
 			group_order: None,
 			filter: Some(filter),
 			range_filters: false,
+			fill_timeout: None,
 		};
 		let mut buf = Vec::new();
 		fill.param_encode(&mut Encoder::new(&mut buf, version.into()), version)
@@ -665,6 +694,7 @@ mod fill_tests {
 					filter,
 					group_order,
 					range_filters: false,
+					fill_timeout: None,
 				};
 				assert_eq!(round_trip(fill, version), fill, "{version} {filter:?} {group_order:?}");
 			}

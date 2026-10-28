@@ -566,6 +566,40 @@ impl<'a> RangeWriter<'a> {
 		}
 	}
 
+	/// Finish the current group and drop the unopened groups before `sequence`, which an End
+	/// of Range said hold nothing more, and `sequence` too when the range covered all of it.
+	/// Otherwise `sequence` opens with its next object.
+	fn skip_to(&mut self, sequence: u64, whole: bool) -> Result<(), Error> {
+		if sequence < self.next || sequence > self.fetch.last {
+			return Err(Error::ProtocolViolation);
+		}
+		self.finish()?;
+		let end = sequence + u64::from(whole);
+		self.fetch.fill.drop_groups(self.next..end);
+		self.next = end;
+		Ok(())
+	}
+
+	/// Refuse every group through `last` with `err`: abort the one being written, refuse the
+	/// unopened ones, and read past the rest of `last`'s objects.
+	fn refuse_through(&mut self, last: u64, err: Error) {
+		let mut state = self.slot.write().ok();
+		if let Some(state) = state.as_mut()
+			&& matches!(**state, GroupFetch::Receiving(_))
+		{
+			**state = GroupFetch::Receiving(None);
+		}
+		if let Some((sequence, Some(producer))) = self.current.take() {
+			let _ = producer.abort(err.clone());
+			self.fetch.fill.refuse_accepted(sequence, err.clone());
+		}
+		if self.next <= last {
+			self.fetch.fill.reject_groups(self.next..last + 1, err);
+			self.next = last + 1;
+		}
+		self.current = Some((last, None));
+	}
+
 	/// Settle the run once its stream ends: the groups after the last one written do not
 	/// exist, except that the last group bounded by an object may still hold later objects.
 	/// A failed stream aborts the group it was writing and refuses the rest for now.
@@ -3621,6 +3655,7 @@ impl Subscriber {
 								}),
 								group_order: Some(GroupOrder::Ascending),
 								range_filters: false,
+								fill_timeout: None,
 							});
 						} else {
 							join.fill = None;
@@ -4108,7 +4143,7 @@ impl Subscriber {
 								group_offset: 0,
 							},
 							range_filters: false,
-							fill_timeout: false,
+							fill_timeout: None,
 							properties_wanted: true,
 							// Served by the subscription it joins, which named the instance.
 							epoch: None,
@@ -5142,8 +5177,21 @@ impl Subscriber {
 		let mut prior_group = None;
 		let mut skipped: Option<(u64, u64)> = None;
 		let mut budget = kio::coop::Budget::new(32);
-		let mut first = true;
-		while let Some(object) = decode_fetch_object(stream, std::mem::take(&mut first)).await? {
+		let mut objects = false;
+		while let Some(item) = decode_fetch_object(stream, objects, objects).await? {
+			let object = match item {
+				FetchItem::Object(object) => object,
+				// The head's missing objects may still exist, so it has no end to stitch.
+				FetchItem::End {
+					kind: ietf::RangeEnd::Unknown | ietf::RangeEnd::TimedOut,
+					..
+				} => return Err(Error::Timeout),
+				FetchItem::End { .. } => {
+					tracing::warn!("a fill with a non-existent range cannot be stitched");
+					return Err(Error::Unsupported);
+				}
+			};
+			objects = true;
 			kio::wait(|waiter| budget.poll_yield(waiter)).await;
 			if !object.datagram && !object.subgroup_ok {
 				tracing::warn!("subgroup ID is not supported, dropping fill");
@@ -5398,7 +5446,9 @@ impl Subscriber {
 					group_order: GroupOrder::Ascending,
 					fetch_type,
 					range_filters: false,
-					fill_timeout: false,
+					// The most tolerant reader's age budget bounds how long the publisher waits
+					// on its own upstream; each reader still enforces its own age.
+					fill_timeout: fill.max_delay(),
 					// The copy learned the track before any fetch, from SUBSCRIBE_OK or
 					// TRACK_STATUS_OK, so a FETCH_OK repeating it is waste.
 					properties_wanted: false,
@@ -5689,62 +5739,129 @@ impl Subscriber {
 	/// properties, never past FETCH_OK's End Location. A group's objects end where the next
 	/// group's begin, since a FETCH carries every object of its range in order. Before
 	/// draft-22 the stream must also reach an object bound inside the last group.
+	///
+	/// A range that does not exist is a gap like an unmarked one. A range that timed out or
+	/// is unknown refuses every group it touches with [`Error::Timeout`], aborting the one
+	/// being written: its objects may still exist, so none of those groups is complete.
 	async fn recv_group_fetch_objects(
 		&self,
 		stream: &mut Reader<crate::transport::boxed::RecvStream, Version>,
 		writer: &mut RangeWriter<'_>,
 	) -> Result<(), Error> {
 		let timescale = writer.fetch.timescale;
-		// The next Object ID expected in the current group.
-		let mut next = 0;
+		// The group of the prior Object or End of Range, and the next Object ID expected in
+		// it, `None` once a range reached the last ID a group can hold.
 		let mut prior_group = None;
-		let mut first = true;
-		while let Some(object) = decode_fetch_object(stream, std::mem::take(&mut first)).await? {
+		let mut next = Some(0);
+		// A non-existent range that ended inside `prior_group`, from the first ID it covered,
+		// so the next object's gap accounts for those IDs too.
+		let mut absent: Option<(u64, u64)> = None;
+		let mut objects = false;
+		while let Some(item) = decode_fetch_object(stream, prior_group.is_some(), objects).await? {
+			let object = match item {
+				FetchItem::Object(object) => object,
+				FetchItem::End { kind, group, object } => {
+					// The IDs are absolute, and the range runs on from the prior Location.
+					let same = prior_group == Some(group);
+					if prior_group.is_some_and(|prior| group < prior)
+						|| (same && next.is_none_or(|next| object < next))
+						|| group < writer.fetch.first
+						|| group > writer.fetch.last
+						|| writer.bound(group).is_some_and(|end| object >= end)
+					{
+						tracing::warn!(
+							group,
+							object,
+							"an End of Range runs backwards or past FETCH_OK's End Location"
+						);
+						return Err(Error::ProtocolViolation);
+					}
+					match kind {
+						ietf::RangeEnd::NonExistent => {
+							let from = match absent {
+								Some((_, from)) if same => from,
+								_ if same => next.ok_or(Error::ProtocolViolation)?,
+								// The last ID a group can hold: none of it exists.
+								_ => {
+									writer.skip_to(group, object == u64::MAX)?;
+									0
+								}
+							};
+							absent = Some((group, from));
+						}
+						ietf::RangeEnd::Unknown | ietf::RangeEnd::TimedOut => {
+							// A prior range that reached the last ID left nothing of its group.
+							if next.is_none() && !same && writer.sequence() == prior_group {
+								writer.finish()?;
+							}
+							writer.refuse_through(group, Error::Timeout);
+							absent = None;
+						}
+					}
+					prior_group = Some(group);
+					next = object.checked_add(1);
+					continue;
+				}
+			};
 			if !object.subgroup_ok && !object.datagram {
 				tracing::warn!("subgroup ID is not supported, dropping group fetch");
 				return Err(Error::Unsupported);
 			}
+			objects = true;
 
-			let group = resolve_fetch_group(prior_group, object.group)?;
-			if let Some(group) = group {
-				prior_group = Some(group);
+			// A later object leaving its group out stays in the prior one's.
+			let sequence = match object.group {
+				Some(_) => resolve_fetch_group(prior_group, object.group)?.ok_or(Error::ProtocolViolation)?,
+				None => prior_group.ok_or(Error::ProtocolViolation)?,
+			};
+			if prior_group != Some(sequence) {
+				absent = None;
 			}
-			// The first object always names its group, so a later one leaving it out stays in it.
-			let sequence = group.or(writer.sequence()).ok_or(Error::ProtocolViolation)?;
+			prior_group = Some(sequence);
 			if writer.sequence() != Some(sequence) {
-				next = writer.open(sequence, object.datagram)?;
+				let start = writer.open(sequence, object.datagram)?;
+				// A non-existent range may have covered the group's head already.
+				next = match absent {
+					Some(_) => next.map(|next| next.max(start)),
+					None => Some(start),
+				};
 			} else if object.datagram {
 				// A datagram group has one object, so it never shares one with a stream.
 				return Err(Error::ProtocolViolation);
 			}
+			let expected = next.ok_or(Error::ProtocolViolation)?;
 
 			let id = match (object.group.is_some(), object.object) {
 				(true, Some(id)) => id,
-				(false, Some(delta)) => next
+				(false, Some(delta)) => expected
 					.checked_sub(1)
 					.and_then(|prior| prior.checked_add(delta))
 					.ok_or(Error::ProtocolViolation)?,
-				(false, None) => next,
+				(false, None) => expected,
 				_ => return Err(Error::ProtocolViolation),
 			};
-			if id < next {
+			if id < expected {
 				return Err(Error::ProtocolViolation);
 			}
 			let raw = bytes::Bytes::from(object.properties.unwrap_or_default());
-			let decoded = super::object::read(&raw, self.version, timescale)?;
-			if id > next && decoded.gap.is_none_or(|gap| gap < id - next) {
+			let mut decoded = super::object::read(&raw, self.version, timescale)?;
+			if id > expected && decoded.gap.is_none_or(|gap| gap < id - expected) {
 				return Err(Error::Unsupported);
+			}
+			// The IDs a non-existent range covered are part of this object's gap.
+			if let Some((_, from)) = absent.take() {
+				decoded.gap = Some(id - from.min(id));
 			}
 			match writer.producer() {
 				Some(producer) => {
 					self.recv_fetch_payload(stream, producer, FetchPayload { decoded, timescale, id })
 						.await?
 				}
-				// Cached already, or a datagram: read past it.
+				// Cached already, a datagram, or refused by a range: read past it.
 				None => skip_fetch_payload(stream).await?,
 			}
-			next = id.checked_add(1).ok_or(Error::ProtocolViolation)?;
-			if writer.bound(sequence).is_some_and(|end| next > end) {
+			next = Some(id.checked_add(1).ok_or(Error::ProtocolViolation)?);
+			if writer.bound(sequence).is_some_and(|end| id >= end) {
 				tracing::warn!(sequence, "a group fetch continued past FETCH_OK's End Location");
 				return Err(Error::ProtocolViolation);
 			}
@@ -5753,13 +5870,16 @@ impl Subscriber {
 		// A clean FIN short of the promised end would otherwise cache a truncated group as
 		// a complete one. Draft-22's End Location is the range covered, not the last object
 		// sent: objects missing before it do not exist (section 9.11). Before draft-22 the
-		// stream must reach the bounded group at all, not just its objects.
+		// stream must reach the bounded group at all, by an object or a range.
 		if !Filter::is_draft22(self.version)
 			&& let Some(end) = writer.fetch.end
-			&& (writer.sequence() != Some(writer.fetch.last) || next < end)
+			&& (prior_group != Some(writer.fetch.last) || next.is_some_and(|next| next < end))
 		{
-			let sequence = writer.sequence();
-			tracing::warn!(?sequence, next, "a group fetch ended before FETCH_OK's End Location");
+			tracing::warn!(
+				?prior_group,
+				?next,
+				"a group fetch ended before FETCH_OK's End Location"
+			);
 			return Err(Error::ProtocolViolation);
 		}
 
@@ -5799,20 +5919,29 @@ struct FetchedObject {
 	properties: Option<Vec<u8>>,
 }
 
-/// Decode the next fetch object header, or `None` at stream end.
+/// One entry on a fetch stream: an Object's header, or an End of Range.
+enum FetchItem {
+	Object(FetchedObject),
+	/// Every Location after the prior one, through this absolute one, shares `kind`.
+	End {
+		kind: ietf::RangeEnd,
+		group: u64,
+		object: u64,
+	},
+}
+
+/// Decode the next fetch stream entry, or `None` at stream end.
 ///
-/// The `first` object on a stream has no prior to inherit from, so a field it leaves to
-/// the prior object is a protocol violation.
+/// Until an Object or End of Range names a Location, an Object must spell its own Group and
+/// Object IDs, and until an Object goes by, its own priority and subgroup.
 async fn decode_fetch_object<R: crate::transport::poll::RecvStream>(
 	stream: &mut Reader<R, Version>,
-	first: bool,
-) -> Result<Option<FetchedObject>, Error> {
+	located: bool,
+	objects: bool,
+) -> Result<Option<FetchItem>, Error> {
 	Ok(match stream.decode_maybe::<ietf::FetchObject>().await? {
 		None => None,
-		Some(ietf::FetchObject::EndOfRange { .. }) => {
-			tracing::warn!("a fill with an End of Range cannot be stitched");
-			return Err(Error::Unsupported);
-		}
+		Some(ietf::FetchObject::EndOfRange { kind, group, object }) => Some(FetchItem::End { kind, group, object }),
 		Some(ietf::FetchObject::Object {
 			subgroup,
 			group,
@@ -5820,15 +5949,14 @@ async fn decode_fetch_object<R: crate::transport::poll::RecvStream>(
 			priority,
 			properties,
 		}) => {
-			let inherits = group.is_none()
-				|| object.is_none()
-				|| priority.is_none()
+			let relocates = group.is_none() || object.is_none();
+			let inherits = priority.is_none()
 				|| matches!(subgroup, ietf::FetchSubgroup::Prior | ietf::FetchSubgroup::PriorPlusOne);
-			if first && inherits {
-				tracing::warn!("the first fetch object refers to a prior object");
+			if (!located && relocates) || (!objects && inherits) {
+				tracing::warn!("a fetch object refers to a prior object that is not there");
 				return Err(Error::ProtocolViolation);
 			}
-			Some(FetchedObject {
+			Some(FetchItem::Object(FetchedObject {
 				group,
 				object,
 				datagram: subgroup == ietf::FetchSubgroup::Datagram,
@@ -5837,7 +5965,7 @@ async fn decode_fetch_object<R: crate::transport::poll::RecvStream>(
 					ietf::FetchSubgroup::Zero | ietf::FetchSubgroup::Prior | ietf::FetchSubgroup::Explicit(0)
 				),
 				properties,
-			})
+			}))
 		}
 	})
 }
@@ -11813,6 +11941,7 @@ fn subscribe_join(start: Option<u64>, end: Option<u64>, version: Version) -> Res
 				// One group back from the next group is the current one.
 				filter: Some(Filter::Relative(1)),
 				range_filters: false,
+				fill_timeout: None,
 			}),
 			fetch: false,
 		},
@@ -11893,6 +12022,7 @@ mod filter_tests {
 					group_order: None,
 					filter: Some(Filter::Relative(1)),
 					range_filters: false,
+					fill_timeout: None,
 				}),
 				fetch: false,
 			}
@@ -12584,7 +12714,7 @@ mod stitch_tests {
 				group_order: ietf::GroupOrder::Ascending,
 				fetch_type,
 				range_filters: false,
-				fill_timeout: false,
+				fill_timeout: None,
 				properties_wanted: true,
 				epoch: None,
 			}
@@ -14360,6 +14490,123 @@ mod stitch_tests {
 		}
 	}
 
+	/// An End of Range through `(group, object)`, on `version`'s wire.
+	fn end_of_range(version: Version, kind: ietf::RangeEnd, group: u64, object: u64) -> Vec<u8> {
+		let mut buf = Vec::new();
+		ietf::FetchObject::EndOfRange { kind, group, object }
+			.encode(&mut crate::coding::Encoder::new(&mut buf, version.into()), version)
+			.unwrap();
+		buf
+	}
+
+	/// Ranges on a fetch stream settle the groups they cover: one that does not exist ends
+	/// its group, and one that timed out refuses its groups with [`Error::Timeout`], since
+	/// their objects may still exist. The objects after them are written as usual.
+	#[moq_clock::test]
+	async fn a_range_fetch_settles_its_end_of_range_groups() {
+		let last = SEQUENCE + 2;
+		for version in [Version::Draft18, VERSION] {
+			let mut objects = group_fetch_objects(SEQUENCE, 0, &[b"a", b"b"]);
+			objects.extend(end_of_range(version, ietf::RangeEnd::NonExistent, SEQUENCE, u64::MAX));
+			objects.extend(end_of_range(
+				version,
+				ietf::RangeEnd::timed_out(version),
+				SEQUENCE + 1,
+				u64::MAX,
+			));
+			// The next group, its ID a delta from the range's.
+			let mut encoder = crate::coding::Encoder::new(&mut objects, version.into());
+			ietf::FetchObject::Object {
+				subgroup: ietf::FetchSubgroup::Zero,
+				group: Some(0),
+				object: Some(0),
+				priority: Some(0),
+				properties: None,
+			}
+			.encode(&mut encoder, version)
+			.unwrap();
+			encoder.varint(1u64).unwrap();
+			objects.push(b'c');
+
+			let mut run = GroupFetchRun::new(version, objects).await;
+			let dynamic = run.track.requests();
+			let consumer = run.track.consume();
+			let mut filling = Box::pin(consumer.fill_groups(SEQUENCE..last + 1, 0));
+			assert!(futures::poll!(filling.as_mut()).is_pending());
+			let fill = dynamic.requested_fill().await.unwrap();
+			let timed_out = consumer.fetch_group(SEQUENCE + 1, None);
+			let slot = kio::Producer::new(GroupFetch::Ready(RangeFetch {
+				fill: std::sync::Arc::new(fill),
+				timescale: None,
+				first: SEQUENCE,
+				last,
+				start: 0,
+				end: None,
+			}));
+			let res = run.subscriber.recv_group_fetch(&mut run.stream, slot).await;
+			assert!(res.is_ok(), "{version}: {res:?}");
+
+			for (sequence, payloads) in [
+				(SEQUENCE, vec![b"a".to_vec(), b"b".to_vec()]),
+				(last, vec![b"c".to_vec()]),
+			] {
+				let mut group = consumer.fetch_group(sequence, None).await.expect("cached");
+				let mut read = Vec::new();
+				while let Some(frame) = group.read_frame().await.expect("complete") {
+					read.push(frame.payload.to_vec());
+				}
+				assert_eq!(read, payloads, "{version} group {sequence}");
+			}
+			let timed_out = moq_clock::timeout(Duration::from_secs(1), timed_out)
+				.await
+				.expect("refused");
+			assert!(
+				matches!(timed_out, Err(Error::Timeout)),
+				"{version}: {:?}",
+				timed_out.err()
+			);
+		}
+	}
+
+	/// A group cut short by a timed-out range never ends cleanly, and a reader that missed
+	/// the cut copy learns it timed out rather than that it does not exist. Nothing may
+	/// follow the range inside that group.
+	#[moq_clock::test]
+	async fn a_timed_out_range_aborts_the_group_it_cuts() {
+		for version in [Version::Draft18, VERSION] {
+			let mut objects = group_fetch_objects(SEQUENCE, 0, &[b"a"]);
+			objects.extend(end_of_range(
+				version,
+				ietf::RangeEnd::timed_out(version),
+				SEQUENCE,
+				u64::MAX,
+			));
+			let mut run = GroupFetchRun::new(version, objects.clone()).await;
+			let (slot, fetch) = run.slot(None, None).await;
+			let res = run.subscriber.recv_group_fetch(&mut run.stream, slot).await;
+			assert!(res.is_ok(), "{version}: {res:?}");
+			let fetched = fetch.await;
+			assert!(matches!(fetched, Err(Error::Timeout)), "{version}: {:?}", fetched.err());
+
+			// An object after a range through the group's last ID.
+			let mut encoder = crate::coding::Encoder::new(&mut objects, version.into());
+			ietf::FetchObject::Object {
+				subgroup: ietf::FetchSubgroup::Prior,
+				group: None,
+				object: None,
+				priority: None,
+				properties: None,
+			}
+			.encode(&mut encoder, version)
+			.unwrap();
+			encoder.varint(1u64).unwrap();
+			objects.push(b'b');
+			let mut run = GroupFetchRun::new(version, objects).await;
+			let res = run.recv_objects().await;
+			assert!(matches!(res, Err(Error::ProtocolViolation)), "{version}: {res:?}");
+		}
+	}
+
 	/// One Object published as a datagram, as a fetch stream may carry it.
 	fn datagram_object(sequence: u64) -> Vec<u8> {
 		let mut properties = Vec::new();
@@ -14441,7 +14688,7 @@ mod stitch_tests {
 				group_order: ietf::GroupOrder::Ascending,
 				fetch_type,
 				range_filters: false,
-				fill_timeout: false,
+				fill_timeout: None,
 				properties_wanted: false,
 				epoch: None,
 			}
@@ -15691,6 +15938,7 @@ mod joining_fetch_tests {
 	async fn group_fetch_from_frame(version: Version, legacy: bool, ended: bool) {
 		const GROUP: u64 = 4;
 		const START: u64 = 2;
+		const MAX_DELAY: Duration = Duration::from_secs(5);
 		const LAST: u64 = START + 1;
 		let draft22 = Filter::is_draft22(version);
 
@@ -15770,6 +16018,7 @@ mod joining_fetch_tests {
 			GROUP,
 			group::Fetch {
 				frame_start: START,
+				max_delay: Some(MAX_DELAY),
 				..Default::default()
 			}
 		));
@@ -15807,6 +16056,8 @@ mod joining_fetch_tests {
 		let fetch = messages.iter().find(|(id, _)| *id == ietf::Fetch::ID).expect("FETCH");
 		let mut body = Decoder::new(&fetch.1, version.into());
 		let msg = ietf::Fetch::decode_msg(&mut body, version).unwrap();
+		// The reader's age bound is how long it may wait on the upstream.
+		assert_eq!(msg.fill_timeout, Some(MAX_DELAY), "{version}");
 		let from = ietf::Location {
 			group: GROUP,
 			object: START,

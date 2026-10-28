@@ -13,6 +13,8 @@ use std::{
 	time::Duration,
 };
 
+use rangemap::RangeSet;
+
 use crate::transport::poll::SendGroup as _;
 use crate::transport::poll::{GroupOf, SendOptions};
 
@@ -103,6 +105,8 @@ enum FillStep {
 	Batch,
 	Partial(frame::Consumer),
 	Done,
+	/// The fill's budget ran out waiting on the next frame.
+	TimedOut,
 }
 
 /// Where a fetch object sits relative to the one written before it on the same stream.
@@ -152,13 +156,200 @@ impl FetchRange {
 	fn until(&self, sequence: u64) -> Option<u64> {
 		(sequence == self.end.group && self.end.object > 0).then_some(self.end.object)
 	}
+
+	/// The last Object ID the range covers in group `sequence`: the bound, or the last ID any
+	/// group can hold.
+	fn last_object(&self, sequence: u64) -> u64 {
+		self.until(sequence).map_or(u64::MAX, |until| until - 1)
+	}
+}
+
+/// FILL_TIMEOUT's budget for one request: the total time it may spend waiting on objects
+/// that are not immediately available, never reset per object or group. Without one it
+/// waits as long as they take.
+struct FillBudget(Option<crate::time::Deadline>);
+
+impl FillBudget {
+	fn new(runtime: &crate::time::Deadlines, timeout: Option<Duration>) -> Self {
+		Self(timeout.map(|timeout| crate::time::Deadline::after(runtime, timeout)))
+	}
+
+	/// Ready once the budget is spent; never without one.
+	fn poll_spent(&mut self, waiter: &kio::Waiter) -> Poll<()> {
+		match &mut self.0 {
+			Some(deadline) => deadline.poll(waiter),
+			None => Poll::Pending,
+		}
+	}
+
+	/// Poll until `poll` resolves, or `None` once the budget is spent first. What is ready
+	/// now always wins, so a zero budget still gets the cache.
+	async fn within<T>(&mut self, mut poll: impl FnMut(&kio::Waiter) -> Poll<T>) -> Option<T> {
+		kio::wait(|waiter| match poll(waiter) {
+			Poll::Ready(value) => Poll::Ready(Some(value)),
+			Poll::Pending => self.poll_spent(waiter).map(|()| None),
+		})
+		.await
+	}
+}
+
+/// One part of a FETCH answer, in the order it goes out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FetchPart {
+	/// A group to read and write.
+	Group(u64),
+	/// Groups nobody could provide within the budget, which may still exist.
+	TimedOut(std::ops::Range<u64>),
+}
+
+/// What a fetch stream said last, which the next entry is spelled against, and the range
+/// it answers.
+struct FetchCursor {
+	range: FetchRange,
+	descending: bool,
+	/// The group the stream starts at, which a leading range need not split from.
+	opening: u64,
+	version: Version,
+	/// The group of the prior Object or End of Range.
+	group: Option<u64>,
+	/// The prior entry was an End of Range, which always runs to its group's last ID here.
+	ranged: bool,
+	/// An Object went out, so a later one may inherit its priority.
+	objects: bool,
+}
+
+impl FetchCursor {
+	fn new(range: FetchRange, descending: bool, opening: u64, version: Version) -> Self {
+		Self {
+			range,
+			descending,
+			opening,
+			version,
+			group: None,
+			ranged: false,
+			objects: false,
+		}
+	}
+
+	/// Note that group `sequence` wrote objects.
+	fn wrote(&mut self, sequence: u64) {
+		self.group = Some(sequence);
+		self.ranged = false;
+		self.objects = true;
+	}
+
+	/// Write an End of Range through the range's last object in `group`.
+	async fn range(
+		&mut self,
+		stream: &mut Writer<Ranked<crate::transport::boxed::SendStream>, Version>,
+		kind: ietf::RangeEnd,
+		group: u64,
+	) -> Result<(), Error> {
+		let object = self.range.last_object(group);
+		stream
+			.encode(&ietf::FetchObject::EndOfRange { kind, group, object })
+			.await?;
+		self.group = Some(group);
+		self.ranged = true;
+		Ok(())
+	}
+
+	/// Mark the groups of `run` timed out. Unmarked gaps say their objects do not exist, but
+	/// a range covers everything since the prior entry, so whatever lies between, such as
+	/// the tail of a complete group, is first split off as non-existent.
+	async fn timed_out(
+		&mut self,
+		stream: &mut Writer<Ranked<crate::transport::boxed::SendStream>, Version>,
+		run: std::ops::Range<u64>,
+	) -> Result<(), Error> {
+		let (first, last) = match self.descending {
+			true => (run.end - 1, run.start),
+			false => (run.start, run.end - 1),
+		};
+		let before = match self.descending {
+			true => first.checked_add(1),
+			false => first.checked_sub(1),
+		};
+		let adjacent = match self.group {
+			Some(group) => self.ranged && Some(group) == before,
+			None => first == self.opening,
+		};
+		if !adjacent && let Some(before) = before {
+			self.range(stream, ietf::RangeEnd::NonExistent, before).await?;
+		}
+		self.range(stream, ietf::RangeEnd::timed_out(self.version), last).await
+	}
+
+	/// Mark group `sequence` timed out after whatever of it went out.
+	async fn group_timed_out(
+		&mut self,
+		stream: &mut Writer<Ranked<crate::transport::boxed::SendStream>, Version>,
+		sequence: u64,
+	) -> Result<(), Error> {
+		match self.group == Some(sequence) && !self.ranged {
+			true => {
+				self.range(stream, ietf::RangeEnd::timed_out(self.version), sequence)
+					.await
+			}
+			false => self.timed_out(stream, sequence..sequence + 1).await,
+		}
+	}
+}
+
+/// Fill the groups of `span` the cache misses within `budget`, returning the guard keeping
+/// them cached, the groups to read, lowest first, and the runs that timed out.
+///
+/// Leaving out a group the source failed to serve would tell the peer it does not exist,
+/// so a failure that says nothing about the group refuses the whole span.
+async fn fill_span(
+	track: &track::Consumer,
+	span: std::ops::Range<u64>,
+	priority: i8,
+	budget: &mut FillBudget,
+) -> Result<(track::Filled, Vec<u64>, RangeSet<u64>), Error> {
+	let mut filling = track.fill_groups(span.clone(), priority).into_inner();
+	let (filled, abandoned) = match budget.within(|waiter| kio::Task::poll(&mut filling, waiter)).await {
+		Some(filled) => (filled, RangeSet::new()),
+		None => filling.abandon(span.clone()),
+	};
+	if let Some(err) = filled.refused(span.clone()).into_iter().find(|err| {
+		!matches!(
+			err,
+			Error::NotFound | Error::NotFetchable | Error::Unsupported | Error::Old | Error::Timeout
+		)
+	}) {
+		return Err(err);
+	}
+	// A group cached or filled for this answer exists even if the cache evicted it while
+	// the rest of the span filled: reading it again fetches it again.
+	let mut groups = filled.held(span.clone());
+	groups.extend(track.cached_groups(span.clone()));
+	let mut timed_out = filled.timed_out(span);
+	for run in abandoned.iter() {
+		timed_out.insert(run.clone());
+	}
+	for sequence in &groups {
+		timed_out.remove(*sequence..sequence + 1);
+	}
+	Ok((filled, groups.into_iter().collect(), timed_out))
+}
+
+/// The groups to read and the runs that timed out, lowest first.
+fn fetch_parts(groups: Vec<u64>, timed_out: &RangeSet<u64>) -> Vec<FetchPart> {
+	let mut parts: Vec<FetchPart> = groups.into_iter().map(FetchPart::Group).collect();
+	parts.extend(timed_out.iter().cloned().map(FetchPart::TimedOut));
+	parts.sort_by_key(|part| match part {
+		FetchPart::Group(sequence) => *sequence,
+		FetchPart::TimedOut(run) => run.start,
+	});
+	parts
 }
 
 /// A FETCH resolved against its track, with the highest group it answers read ahead.
 struct PreparedFetch {
 	range: FetchRange,
-	/// The other groups the answer holds, lowest first.
-	groups: Vec<u64>,
+	/// The rest of the answer below its highest group, lowest first.
+	parts: Vec<FetchPart>,
 	/// The highest group the answer holds, read ahead so FETCH_OK can say where it ends.
 	last: FetchedGroup,
 	/// Keeps the groups a relay filled for the answer cached while they are written.
@@ -171,7 +362,8 @@ struct PreparedFetch {
 /// The range ends at the Largest Object's group, known while a live feed writes the track
 /// or once it ended, and reads that group whole even while it is open. A range spanning several
 /// groups first fills what the cache misses, which on a relay is one upstream FETCH per
-/// run of missing groups, then answers from the groups the cache holds.
+/// run of missing groups, then answers from the groups the cache holds. What `budget` runs
+/// out on, or the source gave up on, is answered as timed out.
 async fn prepare_fetch(
 	track: &track::Consumer,
 	mut range: FetchRange,
@@ -179,12 +371,13 @@ async fn prepare_fetch(
 	joined: bool,
 	priority: i8,
 	compression: bool,
+	budget: &mut FillBudget,
 ) -> Result<PreparedFetch, (Error, String)> {
 	let failed = |err: Error| {
 		let reason = err.to_string();
 		(err, reason)
 	};
-	track.info().await.map_err(failed)?;
+	let info = track.info().await.map_err(failed)?;
 	// The cache's newest object is Largest Object while a live feed writes the track, or once
 	// the track ended at its newest group. A fetch-only copy retains its publisher's report
 	// independently. A joining FETCH ends where its subscription starts instead.
@@ -248,31 +441,23 @@ async fn prepare_fetch(
 		}
 	}
 
-	let (filled, mut groups) = match range.start.group == range.end.group {
-		true => (None, vec![range.start.group]),
+	let (filled, mut groups, mut timed_out) = match range.start.group == range.end.group {
+		true => (None, vec![range.start.group], RangeSet::new()),
 		false => {
 			let span = range.start.group..range.end.group.saturating_add(1);
-			let filled = track.fill_groups(span.clone(), priority).await;
-			// Leaving out a group the source failed to serve would tell the peer it does not
-			// exist, so a failure that says nothing about the group refuses the whole answer.
-			if let Some(err) = filled.refused(span.clone()).into_iter().find(|err| {
-				!matches!(
-					err,
-					Error::NotFound | Error::NotFetchable | Error::Unsupported | Error::Old
-				)
-			}) {
-				return Err(failed(err));
-			}
-			// A group cached or filled for this answer exists even if the cache evicted it
-			// while the rest of the span filled: reading it again fetches it again.
-			let mut groups = filled.held(span.clone());
-			groups.extend(track.cached_groups(span));
-			(Some(filled), groups.into_iter().collect())
+			let (filled, groups, timed_out) = fill_span(track, span, priority, budget).await.map_err(failed)?;
+			(Some(filled), groups, timed_out)
 		}
 	};
 	// A group gone or never fetchable is absent from the answer, as the response skips it,
-	// unless it is the only one.
+	// unless it is the only one. One that timed out may exist, so it stays.
 	let last = loop {
+		let top = timed_out.iter().next_back().map(|run| run.end - 1);
+		if top > groups.last().copied() {
+			let sequence = top.expect("above any group");
+			timed_out.remove(sequence..sequence + 1);
+			break FetchedGroup::timed_out(sequence, range.skip(sequence), info);
+		}
 		let Some(sequence) = groups.pop() else {
 			return Err((Error::NotFound, "no group in range".into()));
 		};
@@ -283,17 +468,19 @@ async fn prepare_fetch(
 			range.until(sequence),
 			priority,
 			compression,
+			budget,
 		)
 		.await
 		{
 			Ok(group) => break group,
-			Err(Error::NotFound | Error::NotFetchable | Error::Unsupported | Error::Old) if !groups.is_empty() => {}
+			Err(Error::NotFound | Error::NotFetchable | Error::Unsupported | Error::Old)
+				if !groups.is_empty() || !timed_out.is_empty() => {}
 			Err(err) => return Err(failed(err)),
 		}
 	};
 	Ok(PreparedFetch {
 		range,
-		groups,
+		parts: fetch_parts(groups, &timed_out),
 		last,
 		_filled: filled,
 	})
@@ -310,6 +497,8 @@ struct FetchedGroup {
 	end_object: Option<Arc<crate::model::object::Fields>>,
 	/// The fetched range reached the finished group's final object.
 	complete: bool,
+	/// The wait for the objects after `frames` ran out, so they may still exist.
+	timed_out: bool,
 	/// The track's info, which FETCH_OK describes and whose units stamp the objects.
 	info: track::Info,
 }
@@ -325,6 +514,8 @@ struct FetchObjectInfo<'a> {
 	fields: Option<&'a crate::model::object::Fields>,
 	/// The draft the track's publisher spoke, which serialized `fields`.
 	source: Option<Version>,
+	/// An Object went out before this one, so its priority can be inherited.
+	prior_object: bool,
 }
 
 fn fetch_prior(prior: Option<u64>, object: u64) -> Result<FetchPrior, Error> {
@@ -339,6 +530,19 @@ fn fetch_prior(prior: Option<u64>, object: u64) -> Result<FetchPrior, Error> {
 }
 
 impl FetchedGroup {
+	/// A group nothing could be read of before the wait for it ran out.
+	fn timed_out(sequence: u64, skip: u64, info: track::Info) -> Self {
+		Self {
+			sequence,
+			first: skip,
+			frames: Vec::new(),
+			end_object: None,
+			complete: false,
+			timed_out: true,
+			info,
+		}
+	}
+
 	/// Drop the END_OF_GROUP object: FETCH objects carry no status, so each group ends at its
 	/// last frame, which is all a receiver can account for.
 	fn without_status(mut self) -> Self {
@@ -366,7 +570,8 @@ impl FetchedGroup {
 /// `until`, or through the end of the group without one.
 ///
 /// This is a [`track::Consumer::fetch_group`], so a relay fetches a miss upstream. The
-/// track's info resolves first, as it would for a SUBSCRIBE.
+/// track's info resolves first, as it would for a SUBSCRIBE. Once `budget` runs out, or the
+/// source gives up on the group, it ends with what was read and is marked timed out.
 async fn read_fetch(
 	track: &track::Consumer,
 	sequence: u64,
@@ -374,6 +579,7 @@ async fn read_fetch(
 	until: Option<u64>,
 	priority: i8,
 	compression: bool,
+	budget: &mut FillBudget,
 ) -> Result<FetchedGroup, Error> {
 	let info = track.info().await?;
 	let cached = track.peek_group(sequence);
@@ -390,7 +596,7 @@ async fn read_fetch(
 		(None, Some(_)) => skip,
 		(_, None) => 0,
 	};
-	let mut group = track
+	let mut fetching = track
 		.fetch_group(
 			sequence,
 			group::Fetch {
@@ -399,7 +605,13 @@ async fn read_fetch(
 				..Default::default()
 			},
 		)
-		.await?;
+		.into_inner();
+	let mut group = match budget.within(|waiter| kio::Task::poll(&mut fetching, waiter)).await {
+		Some(Ok(group)) => group,
+		Some(Err(Error::Timeout)) | None => return Ok(FetchedGroup::timed_out(sequence, skip, info)),
+		Some(Err(err)) => return Err(err),
+	};
+	drop(fetching);
 	if compression {
 		group = group.compressed();
 	}
@@ -407,15 +619,20 @@ async fn read_fetch(
 	let mut frames = Vec::new();
 	// Reading an object past the range proves the range missed the group's end.
 	let mut overshot = false;
+	let mut timed_out = false;
 	// A long cached group is read a slice per poll, so the session's other tasks still run.
-	let mut budget = kio::coop::Budget::new(32);
+	let mut coop = kio::coop::Budget::new(32);
 	loop {
-		kio::wait(|waiter| budget.poll_yield(waiter)).await;
+		kio::wait(|waiter| coop.poll_yield(waiter)).await;
 		if group.wire().is_some_and(|wire| !wire.fetchable) {
 			return Err(Error::Unsupported);
 		}
 		let ordinal = group.index();
-		let Some(frame) = kio::wait(|waiter| group.poll_read_object(waiter)).await? else {
+		let Some(frame) = budget.within(|waiter| group.poll_read_object(waiter)).await else {
+			timed_out = true;
+			break;
+		};
+		let Some(frame) = frame? else {
 			break;
 		};
 		let id = frame.fields.as_ref().map_or(ordinal, |fields| fields.id);
@@ -437,6 +654,7 @@ async fn read_fetch(
 	// A bounded range can reach the group's end without reading its terminal None, and a
 	// start past the end is already there.
 	let complete = !overshot
+		&& !timed_out
 		&& matches!(group.finished().now_or_never(), Some(Ok(_)))
 		&& group.index() >= group.frame_count() as u64;
 	let end_object = group
@@ -452,6 +670,7 @@ async fn read_fetch(
 		frames,
 		end_object,
 		complete,
+		timed_out,
 		info,
 	})
 }
@@ -1475,7 +1694,10 @@ impl Publisher {
 					let fill = msg
 						.fill
 						.filter(|_| msg.forward && Filter::is_draft22(self.version))
-						.map(|fill| (fill_range(fill, msg.filter, edge.largest), cache, timescale));
+						.map(|fill| {
+							let timeout = fill.fill_timeout;
+							(fill_range(fill, msg.filter, edge.largest), timeout, cache, timescale)
+						});
 
 					// Buffered whole before its first await, so however the subscription is
 					// dropped from here, the request can still end on the wire.
@@ -1496,9 +1718,15 @@ impl Publisher {
 					let opened = track_serve.opened.clone();
 					let ranking = track_serve.ranking.clone();
 					let fill = async {
-						if let Some((fill, cache, timescale)) = fill {
-							self.run_fill(fill, &ranking, cache, timescale, &opened, ranking.request_id)
-								.await;
+						if let Some((fill, timeout, track, timescale)) = fill {
+							let task = FillTask {
+								track,
+								timescale,
+								opened: &opened,
+								request_id: ranking.request_id,
+								timeout,
+							};
+							self.run_fill(fill, &ranking, task).await;
 						}
 					};
 					let mut served = match msg.forward {
@@ -1934,10 +2162,13 @@ impl Publisher {
 									.run_fill(
 										fill.fill,
 										&fill.ranking,
-										fill.track,
-										fill.timescale,
-										&fill.opened,
-										fill.request_id,
+										FillTask {
+											track: fill.track,
+											timescale: fill.timescale,
+											opened: &fill.opened,
+											request_id: fill.request_id,
+											timeout: fill.timeout,
+										},
 									)
 									.await;
 							});
@@ -2298,15 +2529,16 @@ impl Publisher {
 	/// Counts its stream into `opened` once it opens, like a group stream, so
 	/// PUBLISH_DONE's Stream Count includes it however the subscription ends. It ranks in
 	/// its subscription's `ranking` as the group it fills.
-	async fn run_fill(
-		&self,
-		fill: FillServe,
-		ranking: &Ranking<GroupOf<Transport>>,
-		track: track::Consumer,
-		timescale: Option<Timescale>,
-		opened: &AtomicU64,
-		request_id: RequestId,
-	) {
+	async fn run_fill(&self, fill: FillServe, ranking: &Ranking<GroupOf<Transport>>, task: FillTask<'_>) {
+		let FillTask {
+			track,
+			timescale,
+			opened,
+			request_id,
+			timeout,
+		} = task;
+		// FILL_TIMEOUT bounds the fill's wait as it does a FETCH's, from the request.
+		let mut budget = FillBudget::new(&self.runtime, timeout);
 		let priority = *ranking.priority.read();
 		let rank = match fill {
 			FillServe::Empty => return,
@@ -2336,7 +2568,7 @@ impl Publisher {
 			stream.varint(FetchHeader::TYPE).await?;
 			stream.encode(&FetchHeader { request_id }).await?;
 
-			let (range, groups, _filled) = match fill {
+			let (range, mut parts, descending, _filled) = match fill {
 				FillServe::Group { sequence, skip, until } => (
 					FetchRange {
 						start: Location {
@@ -2348,22 +2580,13 @@ impl Publisher {
 							object: until.unwrap_or(0),
 						},
 					},
-					vec![sequence],
+					vec![FetchPart::Group(sequence)],
+					false,
 					None,
 				),
 				FillServe::Range { start, end, order } => {
 					let span = start.group..end.group.saturating_add(1);
-					let filled = track.fill_groups(span.clone(), priority).await;
-					if let Some(err) = filled.refused(span.clone()).into_iter().find(|err| {
-						!matches!(
-							err,
-							Error::NotFound | Error::NotFetchable | Error::Unsupported | Error::Old
-						)
-					}) {
-						return Err(err);
-					}
-					let mut groups = filled.held(span.clone());
-					groups.extend(track.cached_groups(span));
+					let (filled, groups, timed_out) = fill_span(&track, span, priority, &mut budget).await?;
 					(
 						FetchRange {
 							start,
@@ -2372,21 +2595,31 @@ impl Publisher {
 								object: end.object.map_or(0, |object| object.saturating_add(1)),
 							},
 						},
-						{
-							let mut groups: Vec<_> = groups.into_iter().collect();
-							if order.map_or(ranking.order, GroupOrder::to_order) == Order::Descending {
-								groups.reverse();
-							}
-							groups
-						},
+						fetch_parts(groups, &timed_out),
+						order.map_or(ranking.order, GroupOrder::to_order) == Order::Descending,
 						Some(filled),
 					)
 				}
 				_ => return Err(Error::Unsupported),
 			};
-			let mut prior_group = None;
-			for sequence in groups {
-				let group = match track
+			if descending {
+				parts.reverse();
+			}
+			let opening = match parts.first() {
+				Some(FetchPart::Group(sequence)) => *sequence,
+				Some(FetchPart::TimedOut(run)) if descending => run.end - 1,
+				_ => range.start.group,
+			};
+			let mut cursor = FetchCursor::new(range, descending, opening, self.version);
+			for part in parts {
+				let sequence = match part {
+					FetchPart::Group(sequence) => sequence,
+					FetchPart::TimedOut(run) => {
+						cursor.timed_out(&mut stream, run).await?;
+						continue;
+					}
+				};
+				let mut fetching = track
 					.fetch_group(
 						sequence,
 						group::Fetch {
@@ -2394,22 +2627,28 @@ impl Publisher {
 							..Default::default()
 						},
 					)
-					.await
-				{
-					Ok(group) => group,
-					Err(Error::NotFound | Error::NotFetchable | Error::Unsupported | Error::Old)
+					.into_inner();
+				let group = match budget.within(|waiter| kio::Task::poll(&mut fetching, waiter)).await {
+					Some(Ok(group)) => group,
+					// It may still exist.
+					Some(Err(Error::Timeout)) | None => {
+						cursor.group_timed_out(&mut stream, sequence).await?;
+						continue;
+					}
+					Some(Err(Error::NotFound | Error::NotFetchable | Error::Unsupported | Error::Old))
 						if matches!(fill, FillServe::Range { .. }) =>
 					{
 						continue;
 					}
-					Err(err) => return Err(err),
+					Some(Err(err)) => return Err(err),
 				};
+				drop(fetching);
 				let group = if self.peer_setup.get().await.flate {
 					group.compressed()
 				} else {
 					group
 				};
-				Self::write_fetch_group(
+				let timed_out = Self::write_fetch_group(
 					&mut stream,
 					group,
 					sequence,
@@ -2418,10 +2657,13 @@ impl Publisher {
 						until: range.until(sequence),
 					},
 					timescale,
-					self.version,
-					&mut prior_group,
+					&mut cursor,
+					&mut budget,
 				)
 				.await?;
+				if timed_out {
+					cursor.group_timed_out(&mut stream, sequence).await?;
+				}
 			}
 			Ok(())
 		}
@@ -2448,15 +2690,18 @@ impl Publisher {
 	/// every later one inherits them and increments the Object ID, so only the
 	/// properties (the timestamp) and the payload go on the wire. A fetch object has no
 	/// status field.
+	///
+	/// Returns whether `budget` ran out before the group did, between whole frames.
 	async fn write_fetch_group(
 		stream: &mut Writer<Ranked<crate::transport::boxed::SendStream>, Version>,
 		mut group: group::Consumer,
 		sequence: u64,
 		slice: GroupSlice,
 		timescale: Option<Timescale>,
-		version: Version,
-		prior_group: &mut Option<u64>,
-	) -> Result<(), Error> {
+		cursor: &mut FetchCursor,
+		budget: &mut FillBudget,
+	) -> Result<bool, Error> {
+		let version = cursor.version;
 		let GroupSlice { skip, until } = slice;
 		let mut index: u64 = 0;
 		let mut prior = None;
@@ -2465,10 +2710,11 @@ impl Publisher {
 		if group.wire().is_some_and(|wire| !wire.fetchable) {
 			return Err(Error::Unsupported);
 		}
+		let mut timed_out = false;
 		// A long cached group is written a slice per poll, so the session's other tasks still run.
-		let mut budget = kio::coop::Budget::new(32);
+		let mut coop = kio::coop::Budget::new(32);
 		'serve: loop {
-			kio::wait(|waiter| budget.poll_yield(waiter)).await;
+			kio::wait(|waiter| coop.poll_yield(waiter)).await;
 			// The cap is the Largest Object snapshot: the group may keep growing, but
 			// everything past the snapshot belongs to the subscription, not the fill.
 			if until.is_some_and(|until| index >= until) {
@@ -2486,7 +2732,7 @@ impl Publisher {
 							Poll::Ready(Ok(Some(frame))) => Poll::Ready(Ok(FillStep::Partial(frame))),
 							Poll::Ready(Ok(None)) => Poll::Ready(Ok(FillStep::Done)),
 							Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-							Poll::Pending => Poll::Pending,
+							Poll::Pending => budget.poll_spent(waiter).map(|()| Ok(FillStep::TimedOut)),
 						},
 						Poll::Ready(Ok(0)) => Poll::Ready(Ok(FillStep::Done)),
 						Poll::Ready(Ok(_)) => Poll::Ready(Ok(FillStep::Batch)),
@@ -2513,13 +2759,14 @@ impl Publisher {
 								FetchObjectInfo {
 									sequence,
 									object: index,
-									prior: fetch_position(*prior_group, sequence, prior, index)?,
+									prior: fetch_position(cursor.group, sequence, prior, index)?,
 									timestamp: frame.timestamp,
 									inflated: frame.inflated,
 									timescale,
 									version,
 									fields: frame.fields.as_deref(),
 									source: group.ietf(),
+									prior_object: cursor.objects || prior.is_some(),
 								},
 							)
 							.await?;
@@ -2561,13 +2808,14 @@ impl Publisher {
 						FetchObjectInfo {
 							sequence,
 							object: index,
-							prior: fetch_position(*prior_group, sequence, prior, index)?,
+							prior: fetch_position(cursor.group, sequence, prior, index)?,
 							timestamp: frame.timestamp,
 							inflated: frame.inflated,
 							timescale,
 							version,
 							fields: frame.fields.as_deref(),
 							source: group.ietf(),
+							prior_object: cursor.objects || prior.is_some(),
 						},
 					)
 					.await?;
@@ -2594,17 +2842,21 @@ impl Publisher {
 					}
 				}
 				FillStep::Done => break,
+				FillStep::TimedOut => {
+					timed_out = true;
+					break;
+				}
 			}
 		}
 
-		if until.is_some_and(|until| index < until) {
+		if !timed_out && until.is_some_and(|until| index < until) {
 			return Err(Error::NotFound);
 		}
 
 		if prior.is_some() {
-			*prior_group = Some(sequence);
+			cursor.wrote(sequence);
 		}
-		Ok(())
+		Ok(timed_out)
 	}
 
 	/// Write one fetch object's header and timestamp properties in the negotiated layout.
@@ -2622,6 +2874,7 @@ impl Publisher {
 			version,
 			fields,
 			source,
+			prior_object,
 		} = header;
 		// Relayed properties survive without a timescale. Plain frames generate a
 		// timestamp only on a timed track.
@@ -2662,12 +2915,13 @@ impl Publisher {
 				priority: None,
 				properties,
 			},
-			// A new group restates its Object ID absolutely, and keeps the prior priority.
+			// A new group restates its Object ID absolutely, and keeps the prior priority, or
+			// spells it after only End of Range markers, which carry none.
 			FetchPrior::Group(group) => ietf::FetchObject::Object {
 				subgroup: ietf::FetchSubgroup::Zero,
 				group: Some(group),
 				object: Some(object),
-				priority: None,
+				priority: (!prior_object).then_some(0),
 				properties,
 			},
 		};
@@ -2677,12 +2931,12 @@ impl Publisher {
 		Ok(())
 	}
 
-	/// Write one group's objects to a fetch stream, after those of `prior_group`, which it
-	/// becomes once the group wrote any.
+	/// Write one group's objects to a fetch stream after what `cursor` last said, which the
+	/// group becomes once it wrote any.
 	async fn write_fetched_group(
 		writer: &mut Writer<Ranked<crate::transport::boxed::SendStream>, Version>,
 		group: FetchedGroup,
-		prior_group: &mut Option<u64>,
+		cursor: &mut FetchCursor,
 		version: Version,
 		timescale: Option<Timescale>,
 	) -> Result<(), Error> {
@@ -2692,8 +2946,7 @@ impl Publisher {
 		for (ordinal, frame) in (group.first..).zip(group.frames) {
 			kio::wait(|waiter| budget.poll_yield(waiter)).await;
 			let object = frame.fields.as_ref().map_or(ordinal, |fields| fields.id);
-			let position = fetch_position(*prior_group, group.sequence, prior, object)?;
-			prior = Some(object);
+			let position = fetch_position(cursor.group, group.sequence, prior, object)?;
 			Self::write_fetch_object(
 				writer,
 				FetchObjectInfo {
@@ -2706,13 +2959,15 @@ impl Publisher {
 					version,
 					fields: frame.fields.as_deref(),
 					source,
+					prior_object: cursor.objects || prior.is_some(),
 				},
 			)
 			.await?;
+			prior = Some(object);
 			Self::write_fetch_payload(writer, frame.frame.payload).await?;
 		}
 		if prior.is_some() {
-			*prior_group = Some(group.sequence);
+			cursor.wrote(group.sequence);
 		}
 		Ok(())
 	}
@@ -2804,13 +3059,9 @@ impl Publisher {
 			.await;
 		}
 
-		// FILL_TIMEOUT=0 asks for cache only, and any budget ends in Timed-Out gaps we
-		// don't write, so waiting on upstream regardless would ignore what was asked.
-		if msg.fill_timeout {
-			return self
-				.reject_fetch(stream, &Error::Unsupported, "FILL_TIMEOUT not supported")
-				.await;
-		}
+		// FILL_TIMEOUT bounds the whole request's wait on objects it does not have yet, from
+		// now; zero is whatever the cache holds.
+		let mut budget = FillBudget::new(&self.runtime, msg.fill_timeout);
 
 		// Pinned to the instance it names, if any: another is refused, never served.
 		let epoch = msg.epoch.clone();
@@ -2990,6 +3241,7 @@ impl Publisher {
 				joined,
 				priority,
 				compression,
+				&mut budget,
 			));
 			kio::wait(|waiter| {
 				let mut cx = waiter.context();
@@ -3009,7 +3261,7 @@ impl Publisher {
 		};
 		let PreparedFetch {
 			range,
-			groups,
+			parts,
 			last: group,
 			_filled,
 		} = match prepared {
@@ -3045,13 +3297,33 @@ impl Publisher {
 
 		let end_location = if joined {
 			// The subscription starts at the saved Largest Object, so the prefix of that
-			// group has to be here in full or the two leave a gap.
-			if group.sequence != end.group || group.end() != end.object {
+			// group has to be here in full or the two leave a gap. A timed-out one says so.
+			if group.sequence != end.group || (!group.timed_out && group.end() != end.object) {
 				return self
 					.reject_fetch(stream, &Error::Evicted, "joining prefix unavailable")
 					.await;
 			}
 			end
+		} else if group.timed_out {
+			// The answer runs through the range's end in this group, whose objects after the
+			// last read timed out. Before draft-22 the End Location is one past what it covers,
+			// with Object 0 covering the requested End Group whole.
+			let sequence = group.sequence;
+			match (draft22, range.until(sequence)) {
+				(true, _) => Location {
+					group: sequence,
+					object: range.last_object(sequence),
+				},
+				(false, Some(until)) => Location {
+					group: sequence,
+					object: until,
+				},
+				(false, None) if sequence == end.group && !capped => end,
+				(false, None) => Location {
+					group: sequence.saturating_add(1),
+					object: 0,
+				},
+			}
 		} else if draft22 {
 			// Draft-22's End Location is inclusive: the end, already capped at the Largest
 			// Object's group (section 10.14). Objects missing before it do not exist. A whole-group end has no
@@ -3082,9 +3354,14 @@ impl Publisher {
 
 		// Groups go out in the order asked for, each read as its turn comes.
 		let last = group.sequence;
-		let mut order = groups;
-		order.push(last);
-		if matches!(msg.group_order, GroupOrder::Descending) {
+		let descending = matches!(msg.group_order, GroupOrder::Descending);
+		let opening = match descending {
+			true => last,
+			false => range.start.group,
+		};
+		let mut order = parts;
+		order.push(FetchPart::Group(last));
+		if descending {
 			order.reverse();
 		}
 		let mut last_group = Some(group);
@@ -3135,8 +3412,15 @@ impl Publisher {
 					request_id: msg.request_id,
 				})
 				.await?;
-			let mut prior_group = None;
-			for sequence in order {
+			let mut cursor = FetchCursor::new(range, descending, opening, self.version);
+			for part in order {
+				let sequence = match part {
+					FetchPart::Group(sequence) => sequence,
+					FetchPart::TimedOut(run) => {
+						cursor.timed_out(&mut writer, run).await?;
+						continue;
+					}
+				};
 				let group = match last_group.take_if(|group| group.sequence == sequence) {
 					Some(group) => group,
 					None => match read_fetch(
@@ -3146,6 +3430,7 @@ impl Publisher {
 						range.until(sequence),
 						priority,
 						compression,
+						&mut budget,
 					)
 					.await
 					{
@@ -3156,7 +3441,12 @@ impl Publisher {
 						Err(err) => return Err(err),
 					},
 				};
-				Self::write_fetched_group(&mut writer, group, &mut prior_group, self.version, timescale).await?;
+				let timed_out = group.timed_out;
+				Self::write_fetched_group(&mut writer, group, &mut cursor, self.version, timescale).await?;
+				// The objects after the last one written may still exist.
+				if timed_out {
+					cursor.group_timed_out(&mut writer, sequence).await?;
+				}
 			}
 			settle(&mut writer).await?;
 			Ok::<(), Error>(())
@@ -4494,12 +4784,26 @@ struct Terminal {
 
 struct SubscriptionFill {
 	fill: FillServe,
+	/// The fill's FILL_TIMEOUT.
+	timeout: Option<Duration>,
 	largest: Option<Location>,
 	request_id: RequestId,
 	track: track::Consumer,
 	ranking: Ranking<GroupOf<Transport>>,
 	timescale: Option<Timescale>,
 	opened: Arc<AtomicU64>,
+}
+
+/// What a draft-22 fill serves from, and where its stream counts.
+struct FillTask<'a> {
+	track: track::Consumer,
+	timescale: Option<Timescale>,
+	/// The subscription's opened streams, which the fill's stream joins.
+	opened: &'a AtomicU64,
+	/// The request that asked for the fill, which names its stream.
+	request_id: RequestId,
+	/// FILL_TIMEOUT, bounding the fill's wait on objects it does not have yet.
+	timeout: Option<Duration>,
 }
 
 /// The current group's tail, even when its head was filled rather than arrived live.
@@ -4710,6 +5014,7 @@ impl TrackServe {
 		self.draining = false;
 		Ok(fill.map(|fill| SubscriptionFill {
 			fill,
+			timeout: update.fill.and_then(|fill| fill.fill_timeout),
 			largest: edge.largest,
 			request_id: update.request_id,
 			track: cache,
@@ -6822,7 +7127,11 @@ mod subscribe_cursor_test {
 		open.write_frame(crate::Timestamp::ZERO, b"a".to_vec()).unwrap();
 
 		let consumer = track.consume();
-		let read = moq_clock::sim::spawn(async move { read_fetch(&consumer, 0, 0, None, 0, false).await.map(|_| ()) });
+		let read = moq_clock::sim::spawn(async move {
+			read_fetch(&consumer, 0, 0, None, 0, false, &mut FillBudget(None))
+				.await
+				.map(|_| ())
+		});
 		moq_clock::sim::yield_now().await;
 		// The track runs a full second past the group's successor.
 		for ms in [1000, 2000] {
@@ -7185,7 +7494,7 @@ mod serve_tests {
 					},
 				},
 				range_filters: false,
-				fill_timeout: false,
+				fill_timeout: None,
 				properties_wanted: true,
 				epoch: None,
 			}
@@ -7449,6 +7758,7 @@ mod serve_tests {
 				group_order: None,
 				filter: Some(Filter::Relative(1)),
 				range_filters: false,
+				fill_timeout: None,
 			}),
 		)
 	}
@@ -8631,7 +8941,7 @@ mod serve_tests {
 				Location { group: 0, object: 1 },
 			),
 			range_filters: false,
-			fill_timeout: false,
+			fill_timeout: None,
 			properties_wanted: true,
 			epoch: Some(epoch.clone()),
 		};
@@ -9140,7 +9450,7 @@ mod serve_tests {
 								},
 								properties_wanted: true,
 								range_filters: true,
-								fill_timeout: false,
+								fill_timeout: None,
 								epoch: None,
 							},
 						)
@@ -9285,32 +9595,12 @@ mod serve_tests {
 				0x03, 0x03, 0x03, 0x00, 0xAA, // AUTHORIZATION TOKEN
 				0x23, 0x02, 0x00, 0x05, // OBJECTID_FILTER (0x26): SetID 0, from 5
 			]),
-			("FETCH", ietf::Fetch::ID, &[
-				0x03, // Number of Parameters
-				0x0A, 0x00, // FILL_TIMEOUT = 0
-				0x17, 0x01, 0x01, // LOCATION_FILTER (0x21): from one group back
+			("FETCH relative to an unknown Largest Object", ietf::Fetch::ID, &[
+				0x02, // Number of Parameters
+				0x21, 0x01, 0x01, // LOCATION_FILTER (0x21): from one group back
 				0x14, 0x01, // INCLUDE_PROPERTIES (0x35) = 1
 			]),
 		];
-
-		// A standalone FETCH we would otherwise serve, carrying FILL_TIMEOUT=0: cache only,
-		// with gaps reported as Timed-Out, which we can't write.
-		#[rustfmt::skip]
-		let fill_timeout = [
-			0x2B, // Request ID
-			0x01, // Standalone
-			0x01, 0x04, b'r', b'o', b'o', b'm', 0x05, b'v', b'i', b'd', b'e', b'o',
-			0x00, 0x00, // Start Location
-			0x00, 0x00, // End Location: the whole group 0
-			0x01, // Number of Parameters
-			0x0A, 0x00, // FILL_TIMEOUT = 0
-		];
-		let version = Version::Draft18;
-		assert_eq!(
-			refusal(version, ietf::Fetch::ID, fill_timeout.to_vec()).await,
-			NOT_SUPPORTED,
-			"{version}: FETCH with FILL_TIMEOUT"
-		);
 
 		let version = Version::Draft22;
 		for (label, id, params) in cases {
@@ -9400,6 +9690,7 @@ mod serve_tests {
 						group_order: None,
 						filter: Some(Filter::Relative(1)),
 						range_filters: false,
+						fill_timeout: None,
 					}),
 				),
 			)
@@ -9558,6 +9849,7 @@ mod serve_tests {
 						group_order: None,
 						filter: None,
 						range_filters: false,
+						fill_timeout: None,
 					}),
 				};
 				let mut bytes = Vec::new();
@@ -9632,6 +9924,7 @@ mod serve_tests {
 					end: Some(EndLocation { group: 0, object: None }),
 				}),
 				range_filters: false,
+				fill_timeout: None,
 			}),
 		};
 		let mut bytes = Vec::new();
@@ -9696,6 +9989,7 @@ mod serve_tests {
 					group_order: None,
 					filter: Some(Filter::Unfiltered),
 					range_filters: false,
+					fill_timeout: None,
 				}),
 			};
 			let mut bytes = Vec::new();
@@ -9789,6 +10083,7 @@ mod serve_tests {
 					group_order: None,
 					filter: Some(Filter::Relative(2)),
 					range_filters: false,
+					fill_timeout: None,
 				}),
 			),
 		)
@@ -9826,6 +10121,7 @@ mod serve_tests {
 				ietf::Fill {
 					group_order: order,
 					range_filters: false,
+					fill_timeout: None,
 					filter: Some(Filter::Absolute {
 						start: Location { group: 2, object: 1 },
 						end: None,
@@ -9838,10 +10134,13 @@ mod serve_tests {
 				.run_fill(
 					fill,
 					&ranking,
-					h.track.consume(),
-					None,
-					&AtomicU64::new(0),
-					ranking.request_id,
+					FillTask {
+						track: h.track.consume(),
+						timescale: None,
+						opened: &AtomicU64::new(0),
+						request_id: ranking.request_id,
+						timeout: None,
+					},
 				)
 				.await;
 			assert!(h.log.resets().is_empty());
@@ -9918,11 +10217,17 @@ mod serve_tests {
 			skip: 0,
 			until: None,
 		};
-		let mut fill =
-			std::pin::pin!(
-				h.publisher
-					.run_fill(fill, &ranking, h.track.consume(), None, &opened, ranking.request_id)
-			);
+		let mut fill = std::pin::pin!(h.publisher.run_fill(
+			fill,
+			&ranking,
+			FillTask {
+				track: h.track.consume(),
+				timescale: None,
+				opened: &opened,
+				request_id: ranking.request_id,
+				timeout: None,
+			},
+		));
 		assert!(futures::poll!(fill.as_mut()).is_pending(), "the group is still open");
 		assert_eq!(
 			h.log.priorities(),
@@ -9981,7 +10286,17 @@ mod serve_tests {
 			until: Some(1),
 		};
 		h.publisher
-			.run_fill(fill, &ranking, h.track.consume(), None, &opened, ranking.request_id)
+			.run_fill(
+				fill,
+				&ranking,
+				FillTask {
+					track: h.track.consume(),
+					timescale: None,
+					opened: &opened,
+					request_id: ranking.request_id,
+					timeout: None,
+				},
+			)
 			.await;
 		assert_eq!(h.log.priorities(), [255], "the start of the group goes first");
 		assert_eq!(occurrences(&h.log, b"head"), 1);
@@ -10103,7 +10418,7 @@ mod serve_tests {
 						group_offset: 0,
 					},
 					range_filters: false,
-					fill_timeout: false,
+					fill_timeout: None,
 					properties_wanted: true,
 					epoch: None,
 				},
@@ -10426,7 +10741,7 @@ mod serve_tests {
 						group_offset: 2,
 					},
 					range_filters: false,
-					fill_timeout: false,
+					fill_timeout: None,
 					properties_wanted: true,
 					epoch: None,
 				},
@@ -10640,28 +10955,48 @@ mod serve_tests {
 		group_order: GroupOrder,
 		properties_wanted: bool,
 	) -> bytes::Bytes {
+		answer_fetch(
+			h,
+			ietf::Fetch {
+				request_id: FETCH_ID,
+				subscriber_priority: 128,
+				group_order,
+				fetch_type,
+				range_filters: false,
+				fill_timeout: None,
+				properties_wanted,
+				epoch: None,
+			},
+		)
+		.await
+	}
+
+	/// Run an ascending FETCH with FILL_TIMEOUT `timeout`, returning what the peer reads back.
+	async fn fetch_within(h: &Serve, fetch_type: FetchType<'static>, timeout: Duration) -> bytes::Bytes {
+		answer_fetch(
+			h,
+			ietf::Fetch {
+				request_id: FETCH_ID,
+				subscriber_priority: 128,
+				group_order: GroupOrder::Ascending,
+				fetch_type,
+				range_filters: false,
+				fill_timeout: Some(timeout),
+				properties_wanted: true,
+				epoch: None,
+			},
+		)
+		.await
+	}
+
+	/// Answer `fetch`, returning what the peer reads back.
+	async fn answer_fetch(h: &Serve, fetch: ietf::Fetch<'static>) -> bytes::Bytes {
 		let version = h.publisher.version;
 		let mark = h.log.writes.lock().unwrap().len();
 		let stream = Stream::open(&mut crate::driver::Transport::new(h.session.clone()), version)
 			.await
 			.unwrap();
-		h.publisher
-			.clone()
-			.run_fetch_stream(
-				stream,
-				ietf::Fetch {
-					request_id: FETCH_ID,
-					subscriber_priority: 128,
-					group_order,
-					fetch_type,
-					range_filters: false,
-					fill_timeout: false,
-					properties_wanted,
-					epoch: None,
-				},
-			)
-			.await
-			.unwrap();
+		h.publisher.clone().run_fetch_stream(stream, fetch).await.unwrap();
 		bytes::Bytes::from(h.log.writes.lock().unwrap()[mark..].to_vec())
 	}
 
@@ -10676,22 +11011,54 @@ mod serve_tests {
 		version: Version,
 		order: GroupOrder,
 	) -> (ietf::FetchOk, Vec<(u64, u64, String)>) {
+		let (ok, entries) = fetch_entries_in(wire, version, order);
+		let objects = entries
+			.into_iter()
+			.map(|entry| match entry {
+				Entry::Object(group, object, payload) => (group, object, payload),
+				Entry::End(..) => panic!("{version}: unexpected End of Range"),
+			})
+			.collect();
+		(ok, objects)
+	}
+
+	/// An entry on a fetch stream.
+	#[derive(Debug, PartialEq, Eq)]
+	enum Entry {
+		/// `(group, object, payload)`.
+		Object(u64, u64, String),
+		/// The range through `(group, object)`.
+		End(ietf::RangeEnd, u64, u64),
+	}
+
+	/// Decode a FETCH_OK and the ascending fetch stream after it.
+	fn fetch_entries(wire: bytes::Bytes, version: Version) -> (ietf::FetchOk, Vec<Entry>) {
+		fetch_entries_in(wire, version, GroupOrder::Ascending)
+	}
+
+	/// Decode a FETCH_OK and the fetch stream after it, its groups in `order`.
+	fn fetch_entries_in(wire: bytes::Bytes, version: Version, order: GroupOrder) -> (ietf::FetchOk, Vec<Entry>) {
 		let mut buf = Decoder::new(&wire, version.into());
 		assert_eq!(buf.varint().unwrap(), ietf::FetchOk::ID, "{version}: not a FETCH_OK");
 		let ok = ietf::FetchOk::decode(&mut buf, version).unwrap();
-		assert_eq!(buf.varint().unwrap(), FetchHeader::TYPE);
-		assert_eq!(FetchHeader::decode(&mut buf, version).unwrap().request_id, FETCH_ID);
+		(ok, fetch_stream_entries(&mut buf, version, order))
+	}
 
-		let mut objects = Vec::new();
+	/// Decode a fetch stream, from its FETCH_HEADER, its groups in `order`.
+	fn fetch_stream_entries(buf: &mut Decoder<'_>, version: Version, order: GroupOrder) -> Vec<Entry> {
+		assert_eq!(buf.varint().unwrap(), FetchHeader::TYPE);
+		assert_eq!(FetchHeader::decode(buf, version).unwrap().request_id, FETCH_ID);
+
+		let mut entries = Vec::new();
 		let mut prior: Option<(u64, u64)> = None;
 		while !buf.is_empty() {
-			let (group, object) = {
-				let ietf::FetchObject::Object { group, object, .. } =
-					ietf::FetchObject::decode(&mut buf, version).unwrap()
-				else {
-					panic!("{version}: unexpected End of Range");
-				};
-				match (prior, group) {
+			let (group, object) = match ietf::FetchObject::decode(buf, version).unwrap() {
+				ietf::FetchObject::EndOfRange { kind, group, object } => {
+					entries.push(Entry::End(kind, group, object));
+					prior = Some((group, object));
+					continue;
+				}
+				ietf::FetchObject::Object { group, object, .. } => match (prior, group) {
 					(None, group) => (group.unwrap(), object.unwrap()),
 					// No Group ID: the same group, and an absent Object ID Delta is one.
 					(Some((group, prior)), None) => (group, prior + object.unwrap_or(1)),
@@ -10702,14 +11069,14 @@ mod serve_tests {
 						};
 						(group, object.unwrap())
 					}
-				}
+				},
 			};
 			let size = buf.varint().unwrap() as usize;
 			let payload = String::from_utf8(buf.slice(size).unwrap().to_vec()).unwrap();
-			objects.push((group, object, payload));
+			entries.push(Entry::Object(group, object, payload));
 			prior = Some((group, object));
 		}
-		(ok, objects)
+		entries
 	}
 
 	/// The `(group, object, payload)` a range of two-frame groups holds.
@@ -11260,6 +11627,263 @@ mod serve_tests {
 		assert_eq!(objects, Vec::new(), "{version}");
 	}
 
+	/// Fill group `sequence` of `cam` with `count` objects, so its cache holds it.
+	async fn cache_cam(dynamic: &track::Requests, cam: &track::Consumer, sequence: u64, count: u64) {
+		let fetching = cam.fetch_group(sequence, None);
+		let mut fetched = dynamic.requested_fill_group().await.unwrap().accept(None).unwrap();
+		for object in 0..count {
+			fetched
+				.write_frame(None, format!("{sequence}-{object}").into_bytes())
+				.unwrap();
+		}
+		fetched.finish().unwrap();
+		fetching.await.unwrap();
+	}
+
+	/// Drive `fetch` until it makes the upstream `ask`.
+	async fn asked<T>(
+		fetch: std::pin::Pin<&mut impl std::future::Future>,
+		ask: impl std::future::Future<Output = T>,
+	) -> T {
+		match futures::future::select(fetch, std::pin::pin!(ask)).await {
+			futures::future::Either::Left(_) => panic!("the FETCH ended before asking upstream"),
+			futures::future::Either::Right((asked, _)) => asked,
+		}
+	}
+
+	/// Reserve `cam` with its info resolved, as a FETCH waits for that first, by caching
+	/// group 9, which no test here fetches.
+	async fn reserve_cam(h: &Serve) -> track::Request {
+		let request = h._broadcast.reserve_track("cam").unwrap();
+		cache_cam(&request.requests(), &request.consume(), 9, 1).await;
+		request
+	}
+
+	/// FILL_TIMEOUT=0 answers from the cache alone, without waiting: the groups it misses
+	/// may still exist, so they are timed out, with a cached group's tail split off as
+	/// non-existent ahead of them. The fill they started is let go.
+	#[moq_clock::test]
+	async fn a_zero_fill_timeout_answers_from_the_cache() {
+		for version in FETCH_DRAFTS {
+			let h = serve(version);
+			let request = h._broadcast.reserve_track("cam").unwrap();
+			let dynamic = request.requests();
+			cache_cam(&dynamic, &request.consume(), 1, 2).await;
+
+			let started = moq_clock::Instant::now();
+			let fetch_type = fetch_range(
+				version,
+				"cam",
+				Location { group: 0, object: 0 },
+				Location { group: 2, object: 0 },
+			);
+			let (_ok, entries) = fetch_entries(fetch_within(&h, fetch_type, Duration::ZERO).await, version);
+			assert_eq!(started.elapsed(), Duration::ZERO, "{version}");
+			let timed_out = ietf::RangeEnd::timed_out(version);
+			assert_eq!(
+				entries,
+				[
+					Entry::End(timed_out, 0, u64::MAX),
+					Entry::Object(1, 0, "1-0".into()),
+					Entry::Object(1, 1, "1-1".into()),
+					Entry::End(ietf::RangeEnd::NonExistent, 1, u64::MAX),
+					Entry::End(timed_out, 2, u64::MAX),
+				],
+				"{version}"
+			);
+			while let Some(fill) = dynamic.requested_fill().now_or_never() {
+				assert!(!fill.unwrap().is_used(), "{version}: the fill outlived the answer");
+			}
+		}
+	}
+
+	/// FILL_TIMEOUT is one budget for the whole request: an object arriving partway does not
+	/// restart it, and what arrived in time goes out ahead of the timed-out rest.
+	#[moq_clock::test]
+	async fn a_fill_timeout_is_one_budget_for_the_request() {
+		const TIMEOUT: Duration = Duration::from_millis(100);
+		const FIRST: Duration = Duration::from_millis(60);
+		for version in FETCH_DRAFTS {
+			let h = serve(version);
+			let request = reserve_cam(&h).await;
+			let dynamic = request.requests();
+			let whole = Location { group: 1, object: 0 };
+			let started = moq_clock::Instant::now();
+			let upstream = async {
+				let mut group = dynamic.requested_fill_group().await.unwrap().accept(None).unwrap();
+				moq_clock::sleep(FIRST).await;
+				group.write_frame(None, b"1-0".to_vec()).unwrap();
+				group
+			};
+			let fetch = fetch_within(&h, fetch_range(version, "cam", whole, whole), TIMEOUT);
+			let (wire, _open) = futures::join!(fetch, upstream);
+			let elapsed = started.elapsed();
+			assert!(
+				elapsed >= TIMEOUT && elapsed < FIRST + TIMEOUT,
+				"{version}: answered after {elapsed:?}"
+			);
+			let (_ok, entries) = fetch_entries(wire, version);
+			assert_eq!(
+				entries,
+				[
+					Entry::Object(1, 0, "1-0".into()),
+					Entry::End(ietf::RangeEnd::timed_out(version), 1, u64::MAX),
+				],
+				"{version}"
+			);
+		}
+	}
+
+	/// Groups that fill out of order within the budget are answered in order, and the one
+	/// still missing when it runs out is timed out between them.
+	#[moq_clock::test]
+	async fn a_fill_timeout_answers_what_filled_out_of_order() {
+		const TIMEOUT: Duration = Duration::from_millis(100);
+		for version in FETCH_DRAFTS {
+			let h = serve(version);
+			let request = reserve_cam(&h).await;
+			let dynamic = request.requests();
+			let fetch_type = fetch_range(
+				version,
+				"cam",
+				Location { group: 0, object: 0 },
+				Location { group: 2, object: 0 },
+			);
+			let upstream = async {
+				let fill = dynamic.requested_fill().await.unwrap();
+				assert_eq!((fill.start().group, fill.end()), (0, 3), "{version}");
+				for sequence in [2, 0] {
+					let mut group = fill.accept(sequence, None).unwrap();
+					for object in 0..2 {
+						group
+							.write_frame(None, format!("{sequence}-{object}").into_bytes())
+							.unwrap();
+					}
+					group.finish().unwrap();
+					moq_clock::sleep(TIMEOUT / 2).await;
+				}
+				fill
+			};
+			let (wire, _fill) = futures::join!(fetch_within(&h, fetch_type, TIMEOUT), upstream);
+			let (_ok, entries) = fetch_entries(wire, version);
+			let mut expected: Vec<_> = pairs([0])
+				.into_iter()
+				.map(|(group, object, payload)| Entry::Object(group, object, payload))
+				.collect();
+			expected.push(Entry::End(ietf::RangeEnd::NonExistent, 0, u64::MAX));
+			expected.push(Entry::End(ietf::RangeEnd::timed_out(version), 1, u64::MAX));
+			expected.extend(
+				pairs([2])
+					.into_iter()
+					.map(|(group, object, payload)| Entry::Object(group, object, payload)),
+			);
+			assert_eq!(entries, expected, "{version}");
+		}
+	}
+
+	/// A FETCH dropped while it waits lets go of the fill it started.
+	#[moq_clock::test]
+	async fn a_cancelled_fetch_lets_go_of_its_fill() {
+		for version in FETCH_DRAFTS {
+			let h = serve(version);
+			let request = reserve_cam(&h).await;
+			let dynamic = request.requests();
+			let fetch_type = fetch_range(
+				version,
+				"cam",
+				Location { group: 0, object: 0 },
+				Location { group: 2, object: 0 },
+			);
+			let mut fetch = Box::pin(fetch_within(&h, fetch_type, Duration::from_secs(1)));
+			let fill = asked(fetch.as_mut(), dynamic.requested_fill()).await.unwrap();
+			assert!(fill.is_used(), "{version}");
+			drop(fetch);
+			assert!(!fill.is_used(), "{version}: the fill outlived its FETCH");
+		}
+	}
+
+	/// Requests sharing one upstream fill keep their own budgets: the impatient one times
+	/// out without cancelling the fill the patient one still waits on.
+	#[moq_clock::test]
+	async fn fetches_sharing_a_fill_keep_their_own_budgets() {
+		for version in FETCH_DRAFTS {
+			let h = serve(version);
+			let request = reserve_cam(&h).await;
+			let dynamic = request.requests();
+			let whole = Location { group: 1, object: 0 };
+			let range = || fetch_range(version, "cam", whole, whole);
+
+			let mut patient = std::pin::pin!(fetch_within(&h, range(), Duration::from_secs(1)));
+			let fill = asked(patient.as_mut(), dynamic.requested_fill_group()).await.unwrap();
+
+			let hasty = fetch_within(&h, range(), Duration::from_millis(50)).await;
+			let (_ok, entries) = fetch_entries(hasty.clone(), version);
+			assert_eq!(
+				entries,
+				[Entry::End(ietf::RangeEnd::timed_out(version), 1, u64::MAX)],
+				"{version}"
+			);
+			assert!(fill.is_used(), "{version}: the patient request let go of the fill");
+
+			let mut group = fill.accept(None).unwrap();
+			group.write_frame(None, b"1-0".to_vec()).unwrap();
+			group.finish().unwrap();
+			// The patient request wrote nothing until now, so its answer follows the hasty one.
+			let wire = patient.await;
+			let (_ok, entries) = fetch_entries(wire.slice(hasty.len()..), version);
+			assert_eq!(entries, [Entry::Object(1, 0, "1-0".into())], "{version}");
+		}
+	}
+
+	/// A draft-22 fill's FILL_TIMEOUT bounds its wait on an open group: the fill stream
+	/// carries what arrived in time, then a timed-out range, and closes cleanly.
+	#[moq_clock::test]
+	async fn a_fill_timeout_ends_a_fill_stream_with_a_timed_out_range() {
+		let version = Version::Draft22;
+		let h = serve(version);
+		let mut group = h.track.create_group(group::Info { sequence: 4 }).unwrap();
+		group.write_frame(timestamp(), b"head".as_slice()).unwrap();
+
+		let ranking = Ranking {
+			queue: h.publisher.priority.clone(),
+			group: None,
+			request_id: FETCH_ID,
+			priority: kio::Producer::new(PRIORITY).consume(),
+			publisher: 0,
+			order: Order::Ascending,
+		};
+		let opened = AtomicU64::new(0);
+		let fill = FillServe::Group {
+			sequence: 4,
+			skip: 0,
+			until: None,
+		};
+		let mark = h.log.writes.lock().unwrap().len();
+		h.publisher
+			.run_fill(
+				fill,
+				&ranking,
+				FillTask {
+					track: h.track.consume(),
+					timescale: None,
+					opened: &opened,
+					request_id: FETCH_ID,
+					timeout: Some(Duration::from_millis(50)),
+				},
+			)
+			.await;
+		assert!(h.log.resets().is_empty(), "a timed-out fill is not a failed one");
+		let wire = h.log.writes.lock().unwrap()[mark..].to_vec();
+		let entries = fetch_stream_entries(&mut Decoder::new(&wire, version.into()), version, GroupOrder::Ascending);
+		assert_eq!(
+			entries,
+			[
+				Entry::Object(4, 0, "head".into()),
+				Entry::End(ietf::RangeEnd::TimedOut, 4, u64::MAX),
+			]
+		);
+	}
+
 	/// The last group of a finished track ends the response at its last object, with End
 	/// of Track set.
 	#[moq_clock::test]
@@ -11683,7 +12307,7 @@ mod serve_tests {
 						end: Location { group: 0, object: 1 },
 					},
 					range_filters: false,
-					fill_timeout: false,
+					fill_timeout: None,
 					properties_wanted: true,
 					epoch: None,
 				},
@@ -11766,7 +12390,7 @@ mod serve_tests {
 					end: Location { group: 4, object: 0 },
 				},
 				range_filters: false,
-				fill_timeout: false,
+				fill_timeout: None,
 				properties_wanted: true,
 				epoch: None,
 			},
@@ -11884,7 +12508,7 @@ mod serve_tests {
 						group_order: GroupOrder::Ascending,
 						fetch_type,
 						range_filters: false,
-						fill_timeout: false,
+						fill_timeout: None,
 						properties_wanted: true,
 						epoch: None,
 					},
@@ -12012,7 +12636,7 @@ mod serve_tests {
 						group_offset: 0,
 					},
 					range_filters: false,
-					fill_timeout: false,
+					fill_timeout: None,
 					properties_wanted: true,
 					epoch: None,
 				},
@@ -12279,7 +12903,7 @@ mod serve_tests {
 									Location { group: 0, object: 1 },
 								),
 								range_filters: false,
-								fill_timeout: false,
+								fill_timeout: None,
 								properties_wanted: true,
 								epoch: None,
 							},
@@ -12498,7 +13122,7 @@ mod serve_tests {
 							group_order: GroupOrder::Ascending,
 							fetch_type,
 							range_filters: false,
-							fill_timeout: false,
+							fill_timeout: None,
 							properties_wanted: true,
 							epoch: None,
 						},
@@ -12551,7 +13175,7 @@ mod serve_tests {
 						group_id: 5,
 					},
 					range_filters: false,
-					fill_timeout: false,
+					fill_timeout: None,
 					properties_wanted: true,
 					epoch: None,
 				},
@@ -12575,6 +13199,7 @@ mod serve_tests {
 					group_order: None,
 					filter: Some(Filter::Relative(1)),
 					range_filters: false,
+					fill_timeout: None,
 				}),
 			),
 		)
@@ -16693,7 +17318,7 @@ mod tests {
 					group_order: GroupOrder::Descending,
 					fetch_type,
 					range_filters: false,
-					fill_timeout: false,
+					fill_timeout: None,
 					properties_wanted: true,
 					epoch: None,
 				},
@@ -17452,6 +18077,7 @@ mod fill_range_tests {
 			group_order: None,
 			filter: Some(filter),
 			range_filters: false,
+			fill_timeout: None,
 		}
 	}
 
@@ -17610,6 +18236,7 @@ mod fill_range_tests {
 			group_order: None,
 			filter: Some(Filter::Relative(1)),
 			range_filters: true,
+			fill_timeout: None,
 		};
 		assert_eq!(fill_range(fill, Filter::NextObject, LARGEST), FillServe::Unsupported);
 	}

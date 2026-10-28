@@ -5209,6 +5209,25 @@ impl Filled {
 			.flat_map(|join| join.outcome().read().refused_in(&span).cloned().collect::<Vec<_>>())
 			.collect()
 	}
+
+	/// The sequences of `span` whose source gave up waiting for them ([`Error::Timeout`]),
+	/// which exist for all anyone knows.
+	pub(crate) fn timed_out(&self, span: ops::Range<u64>) -> RangeSet<u64> {
+		self.joins
+			.iter()
+			.flat_map(|join| join.outcome().read().timed_out_in(&span).collect::<Vec<_>>())
+			.collect()
+	}
+}
+
+#[cfg(feature = "async")]
+impl Filling {
+	/// Stop waiting: the guard over what was answered so far, and the runs of `span` still
+	/// unanswered, which no fill owes this caller any more. A front that has not assigned a
+	/// copy yet has answered nothing.
+	pub(crate) fn abandon(&mut self, span: ops::Range<u64>) -> (Filled, RangeSet<u64>) {
+		self.0.abandon(span)
+	}
 }
 
 /// The pollable state of a [`Consumer::fill_groups`], resolving to the [`Filled`] guard.
@@ -5300,6 +5319,36 @@ impl FillStage {
 				}
 			},
 			Self::Done => panic!("polled after resolving"),
+		}
+	}
+
+	fn abandon(&mut self, span: ops::Range<u64>) -> (Filled, RangeSet<u64>) {
+		match self {
+			Self::Front { serving, .. } => {
+				let (filled, unanswered) = match serving.as_mut() {
+					Some(serving) => serving.abandon(span),
+					None => (
+						Filled {
+							joins: Vec::new(),
+							cached: Vec::new(),
+							_read: None,
+						},
+						std::iter::once(span).filter(|span| !span.is_empty()).collect(),
+					),
+				};
+				(self.resolve(filled.joins, filled.cached), unanswered)
+			}
+			Self::Asked { joins, cached, .. } => {
+				let unanswered = joins.iter_mut().flat_map(|join| join.abandon().into_iter()).collect();
+				let filled = Filled {
+					joins: std::mem::take(joins),
+					cached: std::mem::take(cached),
+					_read: None,
+				};
+				*self = Self::Done;
+				(filled, unanswered)
+			}
+			Self::Done => panic!("abandoned after resolving"),
 		}
 	}
 

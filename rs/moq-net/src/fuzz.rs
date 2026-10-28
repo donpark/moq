@@ -1334,7 +1334,7 @@ pub fn seeds() -> Vec<Seed> {
 				group_order: ietf::GroupOrder::Ascending,
 				fetch_type,
 				range_filters: false,
-				fill_timeout: false,
+				fill_timeout: None,
 				properties_wanted: true,
 				epoch: None,
 			};

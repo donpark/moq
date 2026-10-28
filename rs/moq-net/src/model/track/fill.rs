@@ -219,6 +219,15 @@ impl Outcome {
 		self.refused.overlapping(span).map(|(_, refusal)| &refusal.err)
 	}
 
+	/// The runs of `span` whose source gave up waiting for them, lowest first.
+	#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
+	pub(super) fn timed_out_in(&self, span: &ops::Range<u64>) -> impl Iterator<Item = ops::Range<u64>> {
+		self.refused
+			.overlapping(span)
+			.filter(|(_, refusal)| matches!(refusal.err, Error::Timeout))
+			.map(|(run, _)| run.start.max(span.start)..run.end.min(span.end))
+	}
+
 	/// The runs of `span` refused as too old under a budget, lowest first: a reader with no
 	/// budget of its own may still be served them.
 	#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
@@ -365,6 +374,18 @@ impl Join {
 				}
 			})
 			.map(drop)
+	}
+
+	/// Stop waiting on what this reader still reads unanswered, so the fill no longer owes
+	/// it, and return those runs.
+	#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
+	pub(super) fn abandon(&mut self) -> RangeSet<u64> {
+		let unanswered: RangeSet<u64> = {
+			let outcome = self.outcome().read();
+			self.held.iter().flat_map(|run| outcome.resolved.gaps(run)).collect()
+		};
+		self.release(&unanswered);
+		unanswered
 	}
 
 	/// Whether the reader holds none of the fill any more.
@@ -849,6 +870,15 @@ impl Fill {
 	pub(crate) fn refuse(&self, err: Error) {
 		let unresolved = self.inner.unresolved(self.inner.start.group..self.inner.end);
 		self.inner.refuse(&unresolved, err, self.max_delay());
+	}
+
+	/// Refuse group `sequence` with `err` after accepting it, as its copy was cut short: a
+	/// reader that finds no copy cached learns why, rather than taking the group as absent.
+	#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
+	pub(crate) fn refuse_accepted(&self, sequence: u64, err: Error) {
+		if let Ok(mut outcome) = self.inner.result.write() {
+			outcome.refuse(sequence..sequence + 1, err, self.max_delay());
+		}
 	}
 
 	/// The next run of groups still owed, in the fill's order: [`Self::next`]'s group,

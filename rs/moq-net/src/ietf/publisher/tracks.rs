@@ -1261,7 +1261,7 @@ impl Publisher {
 		let fill = how
 			.fill
 			.filter(|_| Filter::is_draft22(self.version))
-			.map(|fill| fill_range(fill, params.filter, edge.largest));
+			.map(|fill| (fill.fill_timeout, fill_range(fill, params.filter, edge.largest)));
 
 		if how.answer && self.write_request_ok(&mut stream.writer, edge.largest).await.is_err() {
 			return Err(());
@@ -1271,9 +1271,15 @@ impl Publisher {
 			let ranking = serve.ranking.clone();
 			let streams = serve.opened.clone();
 			let fill = async {
-				if let Some(fill) = fill {
-					self.run_fill(fill, &ranking, track.clone(), timescale, &streams, request_id)
-						.await;
+				if let Some((timeout, fill)) = fill {
+					let task = FillTask {
+						track: track.clone(),
+						timescale,
+						opened: &streams,
+						request_id,
+						timeout,
+					};
+					self.run_fill(fill, &ranking, task).await;
 				}
 			};
 			let serving = self.run_subscription(stream, &mut serve, finished, goaways, fill, None);
