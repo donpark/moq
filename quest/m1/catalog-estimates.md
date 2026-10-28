@@ -30,10 +30,15 @@ Decided 2026-10-28 (maintainer):
   unchanged.
 - **MSF deduplicates.** `emit` (`rs/moq-msf` producer, `catalog/producer.rs:221-243`)
   skips a group whose serialized catalog matches the previous one.
-- **MSF waits for estimates, then freezes them.** With no hint, MSF publishes
-  once every unhinted track has closed its first group. Its estimated fields
+- **MSF waits for estimates, then freezes them.** MSF publishes once every
+  track with an unhinted estimate has closed its first group and carried
+  `RATE_WINDOW` (1 s, `catalog/estimate.rs:7`) of media, whichever is later.
+  The minimum duration matters because bitrate is measured over that window:
+  20 ms audio groups would otherwise freeze it absent. Its estimated fields
   then stay as first declared, and MSF republishes only for track-list or
-  identity changes. A hinted track publishes at once.
+  identity changes. A track whose every estimated field is hinted publishes
+  at once. moq-c can hint bitrate and framerate but not jitter or delay
+  ([#7068](https://github.com/moq-dev/moq/pull/7068)), so its tracks wait.
 - **No opt-out.** Quantizing and freezing remove the churn without new config
   surface on fields players rely on.
 - The HLS pointer goes away with
@@ -42,7 +47,8 @@ Decided 2026-10-28 (maintainer):
 
 Tests: a measured `delay` creeping in 1 ms steps republishes hang once per
 frame-duration step. Identical MSF content publishes once. An unhinted MSF
-catalog appears after the first groups close and keeps its estimates.
+catalog appears once the first groups close and a second of media has
+passed, carries a bitrate for 20 ms audio groups, and keeps its estimates.
 
 Public API: none. Wire: fewer catalog groups; MSF estimate fields frozen at
 first declaration.
