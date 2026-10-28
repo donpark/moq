@@ -25,7 +25,8 @@ Usage:
   versions.py check [--base <rev>] [--head <rev>] [--report]
       Fail when merging head into base changes a package's shipped sources at a
       released version, lowers a version, or leaves a lockfile entry behind.
-      Also lists the packages base already carries unreleased changes for.
+      Warns of the packages base already carries unreleased changes for, and
+      those only a shared build script changed for.
       --report lists the failures without failing.
   versions.py tag [--dry-run]
       Push each release tag HEAD's versions lack. Needs GH_TOKEN.
@@ -114,6 +115,9 @@ class Package:
     rides: str | None = None
     # Whether its tag waits for the pinned moq-ffi release.
     ffi: bool = False
+    # Build scripts shared with other packages. A change to one may or may not
+    # change what this ships, which only a human can judge.
+    shared: list[str] = field(default_factory=list)
 
     def version(self, rev: str) -> str | None:
         text = show(rev, self.manifest.path)
@@ -142,6 +146,10 @@ def packages(rev: str) -> list[Package]:
         if manifest.get("private") or not manifest.get("scripts", {}).get("release"):
             continue
         name = manifest["name"]
+        # The js/common scripts its build runs, such as the packager that
+        # rewrites its published manifest.
+        build = manifest["scripts"].get("build", "") + "\n" + (show(rev, f"{directory}/vite.config.ts") or "")
+        shared = sorted({f"js/common/{script}" for script in re.findall(r"\.\./common/([\w.-]+\.ts)\b", build)})
         found.append(Package(
             name=name,
             manifest=Edit(f"{directory}/package.json", r'^(\t"version": ")([^"]+)(")'),
@@ -152,6 +160,7 @@ def packages(rev: str) -> list[Package]:
                 rf'^(    "{re.escape(directory)}": \{{\n      "name": "{re.escape(name)}",\n      "version": ")([^"]+)(")',
                 fix="bun install",
             )],
+            shared=shared,
         ))
     found.append(Package(
         name="moq-rs (Python)",
@@ -261,7 +270,7 @@ def unreleased(head: str) -> list[Unreleased]:
     for pkg in found:
         if since[pkg.name] is None:
             continue
-        changed = git("diff", "--name-only", since[pkg.name], head, "--", *pkg.paths, *UNSHIPPED).stdout.split()
+        changed = git("diff", "--name-only", since[pkg.name], head, "--", *pkg.paths, *pkg.shared, *UNSHIPPED).stdout.split()
         if changed:
             stale[pkg.name] = Unreleased(pkg, pkg.version(head), since[pkg.name], changed)
 
@@ -303,24 +312,33 @@ def how(pkg: Package, version: str) -> str:
 
 
 def check(base: str, head: str) -> tuple[list[str], list[str]]:
-    """The problems merging `head` into `base` brings, and the packages `base`
-    already holds unreleased changes for."""
+    """The problems merging `head` into `base` brings, and warnings: the packages
+    `base` already holds unreleased changes for, and those only a shared build
+    script changed for."""
     merged = merge(base, head)
     found = packages(merged)
     touched = {
         pkg.name for pkg in found
-        if git("diff", "--name-only", base, merged, "--", pkg.manifest.path, *pkg.paths, *UNSHIPPED).stdout.strip()
+        if git("diff", "--name-only", base, merged, "--", pkg.manifest.path, *pkg.paths, *pkg.shared, *UNSHIPPED).stdout.strip()
     }
 
-    problems, notes = [], []
+    problems, warnings = [], []
     for item in unreleased(merged):
         pkg = item.package
+        shared = [path for path in item.changed if path in pkg.shared]
+        only_shared = bool(item.changed) and len(shared) == len(item.changed)
+        fix = how(pkg, item.version)
         if item.alongside:
             reason = f"{item.alongside} releases, and the same tag would publish its released {item.version} again"
+        elif only_shared:
+            reason = f"only the shared build {'script' if len(shared) == 1 else 'scripts'} {', '.join(shared)} changed since {item.version} shipped"
+            fix = f"if that changed what it ships, {fix}"
         else:
             reason = f"{len(item.changed)} shipped {'file' if len(item.changed) == 1 else 'files'} changed since {item.version} shipped"
-        line = f"{pkg.name}: {reason}; {how(pkg, item.version)}."
-        (problems if group(pkg, found) & touched else notes).append(line)
+        if not group(pkg, found) & touched:
+            reason += f", already on {base}"
+        line = f"{pkg.name}: {reason}; {fix}."
+        (problems if group(pkg, found) & touched and not only_shared else warnings).append(line)
 
     for pkg in found:
         if pkg.name not in touched:
@@ -337,7 +355,7 @@ def check(base: str, head: str) -> tuple[list[str], list[str]]:
             have = lock.read(text) if text is not None else None
             if have != new:
                 problems.append(f"{pkg.name}: {lock.path} carries {have}, not {new}; run `{lock.fix}`.")
-    return problems, notes
+    return problems, warnings
 
 
 def release_assets(tag: str) -> set[str]:
@@ -435,14 +453,15 @@ def main() -> int:
         return 0
 
     try:
-        problems, notes = check(args.base, args.head)
+        problems, warnings = check(args.base, args.head)
     except RuntimeError as error:
         print(error, file=sys.stderr)
         return 2
-    for line in notes:
-        print(f"already unreleased on {args.base}: {line}")
+    actions = os.environ.get("GITHUB_ACTIONS")
+    for line in warnings:
+        print(f"::warning::{line}" if actions else f"warning: {line}")
     for line in problems:
-        print(f"::error::{line}" if os.environ.get("GITHUB_ACTIONS") and not args.report else line)
+        print(f"::error::{line}" if actions and not args.report else line)
     if not problems:
         print(f"no version problems merging {args.head} into {args.base}")
         return 0

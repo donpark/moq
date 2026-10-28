@@ -15,7 +15,8 @@ spec.loader.exec_module(versions)
 
 
 def package_json(name: str, version: str, private: bool = False) -> str:
-    manifest = {"name": name, "version": version, "scripts": {"release": "bun ../common/release.ts"}}
+    scripts = {"build": "rimraf dist && tsc -b && bun ../common/package.ts", "release": "bun ../common/release.ts"}
+    manifest = {"name": name, "version": version, "scripts": scripts}
     if private:
         manifest["private"] = True
     return json.dumps(manifest, indent="\t") + "\n"
@@ -69,6 +70,10 @@ class VersionsTest(unittest.TestCase):
             "js/a/src/index.ts": "export {};\n",
             "js/b/package.json": package_json("@moq/b", "0.2.0"),
             "js/b/src/index.ts": "export {};\n",
+            "js/b/vite.config.ts": 'import { worklet } from "../common/vite-plugin-worklet.ts";\n',
+            "js/common/package.ts": "",
+            "js/common/release.ts": "",
+            "js/common/vite-plugin-worklet.ts": "",
             "js/wasm/package.json": package_json("@moq/wasm", "0.0.0", private=True),
             "js/wasm/src/index.ts": "export {};\n",
             "bun.lock": BUN_LOCK,
@@ -185,6 +190,17 @@ class VersionsTest(unittest.TestCase):
             "dart/moq/test/moq_test.dart": "",
         }), ([], []))
 
+    def test_shared_build_scripts_warn_the_packages_that_run_them(self):
+        # Whether a shared build script changed what a package ships takes a human.
+        self.assertEqual(self.backport({"js/common/package.ts": "// fix\n"}), ([], ["@moq/a", "@moq/b"]))
+        self.assertIn("only the shared build script js/common/package.ts changed since 0.1.0 shipped; if that", self.notes[0])
+        self.assertEqual(self.backport({"js/common/vite-plugin-worklet.ts": "// fix\n"}), ([], ["@moq/b"]))
+        # Publishing changes nothing a package ships.
+        self.assertEqual(self.backport({"js/common/release.ts": "// fix\n"}), ([], []))
+        # A change of its own still fails.
+        self.assertEqual(self.backport({"js/common/package.ts": "// fix\n", "js/a/src/index.ts": FIX}), (["@moq/a"], ["@moq/b"]))
+        self.assertIn("2 shipped files changed", self.problems[0])
+
     def test_private_package_is_skipped(self):
         self.assertEqual(self.backport({"js/wasm/src/index.ts": FIX}), ([], []))
 
@@ -209,6 +225,7 @@ class VersionsTest(unittest.TestCase):
     def test_unreleased_changes_already_on_base_are_only_noted(self):
         self.commit("fix(b): merged without a bump", {"js/b/src/index.ts": FIX})
         self.assertEqual(self.backport({"js/a/src/index.test.ts": ""}), ([], ["@moq/b"]))
+        self.assertIn("since 0.2.0 shipped, already on release;", self.notes[0])
         # A backport touching it must bump it, which ships the earlier change too.
         self.assertEqual(self.backport({"js/b/src/other.ts": FIX}), (["@moq/b"], []))
         self.assertIn("2 shipped files changed", self.problems[0])
