@@ -75,7 +75,7 @@
     },
     "js/auth": {
       "name": "@moq/auth",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "bin": {
         "moq-auth": "./src/cli.ts",
       },
