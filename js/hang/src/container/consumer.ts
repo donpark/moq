@@ -25,10 +25,10 @@ export interface ConsumerProps {
 	 * included (default: {@link DEFAULT_MAX_BUFFER}). Mirrors Rust's `Consumer::set_max_buffer`.
 	 *
 	 * Once it is full the consumer stops decoding ahead and stops pulling new groups, so the undecoded
-	 * rest stays in the transport's cache, which bounds it. The group being read, and the one after it,
-	 * still decode a wire frame whenever they hold nothing, so reading never waits on its own lookahead.
-	 * If the group being read stalls while later groups fill the cap, it is skipped like a slow group:
-	 * no more of what it waits behind can be held.
+	 * rest stays in the transport's cache, which bounds it. The group being read still decodes a wire
+	 * frame whenever it holds nothing, so reading never waits on its own lookahead. If it stalls while the
+	 * cap is full, the consumer moves on to the next group like a skip past a slow group, read or not: no
+	 * more of what it waits behind can be held.
 	 */
 	maxBuffer?: number;
 	/**
@@ -211,7 +211,7 @@ export class Consumer {
 			for (;;) {
 				// Past the max buffer, later groups wait in the transport's cache. A missing group at the
 				// cursor then expires like one past the budget: see next().
-				await this.#waitRoom(() => false);
+				while (this.#full() && !this.#signals.abort.aborted) await this.#park();
 				if (this.#signals.abort.aborted) break;
 
 				const consumer = await this.#track.recvGroup();
@@ -246,6 +246,11 @@ export class Consumer {
 				const next = this.#groups.at(index);
 				if (next && next.late < group.late) group.late = next.late;
 				this.#groups.splice(index, 0, group);
+				// Group overhead alone can fill the max buffer, past which next() moves on from a stalled head.
+				if (this.#full()) {
+					this.#notify?.();
+					this.#notify = undefined;
+				}
 
 				// Start buffering frames from this group
 				this.#signals.spawn(this.#runGroup.bind(this, group));
@@ -261,12 +266,16 @@ export class Consumer {
 			let index = 0;
 
 			for (;;) {
-				if (!(await this.#admit(group))) return;
+				while (!this.#stopped(group) && !this.#admits(group)) await this.#park();
+				if (this.#stopped(group)) return;
 				const next = await group.consumer.readFrame();
 				if (!next) break;
 				// The read may have waited while a skip dropped this group or other groups filled the max
-				// buffer, so admit what it decodes again: the max buffer bounds reads in flight too.
-				if (!(await this.#admit(group))) return;
+				// buffer, so admit what it decodes again: the max buffer bounds reads in flight too. Nothing
+				// yields between this check and the charge below, or every task woken together would spend
+				// the same room.
+				while (!this.#stopped(group) && !this.#admits(group)) await this.#park();
+				if (this.#stopped(group)) return;
 				group.empty = false;
 				const arrival = Nano.toMilli(Nano(now()));
 
@@ -502,9 +511,11 @@ export class Consumer {
 		return true;
 	}
 
-	// Skip the stalled active group once later groups fill the max buffer, which can hold no more of
-	// what it waits behind. Only fires when the active group is fully consumed and still open, so we
-	// never drop frames the consumer hasn't seen. Returns true if a group was skipped.
+	// Move on from the stalled active group once the max buffer is full, since it can hold no more of
+	// what it waits behind, to the next group even with nothing of it read yet: that one reads as the
+	// head, and each such skip refunds what the group left behind held. Only fires when the active group
+	// is fully consumed and still open, so we never drop frames the consumer hasn't seen. Returns true if
+	// a group was skipped.
 	#tryPressureSkip(): boolean {
 		if (this.#active === undefined || !this.#full()) return false;
 
@@ -513,14 +524,15 @@ export class Consumer {
 		if (active.done || active.frames.length > 0) return false;
 
 		const next = this.#groups[1];
-		const nextStart = next?.frames.at(0)?.timestamp;
-		if (!next || nextStart === undefined) return false;
+		if (!next) return false;
 
 		this.#groups.shift();
 		console.warn(
 			`skipping a stalled group past the max buffer: track=${this.#track.name} ${active.consumer.sequence} -> ${next.consumer.sequence}`,
 		);
-		// Still open, so its tail is lost unless the next group picks up where it ended.
+		// Still open, so its tail is lost unless the next group picks up where it ended, which nothing
+		// proves before its start is read.
+		const nextStart = next.frames.at(0)?.timestamp;
 		if (active.truncated || !ptsContiguous(active.end ?? this.#presentedEnd, nextStart)) this.#lost = true;
 		this.#recordPresented(active);
 		this.#active = next.consumer.sequence;
@@ -552,25 +564,21 @@ export class Consumer {
 		this.#refund(group, group.charged);
 	}
 
-	// Wait until `group` may decode another wire frame: the max buffer has room, or the group leads with
-	// nothing buffered. The head leads so reading never waits on its own lookahead, and the group past it
-	// so a stalled head always has a successor to skip to. False once the group is dropped or the
-	// consumer closes, so its task stops rather than charge what no one will refund.
-	async #admit(group: Group): Promise<boolean> {
-		await this.#waitRoom(
-			() =>
-				group.released === true ||
-				(group.frames.length === 0 && (group === this.#groups[0] || group === this.#groups[1])),
-		);
-		return group.released !== true && !this.#signals.abort.aborted;
+	// Whether `group` may decode another wire frame: the max buffer has room, or it is the head with
+	// nothing buffered, so reading never waits on its own lookahead.
+	#admits(group: Group): boolean {
+		return !this.#full() || (group === this.#groups[0] && group.frames.length === 0);
 	}
 
-	// Wait until the max buffer has room, or `exempt` holds, re-checked whenever it may have changed.
-	async #waitRoom(exempt: () => boolean): Promise<void> {
-		const abort = this.#signals.abort;
-		while (this.#full() && !exempt() && !abort.aborted) {
-			await new Promise<void>((resolve) => this.#room.push(resolve));
-		}
+	// Whether `group`'s task should stop: the group was dropped, so what it decodes would never be
+	// refunded, or the consumer closed.
+	#stopped(group: Group): boolean {
+		return group.released === true || this.#signals.abort.aborted;
+	}
+
+	// Park until something may have freed room or moved the head; see #wake.
+	#park(): Promise<void> {
+		return new Promise<void>((resolve) => this.#room.push(resolve));
 	}
 
 	// Let parked tasks re-check the max buffer: something was refunded, or the head or cursor moved.
@@ -676,7 +684,7 @@ export class Consumer {
 								head.latest - this.#presentedEnd > maxDelay));
 					const elapsed = Instant.durationSince(now(), this.#hole) >= Nano.fromMicro(maxDelay);
 					// The groups past the hole already fill the max buffer, so it can hold none of what would arrive into it.
-					const full = head.frames.length > 0 && this.#full();
+					const full = this.#full();
 					if (startup || empty || contiguous || skipHole || elapsed || full || ended !== undefined) {
 						if (!contiguous && !empty) {
 							this.#lost = true;

@@ -108,10 +108,10 @@ pub(crate) enum Item {
 /// Decoded frames waiting to be read are charged to a byte cap, [`set_max_buffer`](Self::set_max_buffer),
 /// along with each buffered frame's and group's own overhead. Once it is full the consumer stops
 /// decoding ahead and stops pulling new groups, so the undecoded rest stays in the transport's cache,
-/// which bounds it. The group the cursor is on, and the first one past it, still decode a wire frame
-/// whenever they hold nothing, so reading never waits on its own lookahead. If the cursor's group stalls
-/// while later groups fill the cap, it is skipped like a slow group: the consumer can hold no more of
-/// what it would wait behind.
+/// which bounds it. The group the cursor is on still decodes a wire frame whenever it holds nothing, so
+/// reading never waits on its own lookahead. If that group stalls while the cap is full, the cursor
+/// moves on to the next group like a skip past a slow group, read or not: the consumer can hold no
+/// more of what it would wait behind.
 pub struct Consumer<F: Container> {
 	// Dropped once an error ends the reader, releasing the publisher's demand.
 	track: Option<moq_net::track::Subscriber>,
@@ -127,6 +127,10 @@ pub struct Consumer<F: Container> {
 
 	// What the pending groups hold, against the max buffer.
 	memory: Memory,
+
+	// The last pull stopped at a full max buffer rather than at the track, so nothing wakes the reader
+	// once a skip refunds room: it pulls again itself.
+	gated: bool,
 
 	// Latches the cursor onto the publisher's first served group when the
 	// subscription names no start. Cleared once a first group is chosen.
@@ -266,6 +270,7 @@ impl<F: Container> Consumer<F> {
 			current: start.unwrap_or(0),
 			pending: VecDeque::new(),
 			memory: Memory::new(DEFAULT_MAX_BUFFER),
+			gated: false,
 			startup: start.is_none(),
 			newest: false,
 			max_delay,
@@ -388,6 +393,16 @@ impl<F: Container> Consumer<F> {
 	}
 
 	fn poll_event_inner(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Event>, F::Error>> {
+		loop {
+			match self.poll_event_once(waiter) {
+				// A skip refunded room for groups the max buffer held back, so pull them.
+				Poll::Pending if std::mem::take(&mut self.gated) && !self.memory.full() => continue,
+				res => return res,
+			}
+		}
+	}
+
+	fn poll_event_once(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Event>, F::Error>> {
 		// Grab any new groups from the track, recording whether the track is finished.
 		let finished = self.poll_read_finish(waiter).is_ready();
 
@@ -557,21 +572,17 @@ impl<F: Container> Consumer<F> {
 				None
 			};
 
-			// Find the first newer group with data (our skip target) and where it starts. The first
-			// one past the cursor buffers past a full max buffer, so a stalled cursor always has a
-			// target to skip to.
+			// Find the first newer group with data (our skip target) and where it starts.
 			let mut next_group = None;
-			let mut lead = true;
 			for (i, group) in self.pending.iter_mut().enumerate() {
 				if group.sequence <= self.current {
 					continue;
 				}
 
-				if let Poll::Ready(Some(ts)) = group.poll_min_timestamp(waiter, &self.format, lead) {
+				if let Poll::Ready(Some(ts)) = group.poll_min_timestamp(waiter, &self.format, false) {
 					next_group = Some((i, std::time::Duration::from(ts)));
 					break;
 				}
-				lead = false;
 			}
 
 			// Find the max timestamp across all newer groups.
@@ -646,19 +657,27 @@ impl<F: Container> Consumer<F> {
 			// short whenever it blocks behind a newer one, as a join's backlog does
 			// while the newer groups race ahead on their own streams. Skip early too
 			// once it has presented up to where the next group begins (duration
-			// coverage), since nothing is left worth waiting for, or once the later groups fill the max
-			// buffer, since no more of them can be held while it waits.
-			let full = self.memory.full();
+			// coverage), since nothing is left worth waiting for.
 			let should_skip = next_group.is_some_and(|(_, next_start)| {
 				max_timestamp.saturating_sub(next_start) >= self.max_delay
 					|| current_end.is_some_and(|end| end >= next_start)
-					|| full
 			});
+			let target = match should_skip {
+				true => next_group.map(|(i, start)| (i, Some(start))),
+				// Once the later groups fill the max buffer, no more of them can be held while it waits,
+				// so move on to the next group even with nothing of it read yet: it reads as the
+				// cursor's group, and each such skip refunds what the group left behind held.
+				false if self.memory.full() => self
+					.pending
+					.iter()
+					.position(|group| group.sequence > self.current)
+					.map(|i| (i, self.pending[i].min_timestamp.map(std::time::Duration::from))),
+				false => None,
+			};
 
-			if let Some((new_idx, next_start)) = next_group
-				&& should_skip
-			{
-				let hole = !pts_contiguous(current_end.or(self.presented_end), next_start);
+			if let Some((new_idx, next_start)) = target {
+				// Without a start read yet, nothing proves the timeline continues.
+				let hole = next_start.is_none_or(|start| !pts_contiguous(current_end.or(self.presented_end), start));
 				let had_marker = self.pending.iter().take(new_idx).any(GroupBuffer::marker);
 				// Buffered frames are thrown away, and `current_end` counts them, so contiguity alone would hide them.
 				let discarded = self
@@ -720,6 +739,7 @@ impl<F: Container> Consumer<F> {
 	//
 	// Returns Pending until all groups have been consumed.
 	fn poll_read_finish(&mut self, waiter: &kio::Waiter) -> Poll<()> {
+		self.gated = false;
 		if self.track_error.is_some() {
 			return Poll::Ready(());
 		}
@@ -727,6 +747,7 @@ impl<F: Container> Consumer<F> {
 			// Past the max buffer, later groups wait in the transport's cache. A missing group at the
 			// cursor then expires like one past the budget: see the hole below.
 			if self.memory.full() {
+				self.gated = true;
 				return Poll::Pending;
 			}
 			let next = match ready!(self.subscriber().poll_recv_group(waiter)) {
@@ -4175,15 +4196,61 @@ mod tests {
 		for _ in 0..2_000 {
 			write_marker(&mut markers, ts(10_000));
 		}
+		Container::Legacy(crate::container::Kind::Data)
+			.write(
+				&mut markers,
+				&[Frame {
+					timestamp: ts(20_000),
+					payload: Bytes::from_static(b"video"),
+					keyframe: false,
+					duration: None,
+				}],
+			)
+			.unwrap();
+		markers.finish().unwrap();
 
-		let first = consumer.poll_read(&waiter);
-		assert!(matches!(first, Poll::Ready(Ok(Some(Read::Frame { .. })))), "{first:?}");
-		assert!(consumer.poll_read(&waiter).is_pending());
-		let used = consumer.buffered_bytes();
+		// The markers fill the max buffer behind the stalled group, which moves the cursor on to them,
+		// and the media past them still plays.
 		let slack = 2 * std::mem::size_of::<GroupBuffer<Container>>() + MARKER_COST;
-		assert!(
-			used <= MAX_BUFFER + slack,
-			"holding {used} bytes past a {MAX_BUFFER} byte max buffer"
-		);
+		let mut frames = Vec::new();
+		loop {
+			let read = consumer.poll_read(&waiter);
+			let used = consumer.buffered_bytes();
+			assert!(
+				used <= MAX_BUFFER + slack,
+				"holding {used} bytes past a {MAX_BUFFER} byte max buffer"
+			);
+			match read {
+				Poll::Ready(Ok(Some(Read::Frame { frame, .. }))) => frames.push(frame.timestamp),
+				Poll::Ready(Ok(Some(_))) => continue,
+				Poll::Pending => break,
+				other => panic!("unexpected read: {other:?}"),
+			}
+		}
+		assert_eq!(frames, vec![ts(0), ts(20_000)]);
+	}
+
+	/// A stalled successor does not hide a readable group behind it once group overhead alone fills the
+	/// max buffer: the cursor moves on group by group until one has something to read.
+	#[test]
+	fn a_stalled_successor_does_not_hide_a_readable_group() {
+		let waiter = kio::Waiter::noop();
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let mut consumer = container_max_delay_only(track.subscribe(None), Duration::from_secs(5));
+		consumer.set_max_buffer(2 * std::mem::size_of::<GroupBuffer<Container>>());
+
+		let _stalled = open_group(&mut track, 0, ts(0));
+		let _empty = track.create_group(moq_net::group::Info { sequence: 1 }).unwrap();
+		write_group(&mut track, 2, &[ts(20_000)]);
+
+		let mut reads = Vec::new();
+		while let Poll::Ready(read) = consumer.poll_read(&waiter) {
+			match read.unwrap() {
+				Some(Read::Frame { frame, .. }) => reads.push(Some(frame.timestamp)),
+				Some(Read::Gap { .. }) => reads.push(None),
+				other => panic!("unexpected read: {other:?}"),
+			}
+		}
+		assert_eq!(reads, vec![Some(ts(0)), None, Some(ts(20_000))]);
 	}
 }

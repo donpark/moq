@@ -147,3 +147,60 @@ test("Consumer skips a stalled group once group overhead alone fills the max buf
 		warn.mockRestore();
 	}
 });
+
+test("Consumer reaches a readable group past a stalled successor once group overhead fills the max buffer", async () => {
+	const warn = spyOn(console, "warn").mockImplementation(() => {});
+	const format = new Counting("data");
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format,
+		maxDelay: Milli.zero,
+		// Three groups' overhead: the readable group cannot decode until the stalled ones are moved past.
+		maxBuffer: 768,
+	});
+	try {
+		const stalled = track.createGroup(0);
+		write(stalled, 0);
+		track.createGroup(1);
+		const readable = track.createGroup(2);
+		write(readable, 10_000);
+		write(readable, 20_000);
+		readable.finish();
+
+		expect(await consumer.next()).toMatchObject({ kind: "frame", frame: { timestamp: 0 } });
+		expect(await consumer.next()).toMatchObject({ kind: "gap" });
+		expect(await consumer.next()).toMatchObject({ kind: "frame", frame: { timestamp: 10_000 } });
+		expect(await consumer.next()).toMatchObject({ kind: "frame", frame: { timestamp: 20_000 } });
+	} finally {
+		consumer.close();
+		track.close();
+		warn.mockRestore();
+	}
+});
+
+test("Consumer admits reads completing together one at a time against the max buffer", async () => {
+	const format = new Counting("data");
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format,
+		maxDelay: Milli(5_000),
+		maxBuffer: 4096,
+	});
+	try {
+		// Ten open groups park on their first read with room to spare, then large frames land in all of
+		// them at once.
+		const groups = Array.from({ length: 10 }, (_, sequence) => track.createGroup(sequence));
+		await flush();
+		const large = new Uint8Array(2_000);
+		for (const group of groups) {
+			group.writeFrame({ payload: encodeFrame(large, 0 as Micro), timestamp: Time.Timestamp.now() });
+		}
+		await flush();
+
+		// The first decode fills the max buffer, so only the head may decode past it.
+		expect(format.decoded).toBeLessThanOrEqual(2);
+	} finally {
+		consumer.close();
+		track.close();
+	}
+});
