@@ -32,6 +32,10 @@
 //! each in its rendition's `hls` field. On the read side, [`Consumer::subscribe`] reads one
 //! rendition's records and yields decoded [`Event`]s. On the wire each record track is an
 //! uncompressed [`moq_json::window`] whose groups restate the recent records.
+//!
+//! An edge reads only the records and fetches media per segment request, so it never subscribes to
+//! the media. A record track's subscribers therefore count as demand for its media track: while
+//! any remain, a local subscription keeps the media wanted, so an on-demand publisher produces it.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -587,7 +591,7 @@ impl Tracks {
 				live
 			}
 		};
-		Ok(Recorder { live })
+		Ok(Recorder { live, lend: None })
 	}
 
 	/// The record track and nominal duration advertised for `name`, once its duration is known.
@@ -669,6 +673,74 @@ fn round(duration: Duration) -> Duration {
 	Duration::from_millis(units(duration))
 }
 
+/// Lends a record track's demand to its media track: while anyone subscribes to the records, a
+/// local subscription keeps the media wanted, so an on-demand publisher produces the media that an
+/// HLS export, which reads only the records, describes and fetches.
+///
+/// Driven by the record track's wakeups rather than a task, since nothing here owns a runtime: a
+/// wake runs on the waking thread, which kio does only outside its own locks. The waker holds this
+/// weakly, so dropping the [`Recorder`] ends the subscription and the registration together. Both
+/// track handles are weak, so neither keeps its track open.
+struct Lend {
+	records: moq_net::track::Demand,
+	media: moq_net::track::Consumer,
+	/// The subscription held while the records are wanted. Never polled: holding it is the demand.
+	held: Option<moq_net::track::Subscribing>,
+	waiter: kio::Waiter,
+}
+
+impl Lend {
+	fn new(records: moq_net::track::Demand, media: moq_net::track::Consumer) -> Arc<Mutex<Self>> {
+		let lend = Arc::new_cyclic(|weak| {
+			let waker = std::task::Waker::from(Arc::new(LendWaker(weak.clone())));
+			Mutex::new(Self {
+				records,
+				media,
+				held: None,
+				waiter: kio::Waiter::new(waker),
+			})
+		});
+		Self::poll(&lend);
+		lend
+	}
+
+	/// Follow the record track's demand until it next changes.
+	fn poll(lend: &Mutex<Self>) {
+		let mut lend = lend.lock().unwrap();
+		let lend = &mut *lend;
+		loop {
+			match lend.records.poll_wanted_changed(&lend.waiter) {
+				Poll::Pending => return,
+				Poll::Ready(Ok(Some(_))) => {
+					if lend.held.is_none() {
+						lend.held = Some(lend.media.subscribe(None).into_inner());
+					}
+				}
+				Poll::Ready(Ok(None)) => lend.held = None,
+				Poll::Ready(Err(_)) => {
+					lend.held = None;
+					return;
+				}
+			}
+		}
+	}
+}
+
+/// Re-polls a [`Lend`] when its record track's demand changes.
+struct LendWaker(std::sync::Weak<Mutex<Lend>>);
+
+impl std::task::Wake for LendWaker {
+	fn wake(self: Arc<Self>) {
+		self.wake_by_ref();
+	}
+
+	fn wake_by_ref(self: &Arc<Self>) {
+		if let Some(lend) = self.0.upgrade() {
+			Lend::poll(&lend);
+		}
+	}
+}
+
 /// Reports one track's frames into its live record track.
 ///
 /// Move-only: it is the track's reporting handle, minted by [`Tracks::track`] and held by a
@@ -676,9 +748,23 @@ fn round(duration: Duration) -> Duration {
 /// segment; the record track stays open until [`Tracks::finish`].
 pub(crate) struct Recorder {
 	live: Arc<Mutex<Live>>,
+	/// Lends the record track's demand to the media track, once [`Self::lend`] names it.
+	lend: Option<Arc<Mutex<Lend>>>,
 }
 
 impl Recorder {
+	/// Keep `media`, the track this recorder reports, wanted while anyone subscribes to its
+	/// records, so an HLS export that reads only the records still starts an on-demand publisher.
+	/// The demand ends when the record track's last subscriber leaves, or this recorder drops.
+	pub fn lend(&mut self, media: &moq_net::track::Producer) {
+		let records = {
+			let live = self.live.lock().unwrap();
+			live.output.as_ref().map(|output| output.track.demand())
+		};
+		// A record track that already failed has no readers to lend for.
+		self.lend = records.map(|records| Lend::new(records, media.consume()));
+	}
+
 	/// Run `callback` once when an unhinted track learns its fixed duration.
 	pub fn on_declare(&mut self, callback: impl FnOnce(Duration) + Send + 'static) {
 		self.live.lock().unwrap().on_declare = Some(Box::new(callback));
@@ -1155,6 +1241,34 @@ mod test {
 			records.push((entry.sequence, entry.group, entry.is_stop()));
 		}
 		assert_eq!(records, [(0, 0, false), (1, 1, true), (2, 0, false), (3, 1, true)]);
+	}
+
+	/// A record track's readers are demand for its media, so an HLS export, which subscribes only to
+	/// the records, starts an on-demand publisher, and its leaving stops it.
+	#[tokio::test]
+	async fn record_readers_want_the_media() {
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let media = broadcast.create_track("video", None).unwrap();
+		let demand = media.demand();
+		let tracks = Tracks::new(&broadcast);
+		let mut recorder = tracks.track("video", hinted()).unwrap();
+		recorder.lend(&media);
+		assert_eq!(demand.wanted(), None, "nobody reads the records yet");
+
+		let hls = tracks.hls("video").unwrap();
+		let records = Consumer::subscribe(&broadcast.consume(), &hls).await.unwrap();
+		assert!(demand.wanted().is_some(), "a record reader wants the media");
+		let again = Consumer::subscribe(&broadcast.consume(), &hls).await.unwrap();
+		drop(records);
+		assert!(demand.wanted().is_some(), "another reader remains");
+		drop(again);
+		assert_eq!(demand.wanted(), None, "the last reader left");
+
+		// Dropping the recorder ends the lend, even with a reader still on the records.
+		let _records = Consumer::subscribe(&broadcast.consume(), &hls).await.unwrap();
+		assert!(demand.wanted().is_some());
+		drop(recorder);
+		assert_eq!(demand.wanted(), None, "the recorder is gone");
 	}
 
 	#[test]
