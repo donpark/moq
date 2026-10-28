@@ -77,6 +77,9 @@ const std::vector<uint8_t> g_opus_head = TestOpusHead();
 
 obs_encoder_t *const VIDEO_ENCODER = reinterpret_cast<obs_encoder_t *>(0x2);
 obs_encoder_t *const AUDIO_ENCODER = reinterpret_cast<obs_encoder_t *>(0x3);
+// A second, 2 Mbps video encoder below VIDEO_ENCODER's 8 Mbps, while g_ladder is set.
+obs_encoder_t *const LOW_ENCODER = reinterpret_cast<obs_encoder_t *>(0x5);
+std::atomic<bool> g_ladder{false};
 } // namespace
 
 extern "C" {
@@ -114,7 +117,9 @@ void obs_data_release(obs_data_t *) {}
 
 obs_encoder_t *obs_output_get_video_encoder2(const obs_output_t *, size_t idx)
 {
-	return idx == 0 ? VIDEO_ENCODER : nullptr;
+	if (idx == 0)
+		return VIDEO_ENCODER;
+	return idx == 1 && g_ladder ? LOW_ENCODER : nullptr;
 }
 
 bool obs_output_begin_data_capture(obs_output_t *, uint32_t)
@@ -163,10 +168,11 @@ const char *obs_encoder_get_codec(const obs_encoder_t *encoder)
 }
 
 // VideoInit reads coded size and CBR from the encoder. Any new libobs call in
-// src/moq-output.cpp needs a stub here or `just obs ci` fails at link.
-obs_data_t *obs_encoder_get_settings(const obs_encoder_t *)
+// src/moq-output.cpp needs a stub here or `just obs ci` fails at link. The
+// settings are the encoder itself, so each reports its own bitrate.
+obs_data_t *obs_encoder_get_settings(const obs_encoder_t *encoder)
 {
-	return reinterpret_cast<obs_data_t *>(0x4);
+	return reinterpret_cast<obs_data_t *>(const_cast<obs_encoder_t *>(encoder));
 }
 
 uint32_t obs_encoder_get_width(const obs_encoder_t *)
@@ -184,9 +190,9 @@ const char *obs_data_get_string(obs_data_t *, const char *)
 	return g_rate_control.c_str();
 }
 
-long long obs_data_get_int(obs_data_t *, const char *)
+long long obs_data_get_int(obs_data_t *settings, const char *)
 {
-	return 8000;
+	return settings == reinterpret_cast<obs_data_t *>(LOW_ENCODER) ? 2000 : 8000;
 }
 
 // The settings a retune builds carry only the bitrate, so the stub is that bitrate.
@@ -298,6 +304,7 @@ void reset(std::string url)
 	g_settings_error.clear();
 	g_rate_control = "CBR";
 	g_encoder_caps = OBS_ENCODER_CAP_DYN_BITRATE;
+	g_ladder = false;
 	{
 		std::lock_guard<std::mutex> lock(g_updates_mutex);
 		g_updates.clear();
@@ -344,8 +351,11 @@ std::shared_ptr<moq::BroadcastConsumer> relayBroadcast(TestRelay &relay)
 	return TestOk(available.get(), "available");
 }
 
-// The broadcast's catalog, once it has video and audio.
-std::optional<moq::Catalog> relayCatalog(const std::shared_ptr<moq::BroadcastConsumer> &broadcast)
+// The broadcast's first catalog `ready` accepts, by default one with video and audio.
+std::optional<moq::Catalog> relayCatalog(const std::shared_ptr<moq::BroadcastConsumer> &broadcast,
+					 std::function<bool(const moq::Catalog &)> ready = [](const moq::Catalog &catalog) {
+						 return !catalog.video.empty() && !catalog.audio.empty();
+					 })
 {
 	if (!broadcast)
 		return std::nullopt;
@@ -357,7 +367,7 @@ std::optional<moq::Catalog> relayCatalog(const std::shared_ptr<moq::BroadcastCon
 		auto catalog = TestOk(next.get(), "catalog next");
 		if (!catalog)
 			return std::nullopt;
-		if (!catalog->video.empty() && !catalog->audio.empty())
+		if (ready(*catalog))
 			return catalog;
 	}
 }
@@ -433,14 +443,31 @@ struct MoQOutputStatsTest {
 		}
 		return true;
 	}
-	// Drive every following video track to its floor, as a collapsed uplink would.
-	static void Collapse(MoQOutput &output)
+	// Apply `target` to `encoder`'s track, as a grant the track's rate control returned.
+	static void Retarget(MoQOutput &output, obs_encoder_t *encoder, const moq::RateTarget &target)
 	{
 		std::lock_guard<std::mutex> lock(output.media_mutex);
-		for (auto &[encoder, track] : output.video_tracks) {
-			if (track.rate)
-				track.rate->Update(1, MoQRate::Clock::now());
+		auto it = output.video_tracks.find(encoder);
+		if (it != output.video_tracks.end())
+			output.Retarget(encoder, it->second, target);
+	}
+	// The name and publisher priority of `encoder`'s track, or nothing without one.
+	static std::optional<std::pair<std::string, int8_t>> Published(MoQOutput &output, obs_encoder_t *encoder)
+	{
+		std::shared_ptr<moq::BroadcastProducer> broadcast;
+		std::shared_ptr<moq::MediaTrackProducer> producer;
+		{
+			std::lock_guard<std::mutex> lock(output.media_mutex);
+			auto it = output.video_tracks.find(encoder);
+			if (it == output.video_tracks.end() || !it->second.producer)
+				return std::nullopt;
+			broadcast = output.broadcast;
+			producer = it->second.producer;
 		}
+		auto name = TestOk(producer->demand(), "demand")->name();
+		auto consumer = TestOk(broadcast->consume(), "consume");
+		auto track = TestOk(consumer->subscribe_track(name, std::nullopt).get(), "subscribe_track");
+		return std::make_pair(name, track->info().priority);
 	}
 };
 
@@ -619,7 +646,8 @@ int main()
 		auto keyframe = TestH264Keyframe();
 		auto video = videoPacket(keyframe, 0);
 		o.Data(&video);
-		MoQOutputStatsTest::Collapse(o);
+		// The floor a collapsed uplink drives it to.
+		MoQOutputStatsTest::Retarget(o, VIDEO_ENCODER, moq::RateTarget::kEnabled{800'000});
 		MoQOutput::VideoRate rate;
 		CHECK(o.TryGetVideoRate(&rate));
 		CHECK(rate.target_bps == 800'000);
@@ -629,6 +657,70 @@ int main()
 		CHECK(!applied.empty() && applied.back() == std::make_pair(VIDEO_ENCODER, 8000LL));
 	}
 	printf("stop restores the configured bitrate: ok\n");
+
+	// Two video encoders form a ladder: the higher rung sits one priority below the
+	// lower, and a disabled rung leaves the catalog disabled, dropping its packets
+	// until a keyframe after the grant funds it again. No encoder follows here, so
+	// only the targets the test applies move it.
+	{
+		TestRelay relay;
+		reset(relay.Url());
+		g_ladder = true;
+		g_encoder_caps = 0;
+		MoQOutput o(nullptr, OUTPUT);
+		CHECK(o.Start());
+		CHECK(WaitFor([&] { return o.IsLiveSession(); }));
+
+		auto keyframe = TestH264Keyframe();
+		std::vector<uint8_t> delta = {0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x00, 0x33};
+		auto video = videoPacket(keyframe, 0);
+		o.Data(&video);
+		size_t sent = keyframe.size();
+		CHECK(o.GetTotalBytes() == sent);
+
+		const auto high = MoQOutputStatsTest::Published(o, VIDEO_ENCODER);
+		const auto low = MoQOutputStatsTest::Published(o, LOW_ENCODER);
+		CHECK(high.has_value() && low.has_value());
+		if (high && low) {
+			CHECK(high->second == low->second - 1);
+			auto broadcast = relayBroadcast(relay);
+
+			MoQOutputStatsTest::Retarget(o, VIDEO_ENCODER, moq::RateTarget::kDisabled{});
+			auto disabled = relayCatalog(broadcast, [&](const moq::Catalog &catalog) {
+				auto it = catalog.video.find(high->first);
+				return it != catalog.video.end() && !it->second.enabled;
+			});
+			CHECK(disabled.has_value());
+			if (disabled) {
+				auto lower = disabled->video.find(low->first);
+				CHECK(lower != disabled->video.end() && lower->second.enabled);
+			}
+
+			auto dropped = videoPacket(delta, 1);
+			dropped.keyframe = false;
+			o.Data(&dropped);
+			auto skipped = videoPacket(keyframe, 2);
+			o.Data(&skipped);
+			CHECK(o.GetTotalBytes() == sent);
+
+			// Funded again, it still waits for a keyframe to resume on.
+			MoQOutputStatsTest::Retarget(o, VIDEO_ENCODER, moq::RateTarget::kEnabled{4'000'000});
+			auto early = videoPacket(delta, 3);
+			early.keyframe = false;
+			o.Data(&early);
+			CHECK(o.GetTotalBytes() == sent);
+			auto resumed = videoPacket(keyframe, 4);
+			o.Data(&resumed);
+			sent += keyframe.size();
+			CHECK(o.GetTotalBytes() == sent);
+			CHECK(relayCatalog(broadcast, [&](const moq::Catalog &catalog) {
+				auto it = catalog.video.find(high->first);
+				return it != catalog.video.end() && it->second.enabled;
+			}).has_value());
+		}
+		o.Stop();
+	}
+	printf("a ladder rung disables, drops packets, and resumes on a keyframe: ok\n");
 
 	// Stop drains the session, even when the output is destroyed straight after: a
 	// large frame written just before it still reaches the relay, and the track then
