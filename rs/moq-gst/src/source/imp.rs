@@ -286,6 +286,8 @@ impl ObjectImpl for MoqSrc {
 					.nick("Max delay")
 					.blurb("How many milliseconds a group may trail the live edge before it is skipped")
 					.default_value(crate::connection::duration_millis(DEFAULT_MAX_DELAY))
+					// A SUBSCRIBE carries it as a QUIC varint, which can't hold 2^62 or more.
+					.maximum((1 << 62) - 1)
 					.mutable_ready()
 					.build(),
 			]
