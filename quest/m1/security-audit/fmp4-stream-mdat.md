@@ -16,17 +16,25 @@ past what is buffered keeps returning `None`, and the HLS importer carries a
 trailing partial atom into the next segment, so one bogus header accumulates
 every later segment.
 
-Decided 2026-10-27 (maintainer): no byte cap. Buffer and parse metadata boxes
-(`moov`, `moof`) whole, then stream each mdat sample into its frame as bytes
-arrive, resolving sample ranges from the parsed `moof` as today. This fits
+Decided 2026-10-27 (maintainer): no byte cap. Stream each mdat sample into
+its frame as bytes arrive, resolving sample ranges from the parsed `moof` as
+today, and discard skipped boxes (`free`, `skip`, unknown types) as their
+bytes arrive instead of buffering them.
+
+Open, for the maintainer before building: `moov` and `moof` are parsed whole
+today, so a header declaring a huge one still pins input. Bring options with
+a recommendation, such as parsing them incrementally (a `moof` is a run of
+small child boxes) or bounding them by the work they describe; a plain byte
+cap is ruled out above. The acceptance test covers a huge declared `moof`,
+`moov`, `mdat`, and skipped box. This fits
 [unbounded groups](/quest/m1/unbounded-groups/README.md), which removes the
 frame cap so a sample can be large. Since
 [8d2fa6653a](https://github.com/moq-dev/moq/commit/8d2fa6653a) a fragment can
 hold several GOPs, so a fragment-sized cap would also refuse legal input.
 
-Keep `sample::Resolver`'s range checks and `Claimed`'s no-reuse rule. A test
-feeds a header with a huge declared size in small chunks and asserts the
-importer's held bytes stay bounded.
+Keep `sample::Resolver`'s range checks and `Claimed`'s no-reuse rule. Each
+test feeds a huge declared size in small chunks and asserts the importer's
+held bytes stay bounded.
 
 Public API: none expected. Wire: none.
 
