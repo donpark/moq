@@ -20818,21 +20818,25 @@ mod test {
 	fn serve_refills(requests: &Requests, archive: &[bytes::Bytes]) -> Vec<ops::Range<u64>> {
 		let mut served = Vec::new();
 		while let Poll::Ready(fill) = requests.poll_requested_fill(&kio::Waiter::noop()) {
-			let fill = fill.unwrap();
-			let mut group = fill.accept(0, None).unwrap();
-			let start = fill.frame_start(0);
-			let mut end = start;
-			for payload in &archive[start as usize..] {
-				match group.write_frame(Timestamp::ZERO, payload.clone()) {
-					Ok(()) => end += 1,
-					Err(Error::Closed) => break,
-					Err(err) => panic!("refill write: {err}"),
-				}
-			}
-			group.finish().unwrap();
-			served.push(start..end);
+			served.push(serve_refill(&fill.unwrap(), archive));
 		}
 		served
+	}
+
+	/// Serve one taken fill from `archive`, as [`serve_refills`] does.
+	fn serve_refill(fill: &Fill, archive: &[bytes::Bytes]) -> ops::Range<u64> {
+		let mut group = fill.accept(0, None).unwrap();
+		let start = fill.frame_start(0);
+		let mut end = start;
+		for payload in &archive[start as usize..] {
+			match group.write_frame(Timestamp::ZERO, payload.clone()) {
+				Ok(()) => end += 1,
+				Err(Error::Closed) => break,
+				Err(err) => panic!("refill write: {err}"),
+			}
+		}
+		group.finish().unwrap();
+		start..end
 	}
 
 	/// Frame `index` of the groups below: 16 KiB naming its index, so a 4 MiB pool holds
@@ -20963,6 +20967,36 @@ mod test {
 			let frame = reader.read_frame().now_or_never().unwrap().unwrap().unwrap();
 			assert_eq!(frame.payload, archive[0]);
 		}
+	}
+
+	/// A reader that leaves stops sparing the frame it asked for, so readers that join and
+	/// leave a long group never accumulate frames pressure can't shed.
+	#[test]
+	#[cfg(feature = "async")]
+	fn a_departed_reader_spares_nothing() {
+		let (producer, _pool) = small_pool(POOL);
+		let requests = producer.requests();
+		let mut live = producer.create_group(group::Info { sequence: 0 }).unwrap();
+		let mut late = live.consume();
+		let mut archive: Vec<_> = (0..1_000).map(numbered).collect();
+		for payload in &archive {
+			live.write_frame(Timestamp::ZERO, payload.clone()).unwrap();
+		}
+		assert!(late.read_frame().now_or_never().is_none());
+		// Its source took the refill already, so it lands though the reader left.
+		let fill = requests.requested_fill().now_or_never().unwrap().unwrap();
+		drop(late);
+		assert_eq!(serve_refill(&fill, &archive).start, 0);
+
+		// Pressure sheds the refill nobody reads, frame 0 with it.
+		for index in 1_000..2_000 {
+			archive.push(numbered(index));
+			live.write_frame(Timestamp::ZERO, archive[index as usize].clone()).unwrap();
+		}
+		let mut again = live.consume();
+		assert!(again.read_frame().now_or_never().is_none());
+		assert_eq!(serve_refills(&requests, &archive)[0].start, 0, "frame 0 was shed");
+		assert_eq!(again.read_frame().now_or_never().unwrap().unwrap().unwrap().payload, archive[0]);
 	}
 
 	/// A join onto a group whose first frame was shed asks for a new group on a track that

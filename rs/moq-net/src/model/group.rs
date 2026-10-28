@@ -185,8 +185,6 @@ struct Below {
 	entry: Entry,
 	// A reader took it, or it left the log, so pressure sheds it before the log's frames.
 	read: AtomicBool,
-	// The frame a refill was asked for: spared until read, so its reader always progresses.
-	pinned: bool,
 }
 
 /// Heap one [`Below`] frame costs beyond its payload, doubled like
@@ -226,6 +224,9 @@ pub(super) struct GroupState {
 	below: BTreeMap<usize, Below>,
 	// Refill copies still writing into `below`, which a reader at a hole waits out.
 	refills: usize,
+	// The frames readers asked refills from and still wait on, counted per reader: pressure
+	// spares them, so each reader always progresses. Readers hold only a read guard.
+	waiting: Arc<Mutex<BTreeMap<usize, usize>>>,
 	// On a refill copy, the group it writes its frames into instead of holding them.
 	refill: Option<Box<Handle>>,
 	// IETF relay state, boxed so a group that never carries any pays one pointer.
@@ -775,12 +776,12 @@ impl GroupState {
 	/// Drop the frames held below the log that `shed` picks, lowest first or `last_first`,
 	/// toward `debt` and at most about `cap`, returning the bytes freed. A frame larger than
 	/// what is left of `debt` stays, and so does everything after it.
-	fn shed_below(&mut self, debt: u64, cap: u64, last_first: bool, shed: impl Fn(&Below) -> bool) -> u64 {
+	fn shed_below(&mut self, debt: u64, cap: u64, last_first: bool, shed: impl Fn(usize, &Below) -> bool) -> u64 {
 		let mut freed = 0;
 		let mut picked: Vec<usize> = self
 			.below
 			.iter()
-			.filter(|(_, below)| shed(below))
+			.filter(|(index, below)| shed(**index, below))
 			.map(|(index, _)| *index)
 			.collect();
 		if last_first {
@@ -801,18 +802,24 @@ impl GroupState {
 	/// Shed whole frames from the group's front toward `debt`, freeing at most about `cap`,
 	/// and return the bytes freed.
 	///
-	/// Frames a reader took go first, then the log's oldest segment, then refilled frames
-	/// nobody read yet, last first and sparing each refill's asked-for frame. So a refill
-	/// outlives the frames after it until its reader takes it, and never evicts what that
-	/// reader needs next before it gets there, without pinning anything else: a refill
-	/// larger than the pool keeps the part its reader reaches first. A victim larger than
-	/// what is left of `debt` stays, carrying the debt over, as a whole group does. A
-	/// compressed group sheds nothing: a plain reader inflates from its first frame.
+	/// Frames below the log that no reader will reach go first: those a reader took, and
+	/// refilled ones with no reader waiting at or before them. Then the log's oldest segment,
+	/// then the refilled frames readers will reach, last first and sparing each frame a
+	/// reader waits on. So a refill outlives the frames after it until its reader takes it,
+	/// and never evicts what that reader needs next before it gets there, without pinning
+	/// anything else: a refill larger than the pool keeps the part its reader reaches first.
+	/// A victim larger than what is left of `debt` stays, carrying the debt over, as a whole
+	/// group does. A compressed group sheds nothing: a plain reader inflates from its first
+	/// frame.
 	fn shed(&mut self, debt: u64, cap: u64) -> u64 {
 		if self.flate.is_some() || self.abort.is_some() {
 			return 0;
 		}
-		let mut freed = self.shed_below(debt, cap, false, |below| below.read.load(Ordering::Relaxed));
+		let waiting = self.waiting.clone();
+		let waiting = waiting.lock().unwrap_or_else(PoisonError::into_inner);
+		let mut freed = self.shed_below(debt, cap, false, |index, below| {
+			below.read.load(Ordering::Relaxed) || waiting.range(..=index).next().is_none()
+		});
 		while freed < cap
 			&& let Some(end) = self.log.segment_end()
 		{
@@ -828,7 +835,7 @@ impl GroupState {
 				.filter_map(|index| self.entry(index))
 				.map(|entry| self.entry_bytes(entry).0)
 				.sum();
-			if size > debt - freed {
+			if size > debt.saturating_sub(freed) {
 				return freed;
 			}
 			let kept = keep.and_then(|index| Some((index, self.entry(index)?.clone())));
@@ -845,14 +852,13 @@ impl GroupState {
 				let below = Below {
 					entry,
 					read: AtomicBool::new(true),
-					pinned: false,
 				};
 				self.below.insert(index, below);
 			}
 		}
 		if freed < cap && freed < debt {
-			freed += self.shed_below(debt - freed, cap - freed, true, |below| {
-				!below.pinned && !below.read.load(Ordering::Relaxed)
+			freed += self.shed_below(debt - freed, cap - freed, true, |index, below| {
+				!below.read.load(Ordering::Relaxed) && !waiting.contains_key(&index)
 			});
 		}
 		freed
@@ -2300,6 +2306,10 @@ impl Handle {
 	/// place rather than caching a copy of its own.
 	pub(super) fn refills(&self, frames: Bounds) -> bool {
 		let state = self.state.read();
+		// Object IDs that left the ordinals can't be matched to a copy's frames.
+		if state.sparse() {
+			return false;
+		}
 		let base = state.log.base() as usize;
 		let Ok(start) = usize::try_from(frames.start) else {
 			return false;
@@ -2325,9 +2335,8 @@ impl Handle {
 		state.shed(debt, cap)
 	}
 
-	/// Take a refill's `entries`, numbered from `start`, into the holes they fill, sparing
-	/// `pin`, the frame it was asked for, until a reader takes it.
-	fn adopt_refill(&self, start: usize, entries: Vec<Entry>, pin: usize) {
+	/// Take a refill's `entries`, numbered from `start`, into the holes they fill.
+	fn adopt_refill(&self, start: usize, entries: Vec<Entry>) {
 		let Ok(mut state) = self.state.write() else {
 			return;
 		};
@@ -2345,7 +2354,6 @@ impl Handle {
 			let below = Below {
 				entry,
 				read: AtomicBool::new(false),
-				pinned: index == pin,
 			};
 			state.below.insert(index, below);
 		}
@@ -2376,9 +2384,8 @@ impl Handle {
 		}
 		let entries = state.entries(start, end).cloned().collect();
 		state.evict_log(end);
-		let pin = state.offset;
 		drop(state);
-		target.adopt_refill(start, entries, pin);
+		target.adopt_refill(start, entries);
 	}
 
 	/// Adopt the frames of `head` below where this copy starts, so it holds the group
@@ -2430,7 +2437,6 @@ impl Handle {
 			let below = Below {
 				entry,
 				read: AtomicBool::new(false),
-				pinned: false,
 			};
 			state.below.insert(index, below);
 		}
@@ -3296,6 +3302,36 @@ struct Refill {
 	start: usize,
 	end: usize,
 	ask: track::Refill,
+	_waiting: Waiting,
+}
+
+/// A reader waiting on frame `index` of its group, which pressure spares while this lives.
+struct Waiting {
+	waiting: Arc<Mutex<BTreeMap<usize, usize>>>,
+	index: usize,
+}
+
+impl Waiting {
+	fn new(waiting: Arc<Mutex<BTreeMap<usize, usize>>>, index: usize) -> Self {
+		*waiting
+			.lock()
+			.unwrap_or_else(PoisonError::into_inner)
+			.entry(index)
+			.or_default() += 1;
+		Self { waiting, index }
+	}
+}
+
+impl Drop for Waiting {
+	fn drop(&mut self) {
+		let mut waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+		if let std::collections::btree_map::Entry::Occupied(mut count) = waiting.entry(self.index) {
+			*count.get_mut() -= 1;
+			if *count.get() == 0 {
+				count.remove();
+			}
+		}
+	}
 }
 
 impl Clone for Cursor {
@@ -3901,11 +3937,14 @@ impl Cursor {
 	/// Ask a refill of the frames shed at `index..end`, or [`Error::Evicted`] with nothing
 	/// to serve it.
 	fn ask(&mut self, index: usize, end: usize) -> Result<()> {
+		// Waiting before it asks, so a refill its handler writes at once spares the frame.
+		let waiting = Waiting::new(self.state.read().waiting.clone(), index);
 		let ask = track::Refill::ask(&self.cache, self.sequence, index as u64..end as u64).ok_or(Error::Evicted)?;
 		self.refill = Some(Refill {
 			start: index,
 			end,
 			ask,
+			_waiting: waiting,
 		});
 		Ok(())
 	}
