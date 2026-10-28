@@ -1,0 +1,278 @@
+{
+	"profile": "moq-sign-00",
+	"constants": {
+		"label": "6d6f712d7369676e2d3030",
+		"key_len": 32,
+		"signature_len": 64
+	},
+	"keys": [
+		{
+			"id": "rfc8032-test-1",
+			"seed": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+			"public": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+		},
+		{
+			"id": "test",
+			"seed": "6d6f712d7369676e2d3030207465737420736565642121212121212121212121",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce"
+		},
+		{
+			"id": "other",
+			"seed": "6d6f712d7369676e2d3030206f74686572207365656421212121212121212121",
+			"public": "a159de3c301ce808bc042676c8f609ef61e4aed5181df8a002a7e014091d3758"
+		}
+	],
+	"frames": [
+		{
+			"id": "base",
+			"seed": "6d6f712d7369676e2d3030207465737420736565642121212121212121212121",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 1,
+			"payload": "68656c6c6f",
+			"message": "6d6f712d7369676e2d3030000000000000000d6d6573682f6e6f64652f737368000000000000002430313961326233632d346435652d376636302d386131622d326333643465356636613762000000000000000673747265616d0000000000000003000000000000000168656c6c6f",
+			"body": "68656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189ca1ffe64ad0a"
+		},
+		{
+			"id": "empty-payload",
+			"seed": "6d6f712d7369676e2d3030207465737420736565642121212121212121212121",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 0,
+			"payload": "",
+			"message": "6d6f712d7369676e2d3030000000000000000d6d6573682f6e6f64652f737368000000000000002430313961326233632d346435652d376636302d386131622d326333643465356636613762000000000000000673747265616d00000000000000030000000000000000",
+			"body": "1e0ed358f8c4053edd585a3feb8eca2755f3b232d266b66df0b23ea5b843fec56d8af410d20d495df22f1b0cd7cd0118bd160edfd1ec33972e5738ab6aa58404"
+		},
+		{
+			"id": "group-above-u32",
+			"seed": "6d6f712d7369676e2d3030207465737420736565642121212121212121212121",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 1099511627781,
+			"frame": 0,
+			"payload": "68656c6c6f",
+			"message": "6d6f712d7369676e2d3030000000000000000d6d6573682f6e6f64652f737368000000000000002430313961326233632d346435652d376636302d386131622d326333643465356636613762000000000000000673747265616d0000010000000005000000000000000068656c6c6f",
+			"body": "68656c6c6f36ba11c14dd79078cc547ac35257552140d416bbd8eec0f31a67fa0e4da9d021ac43125ea0d8fb6de5d0c6376ce3529c9b50270dfffbb661559dd42ea1ec1309"
+		},
+		{
+			"id": "frame-above-u32",
+			"seed": "6d6f712d7369676e2d3030207465737420736565642121212121212121212121",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 4294967296,
+			"payload": "68656c6c6f",
+			"message": "6d6f712d7369676e2d3030000000000000000d6d6573682f6e6f64652f737368000000000000002430313961326233632d346435652d376636302d386131622d326333643465356636613762000000000000000673747265616d0000000000000003000000010000000068656c6c6f",
+			"body": "68656c6c6f96b21176ed8aa2cd6ea943a3601e60344ab2ff9ede5c1d3ec22b05c237c28946ac08f2619ca5669c3cb76051e1b0df928f8c1a07b976d1d6f5cf8801701fd404"
+		},
+		{
+			"id": "max-u53",
+			"seed": "6d6f712d7369676e2d3030207465737420736565642121212121212121212121",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 9007199254740991,
+			"frame": 1,
+			"payload": "68656c6c6f",
+			"message": "6d6f712d7369676e2d3030000000000000000d6d6573682f6e6f64652f737368000000000000002430313961326233632d346435652d376636302d386131622d326333643465356636613762000000000000000673747265616d001fffffffffffff000000000000000168656c6c6f",
+			"body": "68656c6c6f42daf8ec76ab76aff7b07fbe664504c0dfd9ad853383a6325b894c6bf6f413e60c14bda18b0e0f2635cf3677bc4f0e0d5fa4170b57503a89b73d587b0b06a709"
+		},
+		{
+			"id": "empty-path-utf8-track",
+			"seed": "6d6f712d7369676e2d3030207465737420736565642121212121212121212121",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "café",
+			"group": 3,
+			"frame": 1,
+			"payload": "68656c6c6f",
+			"message": "6d6f712d7369676e2d30300000000000000000000000000000002430313961326233632d346435652d376636302d386131622d3263336434653566366137620000000000000005636166c3a90000000000000003000000000000000168656c6c6f",
+			"body": "68656c6c6f34c19a5af0957aee4440e37197ab2455b10b16e6f7c106fbf31901565efd651597856b6d08402e7adc6b394a5c2b28236348c77a84fa2419136b2bce2a2f5709"
+		},
+		{
+			"id": "other-key",
+			"seed": "6d6f712d7369676e2d3030206f74686572207365656421212121212121212121",
+			"public": "a159de3c301ce808bc042676c8f609ef61e4aed5181df8a002a7e014091d3758",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 1,
+			"payload": "68656c6c6f",
+			"message": "6d6f712d7369676e2d3030000000000000000d6d6573682f6e6f64652f737368000000000000002430313961326233632d346435652d376636302d386131622d326333643465356636613762000000000000000673747265616d0000000000000003000000000000000168656c6c6f",
+			"body": "68656c6c6fc70597b8ca756f8928014f3b72b05bc70dfe6894ee6f071a9cf11e61c15fddcf4713c8216d3952c8eda963348295f3f94f28bac7eb83e04711ca29c2cce6cb00"
+		}
+	],
+	"negative": [
+		{
+			"id": "relocated-path",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/http",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 1,
+			"body": "68656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189ca1ffe64ad0a",
+			"error": "signature"
+		},
+		{
+			"id": "relocated-epoch",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7c",
+			"track": "stream",
+			"group": 3,
+			"frame": 1,
+			"body": "68656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189ca1ffe64ad0a",
+			"error": "signature"
+		},
+		{
+			"id": "relocated-track",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream2",
+			"group": 3,
+			"frame": 1,
+			"body": "68656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189ca1ffe64ad0a",
+			"error": "signature"
+		},
+		{
+			"id": "relocated-group",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 4,
+			"frame": 1,
+			"body": "68656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189ca1ffe64ad0a",
+			"error": "signature"
+		},
+		{
+			"id": "relocated-frame",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 0,
+			"body": "68656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189ca1ffe64ad0a",
+			"error": "signature"
+		},
+		{
+			"id": "shifted-boundary",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/sshs",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "tream",
+			"group": 3,
+			"frame": 1,
+			"body": "68656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189ca1ffe64ad0a",
+			"error": "signature"
+		},
+		{
+			"id": "wrong-key",
+			"public": "a159de3c301ce808bc042676c8f609ef61e4aed5181df8a002a7e014091d3758",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 1,
+			"body": "68656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189ca1ffe64ad0a",
+			"error": "signature"
+		},
+		{
+			"id": "tampered-payload",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 1,
+			"body": "69656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189ca1ffe64ad0a",
+			"error": "signature"
+		},
+		{
+			"id": "tampered-signature",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 1,
+			"body": "68656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189ca1ffe64ad0b",
+			"error": "signature"
+		},
+		{
+			"id": "appended-byte",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 1,
+			"body": "68656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189ca1ffe64ad0a00",
+			"error": "signature"
+		},
+		{
+			"id": "truncated",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 1,
+			"body": "68656c6c6fb248e979ba0ada4b008cf57976a6bb114670990b0353e9c147b716ef51f2aad8c5401c2b49c0e8160a4bae8ec863527e6c2bd66ce941728cb189",
+			"error": "signature"
+		},
+		{
+			"id": "empty",
+			"public": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce",
+			"path": "mesh/node/ssh",
+			"epoch": "019a2b3c-4d5e-7f60-8a1b-2c3d4e5f6a7b",
+			"track": "stream",
+			"group": 3,
+			"frame": 1,
+			"body": "",
+			"error": "signature"
+		}
+	],
+	"invalid_ids": [
+		{
+			"id": "uppercase",
+			"text": "4030B2C68C2E6CC51C96DAE4B44CC53C07471BA7D7731EB7368FE8F807ECB5CE"
+		},
+		{
+			"id": "short",
+			"text": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5c"
+		},
+		{
+			"id": "long",
+			"text": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce0"
+		},
+		{
+			"id": "non-hex",
+			"text": "4030b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5cg"
+		},
+		{
+			"id": "prefixed",
+			"text": "0x30b2c68c2e6cc51c96dae4b44cc53c07471ba7d7731eb7368fe8f807ecb5ce"
+		},
+		{
+			"id": "empty",
+			"text": ""
+		}
+	]
+}
