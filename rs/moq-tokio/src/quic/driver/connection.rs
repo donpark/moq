@@ -81,7 +81,7 @@ impl Connecting {
 		let connected = Box::pin(conn.shared.connected.clone().notified_owned());
 
 		let driver = ConnectionDriver::new(conn.clone());
-		tokio::spawn(
+		crate::runtime::spawn(
 			async {
 				if let Err(e) = driver.await {
 					tracing::error!("I/O error: {e}");

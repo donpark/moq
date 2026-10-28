@@ -36,9 +36,7 @@ and `set_default_client_config` go.
 writability out to every connection itself. moq-tokio's backend wraps the
 socket in its own `Arc<RwLock<Option<UdpSocket>>>` with a waker fan-out and
 `release()` (about 170 lines with its test) only because every connection's
-`UdpSender` keeps the socket alive. `Endpoint::new` outside a tokio runtime
-returns an error instead of panicking in `tokio::spawn`, so the backend's
-`Handle::try_current()` guards go.
+`UdpSender` keeps the socket alive.
 
 **Limits.** `Limits` gains `stream_receive_window` so it really is the one
 spelling, and the idle timeout is a validated `Duration`. moq-tokio's

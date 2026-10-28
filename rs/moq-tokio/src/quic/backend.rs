@@ -109,10 +109,6 @@ pub enum Error {
 	#[error("failed to create qlog file")]
 	CreateQlog(#[source] std::io::Error),
 
-	/// No async runtime was found. Construct the client or server from within a tokio runtime.
-	#[error("no async runtime")]
-	NoRuntime,
-
 	/// The endpoint's local address could not be read from the socket.
 	#[error("failed to get local address")]
 	LocalAddr(#[source] std::io::Error),
@@ -338,8 +334,6 @@ impl Client {
 			.map(Arc::new);
 
 		// There's a bit more boilerplate to make a generic endpoint.
-		// The driver spawns its tasks on the current tokio runtime.
-		tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
 		let endpoint_config = driver::EndpointConfig::default();
 
 		// Create the generic QUIC endpoint.
@@ -502,7 +496,6 @@ impl Error {
 			Self::InvalidScheme
 			| Self::UnsupportedScheme(_)
 			| Self::InvalidDnsName
-			| Self::NoRuntime
 			| Self::NoInitialCipherSuite
 			| Self::ConnectRejected(_)
 			| Self::Limits(_) => true,
@@ -611,7 +604,10 @@ impl Socket {
 	fn new(socket: std::net::UdpSocket) -> std::io::Result<Self> {
 		let state = moq_sock::udp::UdpSocketState::new((&socket).into())?;
 		let local = socket.local_addr()?;
-		let io = tokio::net::UdpSocket::from_std(socket)?;
+		let io = {
+			let _runtime = crate::runtime::enter();
+			tokio::net::UdpSocket::from_std(socket)?
+		};
 		Ok(Self {
 			io: Arc::new(RwLock::new(Some(Arc::new(io)))),
 			state: Arc::new(state),
@@ -785,9 +781,6 @@ impl Server {
 		}
 
 		// There's a bit more boilerplate to make a generic endpoint.
-		// The driver spawns its tasks on the current tokio runtime.
-		tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
-
 		let listen = config
 			.bind
 			.as_ref()

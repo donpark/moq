@@ -127,7 +127,7 @@ impl Endpoint {
 			addr.is_ipv6(),
 		);
 		let driver = EndpointDriver(rc.clone());
-		tokio::spawn(
+		crate::runtime::spawn(
 			async {
 				if let Err(e) = driver.await {
 					tracing::error!("I/O error: {}", e);

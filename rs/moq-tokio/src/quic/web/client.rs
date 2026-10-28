@@ -201,42 +201,45 @@ impl Client {
 
 	/// Connect to the server.
 	pub async fn connect(&self, request: impl Into<ConnectRequest>) -> Result<Session, ClientError> {
-		let request = request.into();
+		crate::runtime::scope(async move {
+			let request = request.into();
 
-		let port = request.url.port().unwrap_or(443);
+			let port = request.url.port().unwrap_or(443);
 
-		// TODO error on username:password in host
-		let (host, remote) = match request
-			.url
-			.host()
-			.ok_or_else(|| ClientError::InvalidDnsName("".to_string()))?
-		{
-			Host::Domain(domain) => {
-				let domain = domain.to_string();
-				// Look up the DNS entry.
-				let mut remotes = match lookup_host((domain.clone(), port)).await {
-					Ok(remotes) => remotes,
-					Err(_) => return Err(ClientError::InvalidDnsName(domain)),
-				};
+			// TODO error on username:password in host
+			let (host, remote) = match request
+				.url
+				.host()
+				.ok_or_else(|| ClientError::InvalidDnsName("".to_string()))?
+			{
+				Host::Domain(domain) => {
+					let domain = domain.to_string();
+					// Look up the DNS entry.
+					let mut remotes = match lookup_host((domain.clone(), port)).await {
+						Ok(remotes) => remotes,
+						Err(_) => return Err(ClientError::InvalidDnsName(domain)),
+					};
 
-				// Return the first entry.
-				let remote = match remotes.next() {
-					Some(remote) => remote,
-					None => return Err(ClientError::InvalidDnsName(domain)),
-				};
+					// Return the first entry.
+					let remote = match remotes.next() {
+						Some(remote) => remote,
+						None => return Err(ClientError::InvalidDnsName(domain)),
+					};
 
-				(domain, remote)
-			}
-			Host::Ipv4(ipv4) => (ipv4.to_string(), SocketAddr::new(IpAddr::V4(ipv4), port)),
-			Host::Ipv6(ipv6) => (ipv6.to_string(), SocketAddr::new(IpAddr::V6(ipv6), port)),
-		};
+					(domain, remote)
+				}
+				Host::Ipv4(ipv4) => (ipv4.to_string(), SocketAddr::new(IpAddr::V4(ipv4), port)),
+				Host::Ipv6(ipv6) => (ipv6.to_string(), SocketAddr::new(IpAddr::V6(ipv6), port)),
+			};
 
-		// Connect to the server using the addr we just resolved.
-		let conn = self.endpoint.connect_with(self.config.clone(), remote, &host)?;
-		let conn = conn.await?;
+			// Connect to the server using the addr we just resolved.
+			let conn = self.endpoint.connect_with(self.config.clone(), remote, &host)?;
+			let conn = conn.await?;
 
-		// Connect with the connection we established.
-		Session::connect(conn, request).await
+			// Connect with the connection we established.
+			Session::connect(conn, request).await
+		})
+		.await
 	}
 }
 
