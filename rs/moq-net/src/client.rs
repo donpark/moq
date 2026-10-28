@@ -311,11 +311,12 @@ impl Client {
 	) -> Result<(Session, crate::Driver), Error> {
 		let (publish, subscribe) = self.origins(peer_hop);
 
-		// Advertise our capabilities (we report what the transport measures; we
-		// don't pad) plus the request path on URI-less transports, and the
-		// direction we intend to use so the server can reject a token that lacks
-		// the matching scope during the handshake instead of silently carrying
-		// no media. Versions without a Setup Stream have nothing to advertise.
+		// Advertise our capabilities (we report what the transport measures, and
+		// probe to the peer's target only with a sender) plus the request path on
+		// URI-less transports, and the direction we intend to use so the server
+		// can reject a token that lacks the matching scope during the handshake
+		// instead of silently carrying no media. Versions without a Setup Stream
+		// have nothing to advertise.
 		let our_setup = if version.has_setup_stream() {
 			lite::Setup {
 				probe: lite::ProbeLevel::detect(&session),
