@@ -196,7 +196,7 @@ impl Workers {
 
 		// Joining blocks, so it goes to the pool that exists for that rather than
 		// stalling whichever executor thread happened to run this.
-		let _ = crate::runtime::scope(tokio::task::spawn_blocking(move || join(threads))).await;
+		let _ = crate::runtime::scope(async move { tokio::task::spawn_blocking(move || join(threads)).await }).await;
 	}
 }
 
@@ -338,7 +338,7 @@ impl Group {
 
 		// Joining blocks, so it goes to the pool that exists for that rather than
 		// stalling whichever executor thread happened to run this.
-		let _ = crate::runtime::scope(tokio::task::spawn_blocking(move || join(threads))).await;
+		let _ = crate::runtime::scope(async move { tokio::task::spawn_blocking(move || join(threads)).await }).await;
 	}
 
 	/// Tell every worker to stop and take its thread, leaving nothing for a later
