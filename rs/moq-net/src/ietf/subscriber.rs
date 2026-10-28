@@ -3826,8 +3826,14 @@ impl Subscriber {
 		let aborted = self.remove_subscribe(request_id).is_none();
 
 		if !idle {
-			// The publisher already ended the request, so a FIN is all we owe it.
-			stream.writer.finish().ok();
+			// The publisher already ended the request, so a FIN is all we owe it, unless an
+			// update its send window held back would go out truncated behind it.
+			match stream.writer.is_flushed() {
+				true => {
+					stream.writer.finish().ok();
+				}
+				false => stream.writer.abort(&Error::Cancel),
+			}
 			// A reader may still miss history the publisher holds, such as a group whose
 			// fetch was in flight as the track ended, so a finished copy keeps serving fills.
 			return (finished && !aborted).then(|| Idle {
@@ -7843,6 +7849,118 @@ mod tests {
 				"{version:?}: the send side must be closed, not reset out from under the cancellation",
 			);
 		}
+	}
+
+	/// Run a draft-22 subscription to Established over a peer whose request stream takes only
+	/// `window` bytes. Returns the session, the running task, the track, and its first reader.
+	async fn update_under_window(
+		window: Option<usize>,
+	) -> (
+		crate::lite::test_transport::ScriptedSession,
+		moq_clock::sim::JoinHandle<()>,
+		crate::track::Consumer,
+		kio::Pending<track::Subscribing>,
+	) {
+		let version = Version::Draft22;
+		let subscribe_ok = message(
+			ietf::SubscribeOk::ID,
+			&ietf::SubscribeOk {
+				track_alias: 7,
+				largest: None,
+				properties: Default::default(),
+			},
+			version,
+		);
+		let mut session = crate::lite::test_transport::ScriptedSession::new(subscribe_ok);
+		if let Some(window) = window {
+			session = session.with_send_window(window);
+		}
+		let (tasks, task_set) = crate::util::TaskSet::new();
+		std::mem::forget(task_set);
+		let mut subscriber = Subscriber::new(
+			crate::time::sim(),
+			crate::driver::Transport::new(session.clone()),
+			crate::origin::Config::new(crate::Hop::new(1).unwrap()).produce(),
+			Control::new(false),
+			None,
+			peer::PeerSetup::declared(peer::Peer::default()),
+			crate::Hop::new(1).unwrap(),
+			None,
+			version,
+			tasks,
+			Default::default(),
+		);
+		let producer = crate::broadcast::Info::default().produce();
+		let mut dynamic = producer.requests();
+		let track = producer.consume().track("video").unwrap();
+		let first = track.subscribe(None);
+		let request = dynamic.requested_track().await.expect("no track requested");
+		let serving = moq_clock::sim::spawn(async move {
+			let _producer = producer;
+			subscriber
+				.run_subscribe(Path::from_static("broadcast"), dynamic, None, request)
+				.await;
+		});
+		settle().await;
+		(session, serving, track, first)
+	}
+
+	/// A REQUEST_UPDATE the peer's send window holds back part-way is still buffered when
+	/// PUBLISH_DONE ends the subscription, so the stream resets rather than FIN a truncated
+	/// update.
+	#[moq_clock::test]
+	async fn a_stalled_update_resets_when_the_publisher_ends() {
+		// The SUBSCRIBE alone, measured over an open window.
+		let subscribe = {
+			let (session, serving, _track, _first) = update_under_window(None).await;
+			serving.abort();
+			session.log.writes.lock().unwrap().len()
+		};
+
+		let (session, serving, track, _first) = update_under_window(Some(subscribe + 1)).await;
+		let _raised = track
+			.subscribe(track::Subscription {
+				priority: 5,
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		settle().await;
+		assert_eq!(
+			session.log.writes.lock().unwrap().len(),
+			subscribe + 1,
+			"the update stalled mid-message"
+		);
+
+		session.push(&message(
+			ietf::PublishDone::ID,
+			&ietf::PublishDone {
+				status_code: 0x2,
+				stream_count: 0,
+				reason_phrase: "done".into(),
+			},
+			Version::Draft22,
+		));
+		// The script push wakes nothing, so a subscription change re-polls the loop.
+		let _again = track
+			.subscribe(track::Subscription {
+				priority: 7,
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		// Past the grace PUBLISH_DONE waits out for its data streams; the copy then lingers.
+		moq_clock::sleep(crate::ledger::GRACE * 2).await;
+		assert_eq!(session.log.resets(), vec![crate::ietf::error::CANCELLED]);
+		assert!(
+			!session
+				.log
+				.trail()
+				.iter()
+				.any(|(_, sent)| matches!(sent, crate::lite::test_transport::Sent::Finish)),
+			"finished a truncated update"
+		);
+		serving.abort();
 	}
 
 	/// When `conflict` is set, an alias-7 binding for the same full track name is seeded
