@@ -31,6 +31,10 @@ for (const job of [check.jobs.check]) {
 	assert.equal(condition(job.if, "pull_request", "release", true, "edited"), true);
 	assert.equal(condition(job.if, "pull_request", "release", true, "closed"), false);
 }
+// Release's selector and execution share one job-wide base; Land uses its
+// resolved main SHA for every checked prefix, never the preceding PR's head.
+assert.equal(check.jobs.check.env.CI_BASE, "--all");
+for (const step of check.jobs.check.steps) assert.equal(step.env?.CI_BASE, undefined, `${step.name} overrides CI_BASE`);
 // biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub expression is literal YAML.
 assert.equal(check.concurrency.group, "check-${{ github.ref }}");
 assert.equal(check.concurrency["cancel-in-progress"], true);
@@ -56,7 +60,6 @@ for (const job of Object.values(land.jobs) as { steps: { uses?: string; with?: {
 	assert.equal(checkout?.with?.ref, "main", "every phase installs Quest from trusted main");
 }
 assert.ok(!JSON.stringify(land.jobs.check).includes("APP_PRIVATE_KEY"));
-assert.ok(land.jobs.check.steps.find((step: { id?: string }) => step.id === "check").run.includes('just ci "$base"'));
 assert.ok(land.jobs.land.steps.some((step: { run?: string }) => step.run?.includes("quest land push")));
 
 // A failed engine process must fail its job, rather than publish an empty
@@ -66,9 +69,13 @@ const scratch = await mkdtemp(join(process.cwd(), ".tmp/land-policy-"));
 try {
 	const bin = join(scratch, "bin");
 	await mkdir(bin);
-	await writeFile(join(bin, "quest"), '#!/bin/sh\nprintf "%s\\n" "$ENGINE_OUTPUT"\nexit "$ENGINE_EXIT"\n', {
-		mode: 0o755,
-	});
+	await writeFile(
+		join(bin, "quest"),
+		'#!/bin/sh\nprintf "%s\\n" "$@" > "$ENGINE_ARGS"\nprintf "%s\\n" "$ENGINE_OUTPUT"\nexit "$ENGINE_EXIT"\n',
+		{
+			mode: 0o755,
+		},
+	);
 	await writeFile(join(bin, "git"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 	for (const [job, id] of [
 		["resolve", "resolve"],
@@ -86,11 +93,30 @@ try {
 					GITHUB_OUTPUT: output,
 					ENGINE_EXIT: String(code),
 					ENGINE_OUTPUT: '{"checks":[]}',
+					ENGINE_ARGS: join(scratch, "args"),
 				},
 			});
 			assert.equal(result.exitCode, code, `${job} must propagate engine failure`);
 			const posted = await Bun.file(output).exists();
 			assert.equal(posted, code === 0, `${job} must not publish success after failure`);
+			const args = (await Bun.file(join(scratch, "args")).text()).trim().split("\n");
+			assert.deepEqual(
+				args,
+				job === "resolve"
+					? ["land", "resolve", "--base", "main"]
+					: [
+							"land",
+							"check",
+							".tmp/land/plan.json",
+							"--",
+							"nix",
+							"develop",
+							"--command",
+							"just",
+							"ci",
+							"a".repeat(40),
+						],
+			);
 		}
 	}
 } finally {

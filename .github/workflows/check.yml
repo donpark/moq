@@ -27,6 +27,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     # Backstop a hang instead of holding the runner for the 6-hour default.
     timeout-minutes: 60
+    env:
+      CI_BASE: --all
 
     steps:
       - name: Checkout
@@ -43,8 +45,6 @@ jobs:
       - name: Select work
         id: scope
         run: just ci-select "$CI_BASE" >> "$GITHUB_OUTPUT"
-        env:
-          CI_BASE: --all
 
       - uses: ./.github/actions/nix
         if: steps.scope.outputs.needed == 'true' && runner.environment != 'self-hosted'
@@ -65,8 +65,6 @@ jobs:
         run: |
           rm -rf target/cargo-timings
           nix develop --command just ci "$CI_BASE"
-        env:
-          CI_BASE: --all
 
       # Cargo's per-crate timings for the Rust test builds, so a slow crate
       # shows without rebuilding. The job summary has the per-module times.
