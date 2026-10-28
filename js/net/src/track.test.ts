@@ -646,6 +646,47 @@ test("a datagram is judged against a time range by its own timestamp", () => {
 	expect(hooks.tryRecvDatagram(reader)).toEqual({ kind: "idle" });
 });
 
+// A reached end leaves a held group that may still start, so a time start still waits on it.
+test("a time start waits on groups below a reached end that have yet to start", () => {
+	for (const order of ["ascending", "descending"] as const) {
+		const producer = new TrackProducer("test");
+		producer.accept({ timescale: Timescale.MILLI });
+		const groups = [0, 1, 2].map((sequence) => producer.createGroup(sequence));
+		producer.finishAt({ group: 3, frame: 0 });
+		const reader = producer.subscribe({
+			maxDelay: null,
+			order,
+			ranges: [{ start: { time: Timestamp.fromMillis(1500) } }],
+		});
+		expect(reader.tryRecvGroup()).toBeUndefined();
+		for (const [sequence, group] of groups.entries()) {
+			group.writeFrame(textFrame(`${sequence}`, Timestamp.fromMillis(sequence * 1000)));
+		}
+		const got: number[] = [];
+		for (let group = reader.tryRecvGroup(); group; group = reader.tryRecvGroup()) got.push(group.sequence);
+		expect(got.sort()).toEqual([1, 2]);
+	}
+});
+
+// A drop outside a time end's cap is reported once the end settles past it.
+test("a drop a time end settles over is reported", () => {
+	const producer = new TrackProducer("test");
+	producer.accept({ timescale: Timescale.MILLI });
+	const zero = producer.createGroup(0);
+	const reader = producer.subscribe({
+		maxDelay: null,
+		order: "ascending",
+		ranges: [{ start: { absolute: 0 }, end: { time: Timestamp.fromMillis(500) } }, { start: { absolute: 10 } }],
+	});
+	expect(hooks.tryRecvGroup(reader, true)).toMatchObject({ kind: "group", group: { sequence: 0 } });
+	// Past the cap while group 0 has yet to start.
+	hooks.dropTrackGroups(producer, 1, 2, DROPPED);
+	expect(hooks.tryRecvGroup(reader, true)).toEqual({ kind: "idle" });
+	zero.writeFrame(textFrame("0", Timestamp.fromMillis(0)));
+	producer.createGroup(2).writeFrame(textFrame("2", Timestamp.fromMillis(2000)));
+	expect(hooks.tryRecvGroup(reader, true)).toEqual({ kind: "drop", start: 1, end: 2, error: DROPPED });
+});
+
 test("an untimed track or a moq-transport copy refuses a time anchor", () => {
 	const ranges = [{ start: { time: Timestamp.fromMillis(0) } }];
 	const untimed = new TrackProducer("test");

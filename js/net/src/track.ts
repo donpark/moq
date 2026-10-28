@@ -239,10 +239,10 @@ export interface Groups {
  *
  * A time anchor resolves from where the groups the hop holds start. A start before every group
  * held reaches back to the oldest one, and one resolved before any group has started waits for
- * one that has, reading everything meanwhile as a waiting relative anchor does. An end settles once a group starting after it is known and every sequence
- * below that one is accounted for; until then reads stop at the first held group that may still
- * start, so at most that one group past the end is read before its first frame shows where it
- * starts. A datagram is judged by its own timestamp. A time anchor on an untimed track is refused
+ * one that has, reading nothing of its range meanwhile. An end settles once a group starting
+ * after it is known and every sequence below that one is accounted for; until then reads stop
+ * at the first held group that may still start, so at most that one group past the end is read
+ * before its first frame shows where it starts. A datagram is judged by its own timestamp. A time anchor on an untimed track is refused
  * with {@link TimestampMismatch}, and on a moq-transport copy, whose timestamps may rewind.
  *
  * Older moq-lite versions carry only absolute anchors, the live start, and the oldest start,
@@ -1861,6 +1861,8 @@ export class Subscriber {
 	// This reader's own ranges resolved to the groups it reads, whatever another subscriber
 	// widens the aggregate to. Assigned in the constructor.
 	#window!: Window;
+	// Bumped whenever the window moves, so the drop scan knows to look again.
+	#revision = 0;
 	// The hull of what this reader reads now: its local bounds narrowed to the window's floor
 	// and end. A group inside it is read only if the window contains it too.
 	#cursor = new Signal<{ start: number; end?: number }>({ start: 0 });
@@ -1876,7 +1878,7 @@ export class Subscriber {
 	// the track's drops last folded in, and every sequence already reported. Drops are
 	// persistent track state, so they are tracked here rather than removed for everyone.
 	#pending: DropRun[] = [];
-	#dropsSeen?: { drops: readonly DropRun[]; start: number; end?: number; window: Window };
+	#dropsSeen?: { drops: readonly DropRun[]; start: number; end?: number; revision: number };
 	#reported: Run[] = [];
 	// The group the frame-level helpers are currently draining, acquired through the
 	// sequence cursor so frame reads and {@link Ordered.nextGroup} share one floor.
@@ -2198,6 +2200,12 @@ export class Subscriber {
 	// Resolve this reader's ranges again, as when they are replaced.
 	#resolve(): void {
 		this.#window = new Window(this.#state.update.peek()?.ranges ?? [{}], this.#latestGroup(), this.#holdings());
+		this.#moved();
+	}
+
+	// The window moved: narrow the bounds to it.
+	#moved(): void {
+		this.#revision++;
 		this.#bound();
 	}
 
@@ -2235,7 +2243,8 @@ export class Subscriber {
 				return { sequence: group.sequence, held: hooks.groupStarted(group) ? "never" : "pending" };
 			},
 			gone: (sequence) => goneAt(producer, sequence),
-			complete: () => state.closed.peek() !== undefined || this.#complete(),
+			// Only once the producer is gone: a group held below a reached end may still start.
+			complete: () => state.closed.peek() !== undefined,
 		};
 	}
 
@@ -2256,7 +2265,7 @@ export class Subscriber {
 		if (this.#resume || this.#window.settled) return undefined;
 		// The live feed had no group when the ranges resolved, so the newest one then was the first.
 		const latest = this.#window.pending ? this.#state.first : this.#latestGroup();
-		if (this.#window.settle(latest, this.#holdings())) this.#bound();
+		if (this.#window.settle(latest, this.#holdings())) this.#moved();
 		return undefined;
 	}
 
@@ -2781,10 +2790,10 @@ export class Subscriber {
 		// Rescanned only after it changed, so an idle poll costs nothing per drop held.
 		// Out-of-window runs were skipped, so a moved window rescans too.
 		const drops = this.#state.drops.peek();
-		const window = this.#window;
+		const revision = this.#revision;
 		const seen = this.#dropsSeen;
-		if (!seen || seen.drops !== drops || seen.start !== start || seen.end !== end || seen.window !== window) {
-			this.#dropsSeen = { drops, start, end, window };
+		if (!seen || seen.drops !== drops || seen.start !== start || seen.end !== end || seen.revision !== revision) {
+			this.#dropsSeen = { drops, start, end, revision };
 			for (const run of drops) this.#pending = insertDrop(this.#pending, run.start, run.end, run.error);
 		}
 		for (let run = this.#pending.shift(); run; run = this.#pending.shift()) {
