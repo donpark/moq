@@ -34,13 +34,12 @@ delivers a group that arrives below the cursor as a late backfill; Rust
 - Don't infer a relative start from the reported largest location: a
   frameless newest group counts when a relative end resolves but not in
   `largest()`, sparse moq-transport groups break the arithmetic, and a later
-  coalesced largest isn't this request's resolution. SUBSCRIBE_OK's `Group`
-  isn't it either, since the lite draft lets a group between the requested
-  start and it arrive later. Lite-07 SUBSCRIBE_OK's `Range Start` carries
-  where each range's start resolved (`lite::SubscribeStart::starts`, 0 on the
-  wire for one unresolved); the Rust copy only checks its count today, so
-  carry it to the reader. Settle the moq-transport equivalent or keep today's
-  first-arrival cursor there.
+  coalesced largest isn't this request's resolution. Lite-07 SUBSCRIBE_OK's
+  `Range Start` carries where each range's delivery starts, from which its
+  groups are owed (`lite::SubscribeStart::starts`, 0 on the wire for a range
+  with none); the Rust copy only takes the lowest today, so carry each to the
+  reader. Settle the moq-transport equivalent or keep today's first-arrival
+  cursor there.
 - The cursor is range-aware, not just floored: with disjoint ranges it skips
   straight across an unrequested gap (group 1, then 10 onward) instead of
   waiting for the latency budget, since no SUBSCRIBE_DROP is owed there.

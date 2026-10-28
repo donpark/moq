@@ -718,8 +718,8 @@ impl Subscriber {
 	}
 
 	/// Where each of the reader's ranges starts; see [`track::Subscriber::starts`].
-	pub(super) fn starts(&self) -> Vec<Option<u64>> {
-		self.reader().window().starts()
+	pub(super) fn starts(&self, from: u64) -> Vec<Option<u64>> {
+		self.reader().window().starts(from)
 	}
 
 	/// The lowest group at or above `from` the reader's ranges cover; see

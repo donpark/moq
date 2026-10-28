@@ -3444,7 +3444,6 @@ mod tests {
 		for version in [Version::Lite05, Version::Lite06, Version::Lite07] {
 			let mut responses = Vec::new();
 			lite::SubscribeResponse::Start(lite::SubscribeStart {
-				group: 0,
 				largest: None,
 				starts: vec![Some(0)],
 			})
@@ -3563,7 +3562,6 @@ mod tests {
 		let mut answer = Vec::new();
 		let mut encoder = crate::coding::Encoder::new(&mut answer, version.into());
 		lite::SubscribeResponse::Start(lite::SubscribeStart {
-			group: 0,
 			largest: None,
 			starts: vec![Some(0)],
 		})
@@ -3618,7 +3616,6 @@ mod tests {
 		let largest = track::Position { group: 4, frame: 2 };
 		let mut responses = Vec::new();
 		lite::SubscribeResponse::Start(lite::SubscribeStart {
-			group: 4,
 			largest: Some(largest),
 			starts: vec![Some(4)],
 		})
@@ -3681,7 +3678,6 @@ mod tests {
 			let code = crate::coding::StreamCodes::encode_stream_code(&Version::Lite07, &crate::StreamError::App(5));
 			for resp in [
 				lite::SubscribeResponse::Start(lite::SubscribeStart {
-					group: 0,
 					largest: None,
 					starts: vec![Some(0)],
 				}),
@@ -3822,7 +3818,6 @@ mod tests {
 		let mut responses = Vec::new();
 		if started {
 			lite::SubscribeResponse::Start(lite::SubscribeStart {
-				group: 0,
 				largest: None,
 				starts: vec![Some(0)],
 			})
@@ -8008,11 +8003,12 @@ impl ServeLoop {
 										}
 										active.end = Some(end.clone());
 									}
-									// SUBSCRIBE_START names the first group this feed serves:
-									// the publisher skipped everything below it (e.g. it could
-									// not serve the requested frame). Record it as a drop
-									// signal, so a reader waiting on a skipped group
-									// fails over instead of stalling on a live route.
+									// SUBSCRIBE_START names where each range's delivery starts,
+									// the lowest being the first group this feed serves: the
+									// publisher skipped everything below it (e.g. it could not
+									// serve the requested frame). Record it as a drop signal,
+									// so a reader waiting on a skipped group fails over
+									// instead of stalling on a live route.
 									lite::SubscribeResponse::Start(start) => {
 										// One resolved start per range the SUBSCRIBE carried, unless an
 										// update the publisher read first replaced them.
@@ -8022,9 +8018,11 @@ impl ServeLoop {
 											tracing::warn!(track = %serve.name, starts = start.starts.len(), ranges = active.ranges.len(), "subscribe start resolves other ranges");
 											return Poll::Ready(ServeEnd::GiveBack(Error::ProtocolViolation));
 										}
+										// No range starting anywhere leaves nothing owed.
+										let served = start.starts.iter().flatten().min().copied();
 										// Where the live feed is, on versions whose answer says.
 										if serve.subscriber.version.has_largest() {
-											self.serving.set_live(start.largest, Some(start.group));
+											self.serving.set_live(start.largest, served);
 											if let Some(largest) = start.largest {
 												self.serving.report_largest(largest);
 											}
@@ -8036,16 +8034,16 @@ impl ServeLoop {
 										// moved back restores it); elsewhere the
 										// request-tracked floor stands rather than a guess.
 										if active.start == active.requested {
-											let _ = self.serving.start_at(start.group);
+											let _ = self.serving.start_at(served);
 										}
-										active.served = Some(start.group);
+										active.served = served;
 										// The groups the SUBSCRIBE asked for below it are not
 										// waited for, whatever the demand asks later. One that
 										// still arrives is delivered, so they are not dropped.
 										if let Some(requested) = active.requested
-											&& let Ok(mut tail) = active.tail.write()
+											&& let Some(served) = served && let Ok(mut tail) = active.tail.write()
 										{
-											tail.account(requested..start.group, serve.subscriber.runtime.now());
+											tail.account(requested..served, serve.subscriber.runtime.now());
 										}
 									}
 									// The publisher will never send these groups, so they

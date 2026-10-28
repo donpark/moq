@@ -7475,19 +7475,20 @@ impl Subscriber {
 		Some(start?.max(self.bounds().start))
 	}
 
-	/// Where each of this subscriber's ranges starts, by index, as resolved here: `None` for
-	/// one that is empty or still waits on the first group from the live feed.
+	/// Where each of this subscriber's ranges starts, by index, as resolved here and raised
+	/// to `from`, where delivery starts: `None` for one with no group there or still waiting
+	/// on the first group from the live feed.
 	///
 	/// A publisher tells its peer where a relative or time start landed, which the peer
 	/// can't work out from the groups it receives.
 	#[cfg_attr(not(feature = "async"), allow(dead_code, reason = "async-only"))]
-	pub(crate) fn starts(&mut self) -> Vec<Option<u64>> {
+	pub(crate) fn starts(&mut self, from: u64) -> Vec<Option<u64>> {
 		match &mut self.inner {
 			Inner::Plain(cursor) => {
 				cursor.sync();
-				cursor.filter.window.starts()
+				cursor.filter.window.starts(from)
 			}
-			Inner::Resume(resume, _) => resume.starts(),
+			Inner::Resume(resume, _) => resume.starts(from),
 		}
 	}
 

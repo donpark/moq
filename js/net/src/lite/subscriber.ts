@@ -1457,12 +1457,18 @@ export class Subscriber {
 			}
 
 			if ("start" in resp) {
-				entry.start = resp.start.group;
+				// The lowest range start is the first group served; none leaves nothing owed.
+				entry.start = resp.start.starts.reduce<number | undefined>(
+					(lowest, start) =>
+						start === undefined || (lowest !== undefined && lowest <= start) ? lowest : start,
+					undefined,
+				);
 				hooks.startTrack(entry.track, { start: entry.start, requested: entry.requested });
 				hooks.reportedLargest(entry.track, resp.start.largest);
 				// The groups the SUBSCRIBE asked for below it are not waited for, whatever the
 				// demand asks later. One that still arrives is delivered.
-				if (entry.requested !== undefined) entry.tail.account(entry.requested, entry.start);
+				if (entry.requested !== undefined && entry.start !== undefined)
+					entry.tail.account(entry.requested, entry.start);
 			} else if ("end" in resp) {
 				if (entry.end !== undefined) throw new ProtocolViolation("duplicate SUBSCRIBE_END");
 				entry.end = resp.end.group;

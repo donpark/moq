@@ -4109,9 +4109,8 @@ impl TrackRun {
 		{
 			self.start = Some(start);
 			writer.buffer(&lite::SubscribeResponse::Start(lite::SubscribeStart {
-				group: start,
 				largest: Some(largest),
-				starts: self.starts(),
+				starts: self.starts(start),
 			}))?;
 			self.raise_floor(start);
 			return Poll::Ready(Ok(ControlFlow::Continue(())));
@@ -4331,11 +4330,12 @@ impl TrackRun {
 }
 
 impl TrackRun {
-	/// Where each requested range starts, on versions whose SUBSCRIBE_START says.
-	fn starts(&mut self) -> Vec<Option<u64>> {
+	/// Where each requested range starts once delivery starts at `start`. Before lite-07
+	/// there is one range, which starts there.
+	fn starts(&mut self, start: u64) -> Vec<Option<u64>> {
 		match self.ctx.version.has_ranges() {
-			true => self.track.starts(),
-			false => Vec::new(),
+			true => self.track.starts(start),
+			false => vec![Some(start)],
 		}
 	}
 
@@ -4363,7 +4363,7 @@ impl TrackRun {
 		}
 		let skipped = std::mem::take(&mut self.skipped);
 		self.start = Some(start);
-		// Only the group: the subscriber derives the start frame from its own request
+		// Only groups: the subscriber derives the start frame from its own request
 		// (see `lite::SubscribeStart`). The track is live by now, since its first group
 		// was readable. A relay can hold just the first group of a backlog its source
 		// already answered past, so the source's largest says where the live feed is.
@@ -4373,9 +4373,8 @@ impl TrackRun {
 		};
 		let largest = live.max(self.track.peek_largest());
 		writer.buffer(&lite::SubscribeResponse::Start(lite::SubscribeStart {
-			group: start,
 			largest,
-			starts: self.starts(),
+			starts: self.starts(start),
 		}))?;
 		// The subscriber now owes itself everything from the start, so a range given up
 		// above it is named as it would have been after the start.
@@ -6229,11 +6228,11 @@ mod serve_group_test {
 		track.finish().unwrap();
 		run.await.unwrap();
 
-		// SUBSCRIBE_START at 0 with the range resolved there, a DROP for the skipped group 1
+		// SUBSCRIBE_START with the range starting at 0, a DROP for the skipped group 1
 		// with NOT_FOUND (0x33), which the end gives up on at once, and SUBSCRIBE_END at 3.
 		assert_eq!(
 			*log.writes.lock().unwrap(),
-			[0, 5, 0, 1, 0, 1, 1, 2, 3, 1, 1, 0x33, 1, 1, 3]
+			[0, 4, 1, 0, 1, 1, 2, 3, 1, 1, 0x33, 1, 1, 3]
 		);
 	}
 
@@ -6264,7 +6263,10 @@ mod serve_group_test {
 		let lite::SubscribeResponse::Start(start) = msg else {
 			panic!("expected SUBSCRIBE_START, got {msg:?}");
 		};
-		assert_eq!((start.group, start.largest), (0, Some(track::Position::group(4))));
+		assert_eq!(
+			(start.starts, start.largest),
+			(vec![Some(0)], Some(track::Position::group(4)))
+		);
 	}
 
 	/// The SUBSCRIBE_DROP ranges a run loop's subscribe stream carried, once flushed.
@@ -6753,9 +6755,9 @@ mod serve_group_test {
 				let lite::SubscribeResponse::Start(start) = msg else {
 					panic!("expected SUBSCRIBE_START, got {msg:?}");
 				};
-				starts.push(start.group);
+				starts.push(start.starts[0]);
 			}
-			assert_eq!(starts, [2, 2], "{version}: cold and warm relay starts differ");
+			assert_eq!(starts, [Some(2); 2], "{version}: cold and warm relay starts differ");
 		}
 	}
 
@@ -6786,7 +6788,7 @@ mod serve_group_test {
 			let lite::SubscribeResponse::Start(start) = msg else {
 				panic!("expected SUBSCRIBE_START, got {msg:?}");
 			};
-			assert_eq!(start.group, 1_000_000, "{version}: named a dropped group");
+			assert_eq!(start.starts, [Some(1_000_000)], "{version}: named a dropped group");
 		}
 	}
 
@@ -7157,7 +7159,7 @@ mod serve_group_test {
 			let writes = self.session.log.writes.lock().unwrap();
 			matches!(
 				lite::SubscribeResponse::decode_slice(&writes, Version::Lite07),
-				Ok((lite::SubscribeResponse::Start(start), _)) if start.group == group
+				Ok((lite::SubscribeResponse::Start(start), _)) if start.starts == [Some(group)]
 			)
 		}
 	}
@@ -7370,7 +7372,7 @@ mod serve_group_test {
 		assert_eq!(
 			*log.writes.lock().unwrap(),
 			// The DROP carries OLD (0x34).
-			[0, 5, 0, 1, 0, 1, 1, 2, 3, 0, 0, 0x34, 1, 1, 2],
+			[0, 4, 1, 0, 1, 1, 2, 3, 0, 0, 0x34, 1, 1, 2],
 			"the expired group is dropped and the end precedes stream credit"
 		);
 
@@ -7382,7 +7384,7 @@ mod serve_group_test {
 		run.await.unwrap();
 		assert_eq!(
 			*log.writes.lock().unwrap(),
-			[0, 5, 0, 1, 0, 1, 1, 2, 3, 0, 0, 0x34, 1, 1, 2]
+			[0, 4, 1, 0, 1, 1, 2, 3, 0, 0, 0x34, 1, 1, 2]
 		);
 	}
 }
