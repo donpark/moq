@@ -10155,6 +10155,7 @@ mod serve_tests {
 						last: None,
 					})
 					.unwrap();
+				group.mark_gap(5, None).unwrap();
 				let payload = b"first locally received";
 				let mut frame = group
 					.create_object(frame::Header {
@@ -10177,6 +10178,7 @@ mod serve_tests {
 				h.track.finish().unwrap();
 				serving.await.unwrap();
 				assert_eq!(occurrences(&h.log, payload), 1, "{version} streamed={streamed}");
+				assert!(h.log.resets().is_empty(), "{version} streamed={streamed}");
 			}
 		}
 	}
