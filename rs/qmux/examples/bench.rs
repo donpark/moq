@@ -7,12 +7,10 @@
 //! runtime, so the CPU covers sending and receiving alike.
 //!
 //! It reports process CPU time (user plus system), not wall clock, so it still means
-//! something under a profiler:
+//! something under a profiler; `bench/README.md` shows how to run and profile it.
 //!
 //! ```bash
-//! cargo run --release -p qmux --example bench
-//! cargo run --release -p qmux --example bench -- --transport ws,wss --sessions 1,64 --size 300
-//! perf record -g cargo run --release -p qmux --example bench -- --transport ws --sessions 64 --size 300
+//! cargo run --release -p qmux@0.7.0 --example bench -- --transport ws,wss --sessions 1,64 --size 300
 //! ```
 //!
 //! A local profiling tool, not a regression series: the moq-net session bench owns
