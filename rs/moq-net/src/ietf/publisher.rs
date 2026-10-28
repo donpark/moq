@@ -10117,38 +10117,67 @@ mod serve_tests {
 		}
 	}
 
-	/// An upstream Object ID describes its cache, not the frame ordinals in a cold copy.
+	/// A cold copy's frame zero retains the upstream Object ID, so a Next Object floor
+	/// compares wire IDs rather than discarding that many locally received frames.
 	#[moq_clock::test]
-	async fn next_object_on_a_cold_copy_keeps_the_first_received_frame() {
+	async fn a_cold_reported_copy_serves_its_first_wire_object() {
 		for version in [Version::Draft18, Version::Draft22] {
-			let h = serve(version);
-			h.track.report_object(3, 4);
-			settle().await;
-			let stream = Stream::open(&mut crate::driver::Transport::new(h.session.clone()), version)
-				.await
-				.unwrap();
-			let mut serving = std::pin::pin!(
-				h.publisher
-					.clone()
-					.run_subscribe_stream(stream, subscribe(Filter::NextObject, None))
-			);
-			std::future::poll_fn(|cx| {
-				assert!(std::future::Future::poll(serving.as_mut(), cx).is_pending());
-				if !h.log.trail().is_empty() && Wire::read(&h.log, version).sent(ietf::SubscribeOk::ID).is_some() {
-					Poll::Ready(())
-				} else {
-					Poll::Pending
+			for streamed in [false, true] {
+				let h = serve(version);
+				h.track.report_object(3, 4);
+				settle().await;
+				let stream = Stream::open(&mut crate::driver::Transport::new(h.session.clone()), version)
+					.await
+					.unwrap();
+				let mut serving = std::pin::pin!(
+					h.publisher
+						.clone()
+						.run_subscribe_stream(stream, subscribe(Filter::NextObject, None))
+				);
+				std::future::poll_fn(|cx| {
+					assert!(std::future::Future::poll(serving.as_mut(), cx).is_pending());
+					if !h.log.trail().is_empty() && Wire::read(&h.log, version).sent(ietf::SubscribeOk::ID).is_some() {
+						Poll::Ready(())
+					} else {
+						Poll::Pending
+					}
+				})
+				.await;
+				let group = h.track.create_group(group::Info { sequence: 3 }).unwrap();
+				group
+					.set_wire(group::Wire {
+						sparse: true,
+						first_object: false,
+						first_id: 5,
+						extensions: true,
+						has_end: true,
+						fetchable: true,
+						last: None,
+					})
+					.unwrap();
+				let payload = b"first locally received";
+				let mut frame = group
+					.create_object(frame::Header {
+						info: frame::Info {
+							size: payload.len() as u64,
+							timestamp: Some(timestamp()),
+						},
+						fields: Some(std::sync::Arc::new(crate::model::object::Fields {
+							id: 5,
+							properties: Default::default(),
+						})),
+						inflated: None,
+					})
+					.unwrap();
+				frame.write(payload.as_slice()).unwrap();
+				if streamed {
+					assert!(futures::poll!(serving.as_mut()).is_pending());
 				}
-			})
-			.await;
-			let mut group = h.track.create_group(group::Info { sequence: 3 }).unwrap();
-			group
-				.write_frame(timestamp(), b"first locally received".as_slice())
-				.unwrap();
-			group.finish().unwrap();
-			h.track.finish().unwrap();
-			serving.await.unwrap();
-			assert_eq!(occurrences(&h.log, b"first locally received"), 1, "{version}");
+				frame.finish().unwrap().finish().unwrap();
+				h.track.finish().unwrap();
+				serving.await.unwrap();
+				assert_eq!(occurrences(&h.log, payload), 1, "{version} streamed={streamed}");
+			}
 		}
 	}
 
@@ -16733,16 +16762,17 @@ mod tests {
 	}
 }
 
-/// The live edge a SUBSCRIBE resolves against, including the upstream wire report and
-/// the local frame ordinal at which its subscription starts.
+/// The live edge a SUBSCRIBE resolves against, snapshotted once so the subscription
+/// floor, the fill cap, and the advertised LARGEST_OBJECT all agree on where it is.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 struct LiveEdge {
 	/// The newest group sequence, `None` before any group exists.
 	latest: Option<u64>,
-	/// The upstream's Largest Object, or the largest locally readable object when no
-	/// upstream report remains. `None` when neither is available.
+	/// The precise Largest Object. `None` when the track is empty, or when the newest
+	/// group's frames cannot be read right now (none written yet), in which case nothing
+	/// is advertised and no fill is servable.
 	largest: Option<Location>,
-	/// One past the locally received frames, where a Next Object subscription begins.
+	/// One past the Largest Object, which is where a Next Object subscription begins.
 	/// When the edge is imprecise this falls back to the next group boundary: never below
 	/// the true Next Object, at worst under-delivering the current group's tail.
 	next: Option<Location>,
@@ -16762,12 +16792,10 @@ fn live_edge(track: &track::Consumer) -> LiveEdge {
 		Some(largest) => LiveEdge {
 			latest: cached.latest.max(Some(largest.group)),
 			largest: Some(largest),
-			// The report's Object ID is not a local frame ordinal. A cold copy has
-			// received none of that group's frames, so its first received frame is next.
-			next: cached.largest.and(cached.next).or(Some(Location {
+			next: Some(Location {
 				group: largest.group,
-				object: 0,
-			})),
+				object: largest.object.saturating_add(1),
+			}),
 		},
 		None => cached,
 	}
@@ -17321,33 +17349,6 @@ mod range_tests {
 			assert_eq!(
 				edge.largest, None,
 				"group {sequence}: the stale report is not the largest"
-			);
-		}
-	}
-
-	/// A report remains precise on the wire while the local cursor counts only frames
-	/// actually received, including a group that exists without its first frame yet.
-	#[test]
-	fn reported_objects_do_not_advance_local_frame_ordinals() {
-		for frames in [0, 2] {
-			let track = track::Producer::new(
-				std::sync::Arc::new(crate::broadcast::Info::default()),
-				"video",
-				crate::track::Info::timed(),
-			);
-			let mut group = track.create_group(group::Info { sequence: 3 }).unwrap();
-			for _ in 0..frames {
-				group.write_frame(crate::Timestamp::ZERO, b"frame".as_slice()).unwrap();
-			}
-			track.report_object(3, 40);
-			let edge = live_edge(&track.consume());
-			assert_eq!(edge.largest, Some(Location { group: 3, object: 40 }));
-			assert_eq!(
-				edge.next,
-				Some(Location {
-					group: 3,
-					object: frames
-				})
 			);
 		}
 	}
