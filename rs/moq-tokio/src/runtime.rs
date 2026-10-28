@@ -44,7 +44,7 @@ pub(crate) async fn scope<F: Future>(future: F) -> F::Output {
 }
 
 /// Spawn `future` on the caller's runtime, else the fallback.
-#[cfg(any(feature = "net", feature = "driver", all(feature = "watch", feature = "_certs")))]
+#[cfg(any(feature = "net", all(feature = "watch", feature = "_certs")))]
 pub(crate) fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
 	F: Future + Send + 'static,
