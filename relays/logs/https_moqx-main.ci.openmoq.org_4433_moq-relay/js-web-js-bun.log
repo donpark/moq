@@ -2,30 +2,25 @@ https://moqx-main.ci.openmoq.org:4433/moq-relay connected via WebTransport
 https://moqx-main.ci.openmoq.org:4433/moq-relay negotiated ALPN: moqt-16
 connected version=moq-transport-16
 subscribe_namespace written: requestId=0
-announced: broadcast=ci/player-soak/40604063417/moqx-main/loc active=true
-announced: broadcast=ci/player-soak/40604063417/moqx-main/cmaf active=true
 announced: broadcast=openmoq/mtt/aiomoqt/bbb_4k30/moq_test_tracks_00/msf/cmaf/catalog/h264/1080/30/6000/2000/0/aac/2/128/1/0/clip/0 active=true
-announced: broadcast=smoke-js-web-5111-4674.hang active=true
-subscribe start: id=2 broadcast=smoke-js-web-5111-4674.hang track=catalog.json
-subscribe written: id=2 broadcast=smoke-js-web-5111-4674.hang track=catalog.json
-subscribe ok: id=2 broadcast=smoke-js-web-5111-4674.hang track=catalog.json
-subscribe start: id=4 broadcast=smoke-js-web-5111-4674.hang track=video
-subscribe written: id=4 broadcast=smoke-js-web-5111-4674.hang track=video
-subscribe ok: id=4 broadcast=smoke-js-web-5111-4674.hang track=video
-dropping a group with no head: alias=4 group=0
-received 8519 bytes from smoke-js-web-5111-4674.hang
+announced: broadcast=smoke-js-web-5168-21258.hang active=true
+subscribe start: id=2 broadcast=smoke-js-web-5168-21258.hang track=catalog.json
+subscribe written: id=2 broadcast=smoke-js-web-5168-21258.hang track=catalog.json
+subscribe ok: id=2 broadcast=smoke-js-web-5168-21258.hang track=catalog.json
+subscribe start: id=4 broadcast=smoke-js-web-5168-21258.hang track=video
+subscribe written: id=4 broadcast=smoke-js-web-5168-21258.hang track=video
+subscribe ok: id=4 broadcast=smoke-js-web-5168-21258.hang track=video
+received 6916 bytes from smoke-js-web-5168-21258.hang
 adapter: close() called
-subscribe error: id=2 broadcast=smoke-js-web-5111-4674.hang track=catalog.json error=subscribe stream ended without PUBLISH_DONE
-subscribe error: id=4 broadcast=smoke-js-web-5111-4674.hang track=video error=subscribe stream ended without PUBLISH_DONE
+subscribe error: id=2 broadcast=smoke-js-web-5168-21258.hang track=catalog.json error=subscribe stream ended without PUBLISH_DONE
+subscribe error: id=4 broadcast=smoke-js-web-5168-21258.hang track=video error=subscribe stream ended without PUBLISH_DONE
 subscribe_namespace error: RESET_STREAM: 386759528
-announced: broadcast=ci/player-soak/40604063417/moqx-main/loc active=false
-announced: broadcast=ci/player-soak/40604063417/moqx-main/cmaf active=false
 announced: broadcast=openmoq/mtt/aiomoqt/bbb_4k30/moq_test_tracks_00/msf/cmaf/catalog/h264/1080/30/6000/2000/0/aac/2/128/1/0/clip/0 active=false
-announced: broadcast=smoke-js-web-5111-4674.hang active=false
+announced: broadcast=smoke-js-web-5168-21258.hang active=false
 broadcast discovery failed; broadcasts resolve on request only. warn: RESET_STREAM: 386759528
  code: "GenericFailure"
 
-      at async #fill (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:167:50)
-      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:333:29)
+      at async #fill (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:177:50)
+      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:343:29)
       at async <anonymous> (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/ietf/subscriber.js:278:58)
 

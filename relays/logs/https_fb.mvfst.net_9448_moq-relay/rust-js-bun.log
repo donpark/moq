@@ -2,25 +2,25 @@ https://fb.mvfst.net:9448/moq-relay connected via WebTransport
 https://fb.mvfst.net:9448/moq-relay negotiated ALPN: moqt-16
 connected version=moq-transport-16
 subscribe_namespace written: requestId=0
-announced: broadcast=smoke-rust-5111-31960.hang active=true
-subscribe start: id=2 broadcast=smoke-rust-5111-31960.hang track=catalog.json
-subscribe written: id=2 broadcast=smoke-rust-5111-31960.hang track=catalog.json
-subscribe ok: id=2 broadcast=smoke-rust-5111-31960.hang track=catalog.json
-subscribe start: id=4 broadcast=smoke-rust-5111-31960.hang track=0.avc3
-subscribe written: id=4 broadcast=smoke-rust-5111-31960.hang track=0.avc3
-subscribe ok: id=4 broadcast=smoke-rust-5111-31960.hang track=0.avc3
+announced: broadcast=smoke-rust-5168-10452.hang active=true
+subscribe start: id=2 broadcast=smoke-rust-5168-10452.hang track=catalog.json
+subscribe written: id=2 broadcast=smoke-rust-5168-10452.hang track=catalog.json
+subscribe ok: id=2 broadcast=smoke-rust-5168-10452.hang track=catalog.json
+subscribe start: id=4 broadcast=smoke-rust-5168-10452.hang track=0.avc3
+subscribe written: id=4 broadcast=smoke-rust-5168-10452.hang track=0.avc3
+subscribe ok: id=4 broadcast=smoke-rust-5168-10452.hang track=0.avc3
 dropping a group with no head: alias=4 group=2
 adapter: closing stream requestId=4
-subscribe error: id=4 broadcast=smoke-rust-5111-31960.hang track=0.avc3 error=publish done: status=0x0 reason=Write after stream complete or reset
+subscribe error: id=4 broadcast=smoke-rust-5168-10452.hang track=0.avc3 error=publish done: status=0x0 reason=Write after stream complete or reset
 adapter: close() called
 error: publish done: status=0x0 reason=Write after stream complete or reset
-subscribe error: id=2 broadcast=smoke-rust-5111-31960.hang track=catalog.json error=subscribe stream ended without PUBLISH_DONE
+subscribe error: id=2 broadcast=smoke-rust-5168-10452.hang track=catalog.json error=subscribe stream ended without PUBLISH_DONE
 subscribe_namespace error: RESET_STREAM: 386759528
-announced: broadcast=smoke-rust-5111-31960.hang active=false
+announced: broadcast=smoke-rust-5168-10452.hang active=false
 broadcast discovery failed; broadcasts resolve on request only. warn: RESET_STREAM: 386759528
  code: "GenericFailure"
 
-      at async #fill (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:167:50)
-      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:333:29)
+      at async #fill (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:177:50)
+      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:343:29)
       at async <anonymous> (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/ietf/subscriber.js:278:58)
 

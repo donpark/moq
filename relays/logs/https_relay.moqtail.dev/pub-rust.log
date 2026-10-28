@@ -1,14 +1,10 @@
-[2m2026-10-28T00:25:24.432808Z[0m [32m INFO[0m [2mmoq_relay::cluster[0m[2m:[0m cluster initialized [3mhop_id[0m[2m=[0m3150852582389121 [3mconfigured[0m[2m=[0mfalse
-[2m2026-10-28T00:25:24.440703Z[0m [33m WARN[0m [2mmoq_sock::bind[0m[2m:[0m UDP receive buffer is smaller than requested; raise `net.core.rmem_max` or expect packet loss under load [3mwanted[0m[2m=[0m8388608 [3mgranted[0m[2m=[0m1048576
-[2m2026-10-28T00:25:24.440723Z[0m [33m WARN[0m [2mmoq_sock::bind[0m[2m:[0m UDP send buffer is smaller than requested; raise `net.core.wmem_max` or expect packet loss under load [3mwanted[0m[2m=[0m8388608 [3mgranted[0m[2m=[0m212992
-[2m2026-10-28T00:25:24.446105Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttps://relay.moqtail.dev
-[2m2026-10-28T00:25:24.446888Z[0m [32m INFO[0m [2mmoq_relay::cluster[0m[2m:[0m no cluster peers configured; running standalone
-[2m2026-10-28T00:25:24.681681Z[0m [32m INFO[0m [2mmoq_tokio::client[0m[2m:[0m connected [3mversion[0m[2m=[0mmoq-transport-18
-[2m2026-10-28T00:25:24.681712Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connected [3mpeer[0m[2m=[0mhttps://relay.moqtail.dev
-[2m2026-10-28T00:25:24.688602Z[0m [32m INFO[0m [2mmoq_net::ietf::publisher[0m[2m:[0m subscribe started [3mid[0m[2m=[0m155 [3mbroadcast[0m[2m=[0msmoke-rust-5111-16759.hang [3mtrack[0m[2m=[0mcatalog.json
-[2m2026-10-28T00:25:24.700175Z[0m [32m INFO[0m [2mmoq_net::ietf::publisher[0m[2m:[0m subscribe started [3mid[0m[2m=[0m159 [3mbroadcast[0m[2m=[0msmoke-rust-5111-16759.hang [3mtrack[0m[2m=[0m0.avc3
-[2m2026-10-28T00:25:26.373852Z[0m [32m INFO[0m [2mmoq_net::ietf::publisher[0m[2m:[0m subscribe started [3mid[0m[2m=[0m163 [3mbroadcast[0m[2m=[0msmoke-rust-5111-16759.hang [3mtrack[0m[2m=[0m0.avc3
-[2m2026-10-28T00:25:26.819397Z[0m [33m WARN[0m [2mweb_transport_moq::session[0m[2m:[0m failed to read capsule [3me[0m[2m=[0mUnexpectedEnd
-[2m2026-10-28T00:25:26.819461Z[0m [32m INFO[0m [2mmoq_net::ietf::session[0m[2m:[0m session terminated [3merr[0m[2m=[0mtransport: connection error: closed
-/home/runner/work/moq/moq/test/smoke/smoke.sh: line 728: 10843 Killed                  ffmpeg_h264
-     10844 Done                    | rust_moq "$URL" --broadcast "$broadcast" import avc3
+[2m2026-10-28T07:15:08.332723Z[0m [32m INFO[0m [2mmoq_relay::cluster[0m[2m:[0m cluster initialized [3mhop_id[0m[2m=[0m5196337856150904 [3mconfigured[0m[2m=[0mfalse
+[2m2026-10-28T07:15:08.345922Z[0m [33m WARN[0m [2mmoq_sock::bind[0m[2m:[0m UDP receive buffer is smaller than requested; raise `net.core.rmem_max` or expect packet loss under load [3mwanted[0m[2m=[0m8388608 [3mgranted[0m[2m=[0m1048576
+[2m2026-10-28T07:15:08.345943Z[0m [33m WARN[0m [2mmoq_sock::bind[0m[2m:[0m UDP send buffer is smaller than requested; raise `net.core.wmem_max` or expect packet loss under load [3mwanted[0m[2m=[0m8388608 [3mgranted[0m[2m=[0m212992
+[2m2026-10-28T07:15:08.360930Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connecting [3mpeer[0m[2m=[0mhttps://relay.moqtail.dev
+[2m2026-10-28T07:15:08.361309Z[0m [32m INFO[0m [2mmoq_relay::cluster[0m[2m:[0m no cluster peers configured; running standalone
+[2m2026-10-28T07:15:08.662800Z[0m [32m INFO[0m [2mmoq_tokio::client[0m[2m:[0m connected [3mversion[0m[2m=[0mmoq-transport-18
+[2m2026-10-28T07:15:08.662842Z[0m [32m INFO[0m [2mmoq_tokio::connection[0m[2m:[0m connected [3mpeer[0m[2m=[0mhttps://relay.moqtail.dev
+[2m2026-10-28T07:15:08.742138Z[0m [32m INFO[0m [2mmoq_net::ietf::publisher[0m[2m:[0m subscribe started [3mid[0m[2m=[0m183 [3mbroadcast[0m[2m=[0msmoke-rust-5168-19731.hang [3mtrack[0m[2m=[0mcatalog.json
+[2m2026-10-28T07:15:08.844137Z[0m [32m INFO[0m [2mmoq_net::ietf::publisher[0m[2m:[0m subscribe started [3mid[0m[2m=[0m187 [3mbroadcast[0m[2m=[0msmoke-rust-5168-19731.hang [3mtrack[0m[2m=[0m0.avc3
+[2m2026-10-28T07:15:10.294115Z[0m [32m INFO[0m [2mmoq_net::ietf::publisher[0m[2m:[0m subscribe started [3mid[0m[2m=[0m189 [3mbroadcast[0m[2m=[0msmoke-rust-5168-19731.hang [3mtrack[0m[2m=[0m0.avc3

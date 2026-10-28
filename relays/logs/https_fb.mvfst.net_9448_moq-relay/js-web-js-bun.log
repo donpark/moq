@@ -2,23 +2,23 @@ https://fb.mvfst.net:9448/moq-relay connected via WebTransport
 https://fb.mvfst.net:9448/moq-relay negotiated ALPN: moqt-16
 connected version=moq-transport-16
 subscribe_namespace written: requestId=0
-announced: broadcast=smoke-js-web-5111-22665.hang active=true
-subscribe start: id=2 broadcast=smoke-js-web-5111-22665.hang track=catalog.json
-subscribe written: id=2 broadcast=smoke-js-web-5111-22665.hang track=catalog.json
-subscribe ok: id=2 broadcast=smoke-js-web-5111-22665.hang track=catalog.json
-subscribe start: id=4 broadcast=smoke-js-web-5111-22665.hang track=video
-subscribe written: id=4 broadcast=smoke-js-web-5111-22665.hang track=video
-subscribe ok: id=4 broadcast=smoke-js-web-5111-22665.hang track=video
-received 6755 bytes from smoke-js-web-5111-22665.hang
+announced: broadcast=smoke-js-web-5168-5924.hang active=true
+subscribe start: id=2 broadcast=smoke-js-web-5168-5924.hang track=catalog.json
+subscribe written: id=2 broadcast=smoke-js-web-5168-5924.hang track=catalog.json
+subscribe ok: id=2 broadcast=smoke-js-web-5168-5924.hang track=catalog.json
+subscribe start: id=4 broadcast=smoke-js-web-5168-5924.hang track=video
+subscribe written: id=4 broadcast=smoke-js-web-5168-5924.hang track=video
+subscribe ok: id=4 broadcast=smoke-js-web-5168-5924.hang track=video
+received 6916 bytes from smoke-js-web-5168-5924.hang
 adapter: close() called
-subscribe error: id=2 broadcast=smoke-js-web-5111-22665.hang track=catalog.json error=subscribe stream ended without PUBLISH_DONE
-subscribe error: id=4 broadcast=smoke-js-web-5111-22665.hang track=video error=subscribe stream ended without PUBLISH_DONE
+subscribe error: id=2 broadcast=smoke-js-web-5168-5924.hang track=catalog.json error=subscribe stream ended without PUBLISH_DONE
+subscribe error: id=4 broadcast=smoke-js-web-5168-5924.hang track=video error=subscribe stream ended without PUBLISH_DONE
 subscribe_namespace error: RESET_STREAM: 386759528
-announced: broadcast=smoke-js-web-5111-22665.hang active=false
+announced: broadcast=smoke-js-web-5168-5924.hang active=false
 broadcast discovery failed; broadcasts resolve on request only. warn: RESET_STREAM: 386759528
  code: "GenericFailure"
 
-      at async #fill (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:167:50)
-      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:333:29)
+      at async #fill (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:177:50)
+      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:343:29)
       at async <anonymous> (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/ietf/subscriber.js:278:58)
 

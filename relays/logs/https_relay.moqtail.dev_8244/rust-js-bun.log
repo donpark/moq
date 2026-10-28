@@ -2,23 +2,23 @@ https://relay.moqtail.dev:8244/ connected via WebTransport
 https://relay.moqtail.dev:8244/ negotiated ALPN: moqt-22
 connected version=moq-transport-22
 subscribe_namespace written: requestId=0
-announced: broadcast=smoke-rust-5111-5165.hang active=true
-subscribe start: id=2 broadcast=smoke-rust-5111-5165.hang track=catalog.json
-subscribe written: id=2 broadcast=smoke-rust-5111-5165.hang track=catalog.json
-subscribe ok: id=2 broadcast=smoke-rust-5111-5165.hang track=catalog.json
-subscribe start: id=4 broadcast=smoke-rust-5111-5165.hang track=0.avc3
-subscribe written: id=4 broadcast=smoke-rust-5111-5165.hang track=0.avc3
-subscribe ok: id=4 broadcast=smoke-rust-5111-5165.hang track=0.avc3
+announced: broadcast=smoke-rust-5168-24475.hang active=true
+subscribe start: id=2 broadcast=smoke-rust-5168-24475.hang track=catalog.json
+subscribe written: id=2 broadcast=smoke-rust-5168-24475.hang track=catalog.json
+subscribe ok: id=2 broadcast=smoke-rust-5168-24475.hang track=catalog.json
+subscribe start: id=4 broadcast=smoke-rust-5168-24475.hang track=0.avc3
+subscribe written: id=4 broadcast=smoke-rust-5168-24475.hang track=0.avc3
+subscribe ok: id=4 broadcast=smoke-rust-5168-24475.hang track=0.avc3
 dropping a group with no head: alias=1 group=2
-received 394 bytes from smoke-rust-5111-5165.hang
-subscribe error: id=4 broadcast=smoke-rust-5111-5165.hang track=0.avc3 error=session error: connection error: closed
-subscribe error: id=2 broadcast=smoke-rust-5111-5165.hang track=catalog.json error=session error: connection error: closed
+received 398 bytes from smoke-rust-5168-24475.hang
+subscribe error: id=4 broadcast=smoke-rust-5168-24475.hang track=0.avc3 error=session error: connection error: closed
+subscribe error: id=2 broadcast=smoke-rust-5168-24475.hang track=catalog.json error=session error: connection error: closed
 subscribe_namespace error: session error: connection error: closed
-announced: broadcast=smoke-rust-5111-5165.hang active=false
+announced: broadcast=smoke-rust-5168-24475.hang active=false
 broadcast discovery failed; broadcasts resolve on request only. warn: session error: connection error: closed
  code: "GenericFailure"
 
-      at async #fill (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:167:50)
-      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:333:29)
+      at async #fill (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:177:50)
+      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:343:29)
       at async <anonymous> (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/ietf/subscriber.js:278:58)
 

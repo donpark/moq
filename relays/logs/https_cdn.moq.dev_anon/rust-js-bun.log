@@ -4,19 +4,20 @@ announced: prefix=
 connected version=moq-lite-06
 announced: broadcast=anon/doom/game/e1m1 active=true
 announced: broadcast=boom-moq-s2 active=true
-announced: broadcast=smoke-rust-5111-12208.hang active=true
-subscribe start: id=0 broadcast=smoke-rust-5111-12208.hang track=catalog.json
+announced: broadcast=lcb-6739122-4ba9.hang active=true
+announced: broadcast=smoke-rust-5168-5322.hang active=true
+subscribe start: id=0 broadcast=smoke-rust-5168-5322.hang track=catalog.json
 announce: prefix=
-subscribe ok: id=0 broadcast=smoke-rust-5111-12208.hang track=catalog.json
-subscribe start: id=1 broadcast=smoke-rust-5111-12208.hang track=0.avc3
-subscribe ok: id=1 broadcast=smoke-rust-5111-12208.hang track=0.avc3
-received 6721 bytes from smoke-rust-5111-12208.hang
-subscribe close: id=0 broadcast=smoke-rust-5111-12208.hang track=catalog.json
-subscribe close: id=1 broadcast=smoke-rust-5111-12208.hang track=0.avc3
+subscribe ok: id=0 broadcast=smoke-rust-5168-5322.hang track=catalog.json
+subscribe start: id=1 broadcast=smoke-rust-5168-5322.hang track=0.avc3
+subscribe ok: id=1 broadcast=smoke-rust-5168-5322.hang track=0.avc3
+received 6721 bytes from smoke-rust-5168-5322.hang
+subscribe close: id=0 broadcast=smoke-rust-5168-5322.hang track=catalog.json
+subscribe close: id=1 broadcast=smoke-rust-5168-5322.hang track=0.avc3
 broadcast discovery failed; broadcasts resolve on request only. warn: session error: connection error: closed
  code: "GenericFailure"
 
-      at async #fill (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:167:50)
-      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:333:29)
+      at async #fill (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:177:50)
+      at async done (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/stream.js:343:29)
       at async decodeAnnounceBroadcastMaybe (/home/runner/work/moq/moq/test/smoke/clients/js-native/node_modules/@moq/net/lite/announce.js:257:21)
 
