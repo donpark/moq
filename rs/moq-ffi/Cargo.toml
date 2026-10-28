@@ -98,6 +98,7 @@ pollster = { workspace = true }
 test-env = { path = "../test-env" }
 tokio = { workspace = true, features = ["test-util"] }
 web-transport-trait = { workspace = true }
+workspace-hack = { path = "../workspace-hack" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # The video tests encode with OpenH264, the one encoder a GPU-less host has, so

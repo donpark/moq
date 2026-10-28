@@ -156,6 +156,8 @@
             # Per-crate feature matrices (`just rs features`), where workspace
             # unification would otherwise hide a broken single-crate build.
             cargo-hack
+            # The workspace-hack that gives every build one feature set per dependency.
+            cargo-hakari
             cargo-nextest
             # Source-based test coverage (`just rs coverage`).
             # Its LLVM test helpers must read the compiler's profile format.

@@ -33,6 +33,7 @@ web-async = { workspace = true }
 criterion = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+workspace-hack = { path = "../workspace-hack" }
 
 [[bench]]
 name = "decode"
