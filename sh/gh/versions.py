@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Patch-bump hand-versioned packages whose sources changed since they last shipped.
+"""Check that backports bump hand-versioned packages, and push their release tags.
 
-release-plz bumps Rust crates on `release`; this does the same for the packages
-whose version a human owns. Without a bump, a backport touching only one of
-them lands unchanged in version and never publishes.
+release-plz bumps Rust crates on `release`; every other package's version is
+bumped by hand, since only a human can judge a change's semver level. A
+backport that changes one of them without a bump lands unchanged in version,
+and its release workflow skips it as already published. `check` fails that PR;
+it never picks or writes a version.
 
 Two kinds of package publish differently:
 
@@ -17,30 +19,28 @@ Two kinds of package publish differently:
   moq-ffi release `cpp/moq/FFI_VERSION` pins is published.
 
 Any change to a package's sources since it last shipped is unreleased, so it
-needs a patch bump.
+needs a bump.
 
 Usage:
-  bump.py check [--ref <rev>]   List the packages that need a bump or a tag.
-  bump.py apply                 Bump them in the working tree.
-  bump.py pr                    Bump them on the `release-bump` branch and open
-                                or update its PR into `release`; close it when
-                                nothing is left. Needs GH_TOKEN.
-  bump.py tag                   Push each release tag HEAD's versions lack.
-                                Needs GH_TOKEN.
+  versions.py check [--base <rev>] [--head <rev>] [--report]
+      Fail when merging head into base changes a package's shipped sources at a
+      released version, lowers a version, or leaves a lockfile entry behind.
+      Also lists the packages base already carries unreleased changes for.
+      --report lists the failures without failing.
+  versions.py tag [--dry-run]
+      Push each release tag HEAD's versions lack. Needs GH_TOKEN.
 """
 
 import argparse
 from dataclasses import dataclass, field
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 
-BASE = "release"
-BRANCH = "release-bump"
-TITLE = "chore: patch-bump hand-versioned packages"
 REPO = "moq-dev/moq"
 
 # The C and C++ packages' moq-ffi pin.
@@ -66,20 +66,17 @@ def show(rev: str, path: str) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def patch(version: str) -> str:
-    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", version)
-    if not match:
-        raise ValueError(f"cannot patch-bump non-release version {version!r}")
-    major, minor, micro = match.groups()
-    return f"{major}.{minor}.{int(micro) + 1}"
-
-
-def substitute(pattern: str, text: str, version: str, path: str) -> str:
-    """Replace group 2 of the first match of `pattern` with `version`."""
-    out, count = re.subn(pattern, lambda m: m.group(1) + version + m.group(3), text, count=1, flags=re.M)
-    if count != 1:
-        raise ValueError(f"version not found in {path}")
-    return out
+def newer(version: str, than: str) -> bool | None:
+    """Whether `version` sorts after `than` by semver, or None if either is not one."""
+    def key(text: str):
+        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", text)
+        if not match:
+            return None
+        major, minor, micro, pre = match.groups()
+        # A prerelease sorts before its release; prereleases compare as text.
+        return (int(major), int(minor), int(micro), pre is None, pre or "")
+    a, b = key(version), key(than)
+    return None if a is None or b is None else a > b
 
 
 @dataclass
@@ -88,6 +85,8 @@ class Edit:
 
     path: str
     pattern: str
+    # The command that rewrites it, for a lockfile entry.
+    fix: str | None = None
 
     def read(self, text: str) -> str | None:
         match = re.search(self.pattern, text, flags=re.M)
@@ -142,13 +141,17 @@ def packages(rev: str) -> list[Package]:
             manifest=Edit(f"{directory}/package.json", r'^(\t"version": ")([^"]+)(")'),
             # API reports, benches, and examples stay out of the built package.
             paths=[directory, *(f":(exclude){directory}/{d}" for d in ("api", "bench", "examples"))],
-            locks=[Edit("bun.lock", rf'^(    "{re.escape(directory)}": \{{\n      "name": "{re.escape(name)}",\n      "version": ")([^"]+)(")')],
+            locks=[Edit(
+                "bun.lock",
+                rf'^(    "{re.escape(directory)}": \{{\n      "name": "{re.escape(name)}",\n      "version": ")([^"]+)(")',
+                fix="bun install",
+            )],
         ))
     found.append(Package(
         name="moq-rs (Python)",
         manifest=Edit("py/moq-rs/pyproject.toml", r'^(\[project\]\n(?:(?!\[).*\n)*?version = ")([^"]+)(")'),
         paths=["py/moq-rs", ":(exclude)py/moq-rs/benches", ":(exclude)py/moq-rs/examples"],
-        locks=[Edit("uv.lock", r'^(\[\[package\]\]\nname = "moq-rs"\nversion = ")([^"]+)(")')],
+        locks=[Edit("uv.lock", r'^(\[\[package\]\]\nname = "moq-rs"\nversion = ")([^"]+)(")', fix="uv lock")],
     ))
     found.append(Package(
         name="Moq (Swift)",
@@ -213,17 +216,6 @@ def released(pkg: Package, head: str) -> str | None:
     return None
 
 
-@dataclass
-class Bump:
-    package: Package
-    old: str
-    new: str
-    since: str
-    changed: list[str]
-    # The package it releases alongside, when its own sources did not change.
-    alongside: str | None = None
-
-
 def baselines(found: list[Package], head: str) -> dict[str, str | None]:
     """`released` for each package in `found`."""
     since = {pkg.name: released(pkg, head) for pkg in found}
@@ -236,33 +228,105 @@ def baselines(found: list[Package], head: str) -> dict[str, str | None]:
     return since
 
 
-def plan(head: str) -> list[Bump]:
+def group(pkg: Package, found: list[Package]) -> set[str]:
+    """`pkg` and every package one tag publishes along with it."""
+    names = {pkg.name, *([pkg.rides] if pkg.rides else [])}
+    return names | {other.name for other in found if other.rides in names}
+
+
+@dataclass
+class Unreleased:
+    """A package still at a released version that must move to ship."""
+
+    package: Package
+    version: str
+    since: str
+    changed: list[str]
+    # The package it releases alongside, when its own sources did not change.
+    alongside: str | None = None
+
+
+def unreleased(head: str) -> list[Unreleased]:
+    """Every package at `head` whose released version no longer matches what would ship."""
     found = packages(head)
     since = baselines(found, head)
-    bumps: dict[str, Bump] = {}
+    stale: dict[str, Unreleased] = {}
     for pkg in found:
         if since[pkg.name] is None:
             continue
         changed = git("diff", "--name-only", since[pkg.name], head, "--", *pkg.paths, *UNSHIPPED).stdout.split()
         if changed:
-            old = pkg.version(head)
-            bumps[pkg.name] = Bump(pkg, old, patch(old), since[pkg.name], changed)
+            stale[pkg.name] = Unreleased(pkg, pkg.version(head), since[pkg.name], changed)
 
     # One tag publishes a package and every package riding it, so once any of
-    # them releases, each other one still at a released version needs a bump.
+    # them releases, each other one still at a released version must move too.
     for rider in found:
-        group = [pkg for pkg in found if pkg.name == rider.rides]
-        if not group:
+        members = [pkg for pkg in found if pkg.name == rider.rides]
+        if not members:
             continue
-        group.append(rider)
-        releasing = [pkg.name for pkg in group if pkg.name in bumps or since[pkg.name] is None]
+        members.append(rider)
+        releasing = [pkg.name for pkg in members if pkg.name in stale or since[pkg.name] is None]
         if not releasing:
             continue
-        for pkg in group:
-            if pkg.name not in bumps and since[pkg.name] is not None:
-                old = pkg.version(head)
-                bumps[pkg.name] = Bump(pkg, old, patch(old), since[pkg.name], [], alongside=releasing[0])
-    return [bumps[pkg.name] for pkg in found if pkg.name in bumps]
+        for pkg in members:
+            if pkg.name not in stale and since[pkg.name] is not None:
+                stale[pkg.name] = Unreleased(pkg, pkg.version(head), since[pkg.name], [], alongside=releasing[0])
+    return [stale[pkg.name] for pkg in found if pkg.name in stale]
+
+
+def merge(base: str, head: str) -> str:
+    """A commit landing `head` on `base` as a PR's merge does: first parent `base`."""
+    result = git("merge-tree", "--write-tree", base, head, check=False)
+    if result.returncode:
+        raise RuntimeError(f"{head} does not merge cleanly into {base}")
+    tree = result.stdout.split()[0]
+    identity = {f"GIT_{who}_{key}": value for who in ("AUTHOR", "COMMITTER")
+                for key, value in (("NAME", "versions.py"), ("EMAIL", "versions.py@localhost"))}
+    return subprocess.run(["git", "commit-tree", tree, "-p", base, "-p", head, "-m", f"merge {head} into {base}"],
+                          capture_output=True, text=True, check=True, env={**os.environ, **identity}).stdout.strip()
+
+
+def how(pkg: Package, version: str) -> str:
+    """How to move `pkg` past its released `version`."""
+    text = f"raise its version in {pkg.manifest.path} past {version} (CONTRIBUTING.md's Versions: patch for a fix)"
+    fixes = [lock.fix for lock in pkg.locks if lock.fix]
+    if fixes:
+        text += ", then run " + " and ".join(f"`{fix}`" for fix in fixes)
+    return text
+
+
+def check(base: str, head: str) -> tuple[list[str], list[str]]:
+    """The problems merging `head` into `base` brings, and the packages `base`
+    already holds unreleased changes for."""
+    merged = merge(base, head)
+    found = packages(merged)
+    touched = {
+        pkg.name for pkg in found
+        if git("diff", "--name-only", base, merged, "--", pkg.manifest.path, *pkg.paths, *UNSHIPPED).stdout.strip()
+    }
+
+    problems, notes = [], []
+    for item in unreleased(merged):
+        pkg = item.package
+        if item.alongside:
+            reason = f"{item.alongside} releases, and the same tag would publish its released {item.version} again"
+        else:
+            reason = f"{len(item.changed)} shipped {'file' if len(item.changed) == 1 else 'files'} changed since {item.version} shipped"
+        line = f"{pkg.name}: {reason}; {how(pkg, item.version)}."
+        (problems if group(pkg, found) & touched else notes).append(line)
+
+    for pkg in found:
+        if pkg.name not in touched:
+            continue
+        old, new = pkg.version(base), pkg.version(merged)
+        if old and new != old and newer(new, old) is False:
+            problems.append(f"{pkg.name}: {new} does not come after {old}, the version on {base}.")
+        for lock in pkg.locks:
+            text = show(merged, lock.path)
+            have = lock.read(text) if text is not None else None
+            if have != new:
+                problems.append(f"{pkg.name}: {lock.path} carries {have}, not {new}; run `{lock.fix}`.")
+    return problems, notes
 
 
 def release_assets(tag: str) -> set[str]:
@@ -312,11 +376,11 @@ def pending(head: str) -> list[Tag]:
         if not pkg.tag or pkg.rides or since[pkg.name] is not None:
             continue
         blocker = None
-        # A rider still at a released version needs its bump merged first: the
-        # tag would publish that version again, which its release refuses.
+        # A rider still at a released version must be bumped first: the tag
+        # would publish that version again, which its release refuses.
         stale = [rider for rider in found if rider.rides == pkg.name and since[rider.name] is not None]
         if stale:
-            blocker = f"{stale[0].name} {stale[0].version(head)} is already released; merge its bump first"
+            blocker = f"{stale[0].name} {stale[0].version(head)} is already released; bump it on `release` first"
         elif pkg.ffi:
             if not checked:
                 ffi, checked = ffi_blocker(head), True
@@ -325,97 +389,16 @@ def pending(head: str) -> list[Tag]:
     return tags
 
 
-def apply(bumps: list[Bump], root: Path) -> None:
-    # Every edit is checked before any file is written, so a stale lockfile
-    # leaves the tree untouched. Packages share lockfiles, so edits chain.
-    texts: dict[str, str] = {}
-    for bump in bumps:
-        for edit in [bump.package.manifest, *bump.package.locks]:
-            text = texts.get(edit.path) or (root / edit.path).read_text()
-            if edit.read(text) != bump.old:
-                raise ValueError(f"{edit.path} does not carry {bump.package.name} {bump.old}")
-            texts[edit.path] = substitute(edit.pattern, text, bump.new, edit.path)
-    for path, text in texts.items():
-        (root / path).write_text(text)
-
-
-def body(bumps: list[Bump], head: str) -> str:
-    lines = [
-        "Patch-bumps every hand-versioned package whose sources changed on `release` since its current version shipped, "
-        "so merging this publishes them through their release workflows.",
-        "",
-        "| Package | Version | Unreleased changes |",
-        "| --- | --- | --- |",
-    ]
-    for bump in bumps:
-        files = "file" if len(bump.changed) == 1 else "files"
-        compare = f"[{len(bump.changed)} {files}](https://github.com/{REPO}/compare/{bump.since[:10]}...{head[:10]})"
-        if bump.alongside:
-            compare = f"none; releases with {bump.alongside}"
-        lines.append(f"| {bump.package.name} | {bump.old} → {bump.new} | {compare} |")
-    tags = [f"`{b.package.tag}{b.new}`" for b in bumps if b.package.tag and not b.package.rides]
-    if tags:
-        lines += [
-            "",
-            f"Once this merges, the Release bump workflow pushes {', '.join(tags)} to publish them; "
-            "a C or C++ tag waits until the moq-ffi release `cpp/moq/FFI_VERSION` pins is published.",
-        ]
-    lines += [
-        "",
-        "Each bump is a patch, as a backport keeping the published API needs. "
-        "The next push to `release` regenerates this branch from scratch, dropping any edit to it.",
-        "",
-        f"Generated by `just gh bump pr` at {head[:10]}.",
-    ]
-    return "\n".join(lines) + "\n"
-
-
-def gh(*args: str, stdin: str | None = None) -> str:
-    return subprocess.run(["gh", *args], input=stdin, capture_output=True, text=True, check=True).stdout.strip()
-
-
-def open_pr() -> str | None:
-    number = gh("pr", "list", "--repo", REPO, "--base", BASE, "--head", BRANCH, "--state", "open",
-                "--json", "number", "--jq", ".[0].number // empty")
-    return number or None
-
-
-def pr(root: Path) -> None:
-    head = git("rev-parse", "HEAD").stdout.strip()
-    bumps = plan(head)
-    existing = open_pr()
-    if not bumps:
-        if existing:
-            gh("pr", "close", existing, "--repo", REPO, "--delete-branch",
-               "--comment", f"Every hand-versioned package on `release` is bumped as of {head[:10]}.")
-            print(f"closed #{existing}: nothing left to bump")
-        else:
-            print("nothing to bump")
-        return
-
-    apply(bumps, root)
-    names = ", ".join(f"{b.package.name} {b.new}" for b in bumps)
-    git("checkout", "-B", BRANCH)
-    git("commit", "--all", "--message", f"{TITLE}\n\n{names}")
-    # The branch is regenerated from `release` on every run, like release-plz's.
-    git("push", "--force", "origin", f"HEAD:refs/heads/{BRANCH}")
-    text = body(bumps, head)
-    if existing:
-        gh("pr", "edit", existing, "--repo", REPO, "--title", TITLE, "--body-file", "-", stdin=text)
-        print(f"updated #{existing}: {names}")
-    else:
-        url = gh("pr", "create", "--repo", REPO, "--base", BASE, "--head", BRANCH, "--title", TITLE,
-                 "--body-file", "-", stdin=text)
-        print(f"opened {url}: {names}")
-
-
-def push_tags() -> None:
+def push_tags(dry_run: bool = False) -> None:
     head = git("rev-parse", "HEAD").stdout.strip()
     tags = pending(head)
     for tag in tags:
         if tag.blocker:
             # The next push to `release` retries it.
             print(f"waiting to push {tag.name}: {tag.blocker}")
+            continue
+        if dry_run:
+            print(f"would push {tag.name} at {head[:10]}")
             continue
         git("push", "origin", f"{head}:refs/tags/{tag.name}")
         print(f"pushed {tag.name} at {head[:10]}")
@@ -426,32 +409,36 @@ def push_tags() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    check = sub.add_parser("check")
-    check.add_argument("--ref", default="HEAD")
-    sub.add_parser("apply")
-    sub.add_parser("pr")
-    sub.add_parser("tag")
+    check_parser = sub.add_parser("check")
+    check_parser.add_argument("--base", default="origin/release")
+    check_parser.add_argument("--head", default="HEAD")
+    check_parser.add_argument("--report", action="store_true")
+    tag_parser = sub.add_parser("tag")
+    tag_parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    root = Path(git("rev-parse", "--show-toplevel").stdout.strip())
-    if args.command == "check":
-        bumps = plan(args.ref)
-        for bump in bumps:
-            reason = f"releases with {bump.alongside}" if bump.alongside else f"{len(bump.changed)} files"
-            print(f"{bump.package.name}: {bump.old} -> {bump.new} ({reason} since {bump.since[:10]})")
-            for path in bump.changed:
-                print(f"  {path}")
-        for tag in pending(args.ref):
-            print(f"{tag.package.name}: tag {tag.name}" + (f" (waiting: {tag.blocker})" if tag.blocker else ""))
-        if not bumps:
-            print("nothing to bump")
-    elif args.command == "apply":
-        apply(plan("HEAD"), root)
-    elif args.command == "tag":
-        push_tags()
-    else:
-        pr(root)
-    return 0
+    if args.command == "tag":
+        push_tags(args.dry_run)
+        return 0
+
+    try:
+        problems, notes = check(args.base, args.head)
+    except RuntimeError as error:
+        print(error, file=sys.stderr)
+        return 2
+    for line in notes:
+        print(f"already unreleased on {args.base}: {line}")
+    for line in problems:
+        print(f"::error::{line}" if os.environ.get("GITHUB_ACTIONS") and not args.report else line)
+    if not problems:
+        print(f"no version problems merging {args.head} into {args.base}")
+        return 0
+    if args.report:
+        return 0
+    print(f"{len(problems)} version {'problem' if len(problems) == 1 else 'problems'}; "
+          "a backport bumps each hand-versioned package whose shipped sources it changes, "
+          "or its release workflow skips the fix as already published.")
+    return 1
 
 
 if __name__ == "__main__":

@@ -25,14 +25,14 @@ The nightly C++ and OBS release checks pass: the
 which failed only in unrelated lanes, checked the installed consumers of all four packaged archives and built both
 OBS plugins against them. It packages this run's prebuilt moq-ffi input,
 while a tag with `cpp/moq/FFI_VERSION` unset builds moq-ffi from source, a
-path no nightly checks. The Release bump workflow pushes the `cpp-v` tag
-itself on the first push to `release` after the pin names a published
-moq-ffi release, and never while it is unset. So if the pin is still unset,
-first dispatch `release-cpp.yml` on the ref to be tagged without
-`prebuilt-test`: it runs the tag's source build and archive check on all four
-hosts, then both OBS builds, and publishes nothing. Then tag it by hand. This
-quest owns that dry run, any hand tagging, and verifying the published
-downloads.
+path no nightly checks. The Release tag workflow pushes the `cpp-v` tag
+itself on the first push to `release` once the pin names a published moq-ffi
+release and OBS sits at an unreleased version, and never while the pin is
+unset. So if the pin is still unset, first dispatch `release-cpp.yml` on the
+ref to be tagged without `prebuilt-test`: it runs the tag's source build and
+archive check on all four hosts, then both OBS builds, and publishes nothing.
+Then tag it by hand. This quest owns that dry run, any hand tagging, and
+verifying the published downloads.
 
 ## Required
 
