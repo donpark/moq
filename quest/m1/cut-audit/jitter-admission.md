@@ -72,6 +72,16 @@ Investigation in [moq-dev/moq#7012](https://github.com/moq-dev/moq/pull/7012):
   frames. At 64 tracks the original fill grows from 0.507 ms to 7.696 ms;
   the iterated candidate remains about 0.25 ms. This measures established-clock
   read work, not the unresolved startup path.
+- Updated-base validation completes all-language interop: all 169 recorded
+  checks pass, including Chromium, finite tails, compression, and partial drops.
+  A shorter checkout-local scratch path removes the former browser socket-path
+  failure. Full CI now finishes with only the acquisition-bound probe failing:
+  3,282 selected tests pass, one fails, and 60 are skipped before fail-fast stops
+  the remaining tests. The test and its 27-frame bound remain unchanged.
+- The validation branch carries the independent scratch-formatting fix from
+  [moq-dev/moq#7114](https://github.com/moq-dev/moq/pull/7114), because Taplo
+  otherwise scans generated relay configs inside the ignored `.tmp/` tree.
+  That source-discovery failure is resolved; acquisition still blocks readiness.
 
 Public API: none. Wire: none.
 
