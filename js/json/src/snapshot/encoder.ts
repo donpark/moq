@@ -212,8 +212,6 @@ export class Encoder<T> {
 		// throw. The baseline advances on commit, so it never runs ahead of the wire. Matches the Rust
 		// encoder, which completes every fallible step before mutating state.
 		if (delta) {
-			const payload = this.#frame(delta);
-
 			// A delta is only readable while the group still holds the snapshot it applies to.
 			// Admitting a patch that pushes the group past that budget would abort it
 			// (`GroupTooLarge`), or past a reader's inflate budget, leaving a late subscriber with no
@@ -221,13 +219,17 @@ export class Encoder<T> {
 			//
 			// Charged the larger of the encoded payload and the plaintext: a sync-flushed DEFLATE frame
 			// can come out slightly larger than its input, while the reader's window counts what it
-			// inflates. Compressing first advanced the window past what any reader holds, so drop the
+			// inflates. The plaintext is checked before compressing, so a patch it alone overflows costs
+			// no DEFLATE pass. Compressing advances the window past what any reader holds, so drop the
 			// group before rolling: if the snapshot is refused too, the next update must not be a delta.
-			const charge = Math.max(payload.length, delta.length);
-			if (this.#groupBytes + charge <= this.#maxGroupBytes) {
-				this.#groupBytes += charge;
-				this.#groupFrames += 1;
-				return this.#pend({ payload, keyframe: false }, json);
+			const room = this.#maxGroupBytes - this.#groupBytes;
+			if (delta.length <= room) {
+				const payload = this.#frame(delta);
+				if (payload.length <= room) {
+					this.#groupBytes += Math.max(payload.length, delta.length);
+					this.#groupFrames += 1;
+					return this.#pend({ payload, keyframe: false }, json);
+				}
 			}
 			this.reset();
 		}
@@ -288,10 +290,10 @@ export class Encoder<T> {
 	// Encode a group's snapshot (frame 0), returning its payload. On the compressed path this opens a
 	// fresh stream (cold window), so the snapshot and its deltas share one DEFLATE window.
 	#snapshot(frame: Uint8Array): Uint8Array {
-		// Every consumer holds a compressed group to the group budget by its inflated size, so a value
-		// past it would be unreadable however small it compresses to: the same `FrameTooLarge` a plain
-		// one meets. Checked before anything is published or the window advances.
-		if (this.#compress && frame.byteLength > this.#maxGroupBytes) throw new NetError.FrameTooLarge();
+		// A plain frame past the budget is one the network refuses, and every consumer holds a compressed
+		// group to the same budget by its inflated size, so a value past it would be unreadable however
+		// small it compresses to. Checked before anything is published or the window advances.
+		if (frame.byteLength > this.#maxGroupBytes) throw new NetError.FrameTooLarge();
 
 		// Build the window locally and install it only once framing succeeds. Assigning it first would
 		// leave a throw with a cold window in place, no resync pending, and the old group counters

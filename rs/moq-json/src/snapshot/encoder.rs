@@ -292,7 +292,11 @@ impl<T> Encoder<T> {
 			Some(Baseline::Encoded { bytes, .. }) => bytes.clone(),
 			Some(Baseline::Parsed(value)) => Bytes::from(serde_json::to_vec(value)?),
 		};
-		let encoded = self.snapshot_encoded(bytes)?;
+		// A baseline built by patches was never held to the budget as one snapshot.
+		if bytes.len() as u64 > self.max_group_bytes {
+			return Err(moq_net::Error::FrameTooLarge.into());
+		}
+		let encoded = self.snapshot_encoded(bytes);
 		Ok(Some(Pending {
 			encoder: self,
 			encoded,
@@ -337,6 +341,15 @@ impl<T> Encoder<T> {
 		//
 		// Every fallible step runs before any state changes, so a failure leaves the encoder exactly
 		// as it was rather than half-advanced with no frame to show for it.
+		//
+		// The size check runs first, so a value no reader could hold costs no parse. A plain frame
+		// past the budget is one moq-net refuses, and every consumer holds a compressed group to the
+		// same budget by its inflated size, so a value past it would be unreadable however small it
+		// compresses to. Refusing it before anything is published leaves the previous value standing
+		// rather than superseded by one nothing can read.
+		if snapshot.len() as u64 > self.max_group_bytes {
+			return Err(moq_net::Error::FrameTooLarge.into());
+		}
 		let last = if self.config.deltas {
 			Baseline::Parsed(serde_json::from_slice(&snapshot)?)
 		} else {
@@ -348,19 +361,13 @@ impl<T> Encoder<T> {
 			}
 		};
 
-		let encoded = self.snapshot_encoded(snapshot)?;
+		let encoded = self.snapshot_encoded(snapshot);
 		Ok((encoded, Edit::Snapshot(last)))
 	}
 
-	/// Encode an already-serialized value as a full snapshot, opening a new group.
-	fn snapshot_encoded(&mut self, snapshot: Bytes) -> Result<Encoded> {
-		// Every consumer holds a compressed group to the group budget by its inflated size, so a value
-		// past it would be unreadable however small it compresses to: the same `FrameTooLarge` a plain
-		// one meets. Reject it before anything is published, so the previously published value stands
-		// rather than being superseded by one nothing can read.
-		if self.config.compression.is_deflate() && snapshot.len() as u64 > self.max_group_bytes {
-			return Err(moq_net::Error::FrameTooLarge.into());
-		}
+	/// Encode an already-serialized value, already held to the budget, as a full snapshot opening a
+	/// new group.
+	fn snapshot_encoded(&mut self, snapshot: Bytes) -> Encoded {
 		let plain = snapshot.len() as u64;
 
 		// Open a fresh per-group encoder (cold window) and compress the snapshot as frame 0.
@@ -378,10 +385,10 @@ impl<T> Encoder<T> {
 		self.flate = flate;
 		self.resync = false;
 
-		Ok(Encoded {
+		Encoded {
 			payload,
 			keyframe: true,
-		})
+		}
 	}
 }
 
@@ -445,13 +452,6 @@ impl<T: Serialize> Encoder<T> {
 			return self.encode_snapshot(value).map(Some);
 		}
 
-		// Compress into the per-group window only now, for a frame we are committed to emitting.
-		let bytes = Bytes::from(patch);
-		let payload = match self.flate.as_mut() {
-			Some(flate) => flate.frame(&bytes),
-			None => bytes.clone(),
-		};
-
 		// A delta is only readable while the group still holds the snapshot it applies to.
 		// Admitting a patch that pushes the group past that budget would abort it
 		// (`GroupTooLarge`), or past a reader's inflate budget, leaving a late subscriber with no
@@ -459,15 +459,22 @@ impl<T: Serialize> Encoder<T> {
 		//
 		// Charged the larger of the encoded payload and the plaintext: a sync-flushed DEFLATE frame
 		// can come out slightly larger than its input, while the reader's window counts what it
-		// inflates. Compressing first advanced the window past what any reader holds, so drop the
+		// inflates. The plaintext is checked before compressing, so a patch it alone overflows costs
+		// no DEFLATE pass. Compressing advances the window past what any reader holds, so drop the
 		// group before rolling: if the snapshot is refused too, the next update must not be a delta.
-		let charge = (payload.len() as u64).max(bytes.len() as u64);
-		if self.group_bytes + charge > self.max_group_bytes {
+		let bytes = Bytes::from(patch);
+		let room = self.max_group_bytes.saturating_sub(self.group_bytes);
+		let payload = match self.flate.as_mut() {
+			_ if bytes.len() as u64 > room => None,
+			Some(flate) => Some(flate.frame(&bytes)).filter(|payload| payload.len() as u64 <= room),
+			None => Some(bytes.clone()),
+		};
+		let Some(payload) = payload else {
 			self.reset();
 			return self.encode_snapshot(value).map(Some);
-		}
+		};
 
-		self.group_bytes += charge;
+		self.group_bytes += (payload.len() as u64).max(bytes.len() as u64);
 		self.group_frames += 1;
 
 		// The patch folds into the baseline on commit, so a frame that never reaches the wire leaves
@@ -1001,8 +1008,8 @@ mod test {
 		);
 	}
 
-	/// A delta that overflows the group advances the window before the roll is attempted, so a refused
-	/// roll must not leave that window behind: the next update is a snapshot a reader can decode.
+	/// A delta that overflows the group rolls a snapshot, and a refused roll must not leave the group
+	/// behind: the next update is a snapshot a reader can decode.
 	#[test]
 	fn a_refused_roll_resynchronizes() {
 		let config = Config {
@@ -1026,24 +1033,27 @@ mod test {
 		);
 	}
 
-	/// A compressed snapshot is refused by its plaintext, the way a plain one is, however small it
-	/// deflates: no reader could inflate it.
+	/// A snapshot past the budget is refused by its plaintext, plain or however small it deflates
+	/// (no reader could inflate it), and with or without the parsed baseline deltas need.
 	#[test]
-	fn a_compressed_snapshot_past_the_budget_is_refused() {
-		let config = Config {
-			deltas: false,
-			compression: Compression::Deflate,
-		};
-		let mut encoder = Encoder::<Value>::new(config);
-		encoder.max_group_bytes = 100;
-		assert!(matches!(
-			encoder.update(&json!({ "v": "x".repeat(1000) })),
-			Err(crate::Error::Net(moq_net::Error::FrameTooLarge))
-		));
-		assert!(
-			encoder.value().is_none(),
-			"a refused snapshot leaves the encoder as it was"
-		);
+	fn a_snapshot_past_the_budget_is_refused() {
+		for compression in [Compression::None, Compression::Deflate] {
+			for deltas in [false, true] {
+				let mut encoder = Encoder::<Value>::new(Config { deltas, compression });
+				encoder.max_group_bytes = 100;
+				assert!(
+					matches!(
+						encoder.update(&json!({ "v": "x".repeat(1000) })),
+						Err(crate::Error::Net(moq_net::Error::FrameTooLarge))
+					),
+					"{compression:?}, deltas {deltas}"
+				);
+				assert!(
+					encoder.value().is_none(),
+					"a refused snapshot leaves the encoder as it was"
+				);
+			}
+		}
 	}
 
 	#[test]

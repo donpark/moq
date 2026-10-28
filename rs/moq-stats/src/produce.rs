@@ -415,8 +415,9 @@ impl<T: Serialize> Snapshot<T> {
 	///
 	/// A frame over the cache limit aborts the track with
 	/// [`moq_net::Error::FrameTooLarge`]: skipping it would leave readers on the
-	/// previous snapshot with no sign it stopped tracking. A compressed frame
-	/// meets the same limit by its uncompressed size, which the encoder refuses.
+	/// previous snapshot with no sign it stopped tracking. The encoder refuses a
+	/// snapshot past the limit by its uncompressed size, before compressing it;
+	/// a compressed frame DEFLATE grew past it is refused here.
 	fn update(&mut self, value: &T, stamp: Stamp) -> moq_json::Result<Option<usize>> {
 		#[cfg(feature = "bench")]
 		{
@@ -537,8 +538,8 @@ impl<V: Serialize> TrackPair<V> {
 
 	/// Publish this drain's entries on both flavors (`{}` when there are none)
 	/// and clear them for the next drain; moq-json skips unchanged values. A
-	/// flavor that fails ends alone: DEFLATE can shrink a frame too large for
-	/// the plain track, or grow one that just fits.
+	/// flavor that fails ends alone: DEFLATE can grow a frame that just fits the
+	/// plain track.
 	fn publish(&mut self, name: &str, stamp: Stamp) {
 		self.frame.entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 		if let Err(err) = self.plain.update(&self.frame, stamp) {

@@ -583,11 +583,15 @@ test("a refused roll resynchronizes", () => {
 	expect(JSON.parse(decoded)).toEqual({ a: 2 });
 });
 
-// A compressed snapshot is refused by its plaintext, the way a plain one is, however small it deflates:
-// no reader could inflate it.
-test("a compressed snapshot past the budget is refused", () => {
-	const encoder = new Encoder<Value>({ compression: "deflate", deltas: false, maxGroupBytes: 100 });
-	expect(() => encoder.update({ v: "x".repeat(1000) })).toThrow(NetError.FrameTooLarge);
+// A snapshot past the budget is refused by its plaintext, plain or however small it deflates (no reader
+// could inflate it), with or without deltas.
+test("a snapshot past the budget is refused", () => {
+	for (const compression of ["none", "deflate"] as const) {
+		for (const deltas of [false, true]) {
+			const encoder = new Encoder<Value>({ compression, deltas, maxGroupBytes: 100 });
+			expect(() => encoder.update({ v: "x".repeat(1000) })).toThrow(NetError.FrameTooLarge);
+		}
+	}
 });
 
 test("a compressed delta is gated on its encoded size, not its plaintext", async () => {
