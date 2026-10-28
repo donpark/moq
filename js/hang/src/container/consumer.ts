@@ -232,7 +232,8 @@ export class Consumer {
 				// may be is the subscription's own max delay, applied before it ever reaches here.
 				const group: Group = {
 					consumer,
-					late: now(),
+					// When the group landed, not when it was pulled: a full max buffer delays pulls.
+					late: consumer.arrived,
 					frames: [],
 					costs: [],
 					empty: true,

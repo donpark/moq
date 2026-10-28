@@ -3,7 +3,7 @@
  *
  * @module
  */
-import { Instant, now } from "@moq/clock";
+import { type Instant, now } from "@moq/clock";
 import { type Dispose, type GetPromise, type Getter, Once, race, Signal } from "@moq/signals";
 import {
 	FrameTooLarge,
@@ -94,8 +94,9 @@ class GroupState {
 	// so this mirror drives no media-time expiry.
 	unverified = false;
 	// When the group joined the track this mirror belongs to, at this hop: the wall clock a
-	// superseded predecessor ages from. Per track, since one group can join several.
-	arrived = Instant.zero;
+	// superseded predecessor ages from. Per track, since one group can join several. A group
+	// no track holds arrived when it was created.
+	arrived = now();
 	// Called with the frame count on every write, synchronously: a track's largest must not
 	// trail a write that already returned, as a batched `total` notification would.
 	progress = new Set<(total: number) => void>();
@@ -329,6 +330,8 @@ export class Producer {
 		dst.latest = this.#state.latest;
 		dst.flate = this.#state.flate;
 		dst.compressed = this.#state.compressed;
+		// A track restamps its own mirror with when the group joined it.
+		dst.arrived = this.#state.arrived;
 		for (const frame of this.#state.frames.peek()) appendFrame(dst, frame);
 		dst.start = this.#state.start;
 		dst.offset = this.#state.offset;
@@ -677,10 +680,24 @@ export class Consumer {
 	#expired?: Expired;
 	// Closed by its reader, which ends it whatever is left unread.
 	#released = false;
+	// The arrival of the copy first read, kept once a replacement copy is adopted.
+	#arrived?: Instant;
 
 	private constructor(state: GroupState) {
 		this.#state = state;
 		this.sequence = state.sequence;
+	}
+
+	/**
+	 * When the group joined its track at this hop, before its first frame, on the installed
+	 * clock: its header was received, or it was fetched or created here.
+	 *
+	 * A reader that gets to the group late still measures from when it landed, as
+	 * {@link Frame.arrived} does for each frame. A consumer resumed onto a replacement copy
+	 * keeps the original group's arrival.
+	 */
+	get arrived(): Instant {
+		return this.#arrived ?? this.#state.arrived;
 	}
 
 	/**
@@ -887,6 +904,7 @@ export class Consumer {
 		replacement.adopt();
 		// The copy left behind stops teeing into the state this consumer read.
 		if (this.#state.closed.peek() === undefined) this.#state.closed.set(null);
+		this.#arrived ??= this.#state.arrived;
 		this.#state = next;
 		this.#expiry = replacement.expiry;
 		this.#skip = index;

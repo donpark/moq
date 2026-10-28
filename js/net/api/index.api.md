@@ -310,6 +310,7 @@ export namespace Error {
 
 export namespace Group {
 	export class Consumer {
+		get arrived(): Instant;
 		close(): void;
 		get closed(): Signals.GetPromise<Error | null>;
 		get done(): boolean;

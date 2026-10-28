@@ -277,6 +277,39 @@ test("Consumer stamps frames the max buffer held back with when they landed, not
 	}
 });
 
+test("Consumer expires a hole behind a full max buffer from when the group past it landed", async () => {
+	const clock = new Manual();
+	const installed = clock.install();
+	const track = new Track.Producer("test");
+	const consumer = new Consumer(track.subscribe({ maxDelay: Milli(30_000) }), {
+		format: new Format("data"),
+		maxDelay: Milli(500),
+		// Two groups' overhead: group 3 waits in the transport until groups 0 and 1 are read.
+		maxBuffer: 512,
+	});
+	try {
+		for (const sequence of [0, 1]) {
+			const group = track.createGroup(sequence);
+			write(group, sequence * 10_000);
+			group.finish();
+		}
+		const marker = track.createGroup(3);
+		marker.writeFrame({ payload: new Uint8Array(), timestamp: Time.Timestamp.now() });
+		marker.finish();
+		// The reader is slow: the hole before group 3 expired before anything is read.
+		await clock.advance(Nano.fromMilli(Milli(1_000)));
+
+		expect(await within(consumer.next())).toMatchObject({ kind: "frame", group: 0 });
+		expect(await within(consumer.next())).toMatchObject({ kind: "frame", group: 1 });
+		expect(await within(consumer.next())).toMatchObject({ kind: "gap" });
+		expect(await within(consumer.next())).toMatchObject({ kind: "end", group: 3 });
+	} finally {
+		consumer.close();
+		track.close();
+		installed.close();
+	}
+});
+
 for (const maxBuffer of [0, 256]) {
 	test(`Consumer moves past a stalled group with a ${maxBuffer} byte max buffer`, async () => {
 		const warn = spyOn(console, "warn").mockImplementation(() => {});

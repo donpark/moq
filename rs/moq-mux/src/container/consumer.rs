@@ -914,8 +914,9 @@ struct GroupBuffer<F: Container> {
 impl<F: Container> GroupBuffer<F> {
 	fn new(group: moq_net::group::Consumer, memory: Memory) -> Self {
 		let mut this = Self {
+			// When the group landed, not when it was pulled: a full max buffer delays pulls.
+			late: group.arrived(),
 			group,
-			late: moq_clock::now(),
 			index: 0,
 			empty: true,
 			media: false,
@@ -4425,6 +4426,48 @@ mod tests {
 			});
 		}
 		assert_eq!(reads, ["gap", "end 1", "frame 2 20000"]);
+	}
+
+	/// A hole's budget runs from when the group past it landed, not from when the reader pulled it:
+	/// a full max buffer holds pulls back, so a hole that already expired is passed at once.
+	#[tokio::test(start_paused = true)]
+	async fn a_hole_behind_a_full_max_buffer_expires_from_its_successors_arrival() {
+		let max_delay = Duration::from_millis(500);
+		let mut track = track_producer("test", hang::container::track_info(hang::catalog::PRIORITY.video));
+		let mut consumer = container_max_delay_only(track.subscribe(None), max_delay);
+		consumer.set_max_buffer(4096);
+		for sequence in 0..2u64 {
+			let mut group = track.create_group(moq_net::group::Info { sequence }).unwrap();
+			Container::Legacy(crate::container::Kind::Data)
+				.write(
+					&mut group,
+					&[Frame {
+						timestamp: ts(sequence * 10_000),
+						payload: Bytes::from(vec![0; 4096]),
+						keyframe: false,
+						duration: None,
+					}],
+				)
+				.unwrap();
+			group.finish().unwrap();
+		}
+		let mut marker = track.create_group(moq_net::group::Info { sequence: 3 }).unwrap();
+		marker.write_frame(ts(20_000), Bytes::new()).unwrap();
+		marker.finish().unwrap();
+
+		// The reader gets to the track only after the hole before group 3 has expired.
+		tokio::time::advance(2 * max_delay).await;
+		let waiter = kio::Waiter::noop();
+		let mut reads = Vec::new();
+		while let Poll::Ready(read) = consumer.poll_read(&waiter) {
+			reads.push(match read.unwrap() {
+				Some(Read::Frame { group, frame }) => format!("frame {group} {}", frame.timestamp.as_micros()),
+				Some(Read::Gap { .. }) => "gap".to_string(),
+				Some(Read::End { group, .. }) => format!("end {group}"),
+				None => break,
+			});
+		}
+		assert_eq!(reads, ["frame 0 0", "frame 1 10000", "gap", "end 3"]);
 	}
 
 	/// No cap is too small to read through: the cursor's group and one successor are always pulled, so

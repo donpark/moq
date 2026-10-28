@@ -6,6 +6,7 @@ import { MAX_GROUP_CACHE_BYTES, MAX_GROUP_FRAMES, Producer } from "./group.ts";
 import { hooks, type Replacement } from "./internal.ts";
 import { textFrame } from "./mock.ts";
 import { Timestamp } from "./time.ts";
+import { Producer as TrackProducer } from "./track.ts";
 
 const dec = new TextDecoder();
 
@@ -118,6 +119,52 @@ test("a frame read late keeps the instant it landed, plain, compressed, or resum
 		expect((await resumed.readFrame())?.arrived).toBe(landed);
 
 		for (const producer of [plain, compressed, forwarded, replacement]) producer.finish();
+	} finally {
+		installed.close();
+	}
+});
+
+test("a group read late keeps the instant it joined, alone, on a track, or resumed", async () => {
+	const clock = new Manual();
+	const installed = clock.install();
+	try {
+		const created = clock.now();
+		const alone = new Producer(0);
+		const track = new TrackProducer("test");
+		const subscriber = track.subscribe();
+		const live = track.createGroup(0);
+		live.writeFrame(textFrame("a"));
+		clock.jump(Nano.fromMilli(Milli(1000)));
+
+		expect(alone.consume().arrived).toBe(created);
+		expect((await subscriber.recvGroup())?.arrived).toBe(created);
+
+		// A resumed read keeps the original group's arrival, not the replacement copy's.
+		const failing = new Producer(0);
+		const resumed = failing.mirror();
+		clock.jump(Nano.fromMilli(Milli(1000)));
+		const replacement = new Producer(0);
+		replacement.writeFrame(textFrame("a"));
+		replacement.writeFrame(textFrame("b"));
+		hooks.recoverGroup(resumed, {
+			changed: new Signal(0),
+			wants: (failed) => failed !== undefined,
+			replace: async () => ({
+				group: replacement.mirror(),
+				expiry: { expired: () => false, changed: [] },
+				adopt: () => {},
+				discard: () => {},
+			}),
+		});
+		failing.writeFrame(textFrame("a"));
+		await resumed.readFrame();
+		failing.abort(new Error("copy failed"));
+		expect((await resumed.readFrame())?.payload).toEqual(textFrame("b").payload);
+		expect(resumed.arrived).toBe(created + Nano.fromMilli(Milli(1000)));
+
+		for (const producer of [alone, live, replacement]) producer.finish();
+		subscriber.close();
+		track.close();
 	} finally {
 		installed.close();
 	}
