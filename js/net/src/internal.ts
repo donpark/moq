@@ -538,6 +538,8 @@ export const hooks: {
 	 * Assigned by `group.ts`.
 	 */
 	releaseGroupReader: (group: GroupConsumer, abort?: Error) => void;
+	/** Whether a group reader still reads the copy it was mirrored from, not one its recovery moved it to. */
+	readsMirrored: (group: GroupConsumer) => boolean;
 	groupTimestamp: (group: GroupConsumer) => Timestamp | undefined;
 	groupLatest: (group: GroupConsumer) => Timestamp | undefined;
 	/** Return when a group joined its track at this hop, on the installed clock. */
@@ -745,6 +747,9 @@ export const hooks: {
 		throw new Error("group.ts not loaded");
 	},
 	releaseGroupReader: () => {
+		throw new Error("group.ts not loaded");
+	},
+	readsMirrored: () => {
 		throw new Error("group.ts not loaded");
 	},
 	groupTimestamp: () => {

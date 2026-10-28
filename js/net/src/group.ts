@@ -690,6 +690,7 @@ export class Consumer {
 	static {
 		makeConsumer = (state) => new Consumer(state);
 		hooks.releaseGroupReader = (group, abort) => group.#release(abort);
+		hooks.readsMirrored = (group) => group.#state === group.#mirrored;
 		hooks.groupTimestamp = (group) => (group.#state.unverified ? undefined : group.#state.timestamp);
 		hooks.groupLatest = (group) => (group.#state.unverified ? undefined : group.#state.latest);
 		hooks.unverifyGroup = (group) => {

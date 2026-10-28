@@ -13,7 +13,7 @@
 import { test } from "bun:test";
 import { Manual, Milli, Nano } from "@moq/clock";
 import fc from "fast-check";
-import { Producer as BroadcastProducer } from "./broadcast.ts";
+import { Consumer as BroadcastConsumer, Producer as BroadcastProducer } from "./broadcast.ts";
 import * as Epoch from "./epoch.ts";
 import { NotFound, StreamCode, StreamError, TooFarBehind } from "./error.ts";
 import type { Frame, Consumer as GroupConsumer, Producer as GroupProducer } from "./group.ts";
@@ -24,7 +24,7 @@ import * as Path from "./path.ts";
 import { routeFailed } from "./resume.ts";
 import { Timescale, Timestamp } from "./time.ts";
 import type * as track from "./track.ts";
-import { wireOf } from "./wire.ts";
+import { overrideBroadcastWire, wireOf } from "./wire.ts";
 
 /** Groups in the logical track; group `g` has `1 + g % 3` frames. */
 const GROUPS = 12;
@@ -178,6 +178,36 @@ interface Copy {
 	givenUp: Set<number>;
 }
 
+/** Answers a fetch of `sequence` that `local`, the route's own cache, may serve. */
+type Fill = (sequence: number, local: () => Promise<GroupConsumer>) => Promise<GroupConsumer>;
+
+/** A route's broadcast, which fetches upstream what its cache lacks, the way a relay forwards a fetch. */
+class Upstream extends BroadcastConsumer {
+	#fill: Fill;
+
+	constructor(fill: Fill, state?: never) {
+		super(state);
+		const local = wireOf(this).fetchGroup;
+		if (!local) throw new Error("a produced broadcast always fetches");
+		overrideBroadcastWire(this, {
+			fetchGroup: (name, sequence, options) => fill(sequence, () => local(name, sequence, options)),
+		});
+		this.#fill = fill;
+	}
+
+	/** Serve `broadcast`, fetching through `fill`. */
+	static of(broadcast: BroadcastProducer, fill: Fill): Upstream {
+		const base = broadcast.consume();
+		const upstream = new Upstream(fill, (base as Upstream).shareState());
+		base.close();
+		return upstream;
+	}
+
+	override clone(): Upstream {
+		return new Upstream(this.#fill, this.shareState());
+	}
+}
+
 function complete(copy: Copy, group: number): boolean {
 	return copy.groups.get(group)?.written === frames(group);
 }
@@ -248,8 +278,21 @@ interface Reader {
 	resumed?: number;
 	/** `null` once the track ended cleanly, the error once it failed. */
 	end?: Error | null;
+	/**
+	 * The track ended cleanly with only groups past the reader's cap left: where Rust ends the
+	 * reader, JS leaves the route but keeps it open with those claimable for the cap to rise.
+	 */
+	parked: boolean;
 	/** What every live route carried in full when the track ended cleanly. */
 	carried: Set<number>;
+}
+
+/**
+ * Unlike Rust, which ends a reader capped below a finished track's end, JS keeps the groups past
+ * the cap claimable, so the reader stays open for the cap to rise.
+ */
+function capped(reader: Reader): boolean {
+	return (reader.cursor?.[1] ?? GROUPS) < GROUPS;
 }
 
 function within(range: Range, group: number): boolean {
@@ -413,7 +456,12 @@ class Model {
 		const broadcast = new BroadcastProducer();
 		const producer = broadcast.createTrack("video", { timescale: Timescale.MILLI });
 		void (async () => {
-			for await (const request of serving.requested()) hooks.acceptRequest(request, broadcast.consume());
+			for await (const request of serving.requested()) {
+				hooks.acceptRequest(
+					request,
+					Upstream.of(broadcast, (sequence, local) => this.fill(epoch, slot, sequence, local)),
+				);
+			}
 		})();
 		instance.routes[slot] = { track: producer, serving, broadcast, groups: new Map(), givenUp: new Set() };
 	}
@@ -453,6 +501,31 @@ class Model {
 			instance.complete.add(group);
 		}
 		instance.written.set(group, Math.max(instance.written.get(group) ?? 0, entry.written));
+	}
+
+	/**
+	 * Answer a fetch the route's cache missed from upstream, where the instance's publisher
+	 * holds every frame any of its routes wrote. Later writes to the route continue the group.
+	 */
+	async fill(
+		epoch: number,
+		slot: number,
+		sequence: number,
+		local: () => Promise<GroupConsumer>,
+	): Promise<GroupConsumer> {
+		this.progress++;
+		const instance = this.instances[epoch];
+		const copy = instance.routes[slot];
+		if (!copy) throw routeFailure();
+		if (copy.givenUp.has(sequence)) throw giveUp();
+		if (copy.groups.has(sequence)) return local();
+		const written = instance.written.get(sequence) ?? 0;
+		if (sequence >= GROUPS || written === 0) throw new NotFound(`group ${sequence}`);
+		const writer = copy.track.createGroup(sequence);
+		copy.groups.set(sequence, { written: 0, writer });
+		const group = writer.consume();
+		this.write(epoch, slot, sequence, written);
+		return group;
 	}
 
 	end(epoch: number, slot: number): void {
@@ -511,6 +584,7 @@ class Model {
 			floor: this.instances[instance].newest(),
 			doomed: false,
 			end: undefined,
+			parked: false,
 			carried: new Set(),
 		};
 		this.poll(index);
@@ -528,6 +602,16 @@ class Model {
 	}
 
 	/** Read everything `index` has ready, checking each step against the model. */
+	/** The track ended cleanly: a group landing below the end afterwards is not owed, since a reader stops at it. */
+	#endClean(index: number, reader: Reader): void {
+		const instance = this.instances[reader.instance];
+		if (!instance.ended) throw fail(index, "the track ended cleanly though no route declared an end");
+		reader.carried = new Set();
+		for (let group = 0; group < GROUPS; group++) {
+			if (instance.live().every((copy) => complete(copy, group))) reader.carried.add(group);
+		}
+	}
+
 	poll(index: number): void {
 		const reader = this.readers[index];
 		if (!reader) return;
@@ -537,7 +621,13 @@ class Model {
 
 		while (reader.end === undefined) {
 			const recv = reader.spec.ordered ? hooks.tryNextGroup(reader.sub) : hooks.tryRecvGroup(reader.sub, false);
-			if (recv.kind === "idle" || recv.kind === "boundary") break;
+			if (recv.kind === "idle" || recv.kind === "boundary") {
+				if (!reader.parked && capped(reader) && reader.sub.closed.peek() === null) {
+					this.#endClean(index, reader);
+					reader.parked = true;
+				}
+				break;
+			}
 			if (recv.kind === "group") {
 				const group = recv.group;
 				const sequence = group.sequence;
@@ -559,12 +649,7 @@ class Model {
 				reader.reading.set(sequence, reading);
 				void this.#read(index, reader, reading);
 			} else if (recv.kind === "done") {
-				if (!instance.ended) throw fail(index, "the track ended cleanly though no route declared an end");
-				// A group landing below the end afterwards is not owed: a reader stops at it.
-				reader.carried = new Set();
-				for (let group = 0; group < GROUPS; group++) {
-					if (instance.live().every((copy) => complete(copy, group))) reader.carried.add(group);
-				}
+				if (!reader.parked) this.#endClean(index, reader);
 				reader.end = null;
 			} else if (recv.kind === "error") {
 				if (!reader.doomed) throw fail(index, `the track failed while its instance had a route: ${recv.error}`);
@@ -685,11 +770,9 @@ class Model {
 
 	owed(index: number, reader: Reader, before: number | undefined, finish: boolean): void {
 		const instance = this.instances[reader.instance];
-		// Unlike Rust, a JS reader capped below the end keeps the groups past its cap claimable
-		// after the track finishes, so it stays open for the cap to rise.
-		const capped = (reader.cursor?.[1] ?? GROUPS) < GROUPS;
+		const ended = reader.end === null || reader.parked;
 		if (reader.doomed) {
-			if (reader.end instanceof Error || ((reader.end === null || capped) && instance.ended)) return;
+			if (reader.end instanceof Error || ((ended || capped(reader)) && instance.ended)) return;
 			throw fail(index, `outlived its instance's routes: ${reader.end}`);
 		}
 		// What every live route carries in full.
@@ -701,7 +784,7 @@ class Model {
 			if (covers(reader, group) && carried(group)) owed.push(group);
 		}
 		if (reader.spec.ordered && before !== undefined) owed = owed.filter((group) => group > before);
-		if (reader.end === null) owed = owed.filter((group) => reader.carried.has(group));
+		if (ended) owed = owed.filter((group) => reader.carried.has(group));
 		if (reader.spec.budget === "short") owed = owed.filter((group) => group === GROUPS - 1);
 		const missing = owed.filter((group) => !reader.reading.has(group));
 		let problems = "";
@@ -714,14 +797,14 @@ class Model {
 				const gone = reading.end instanceof TooFarBehind || reading.end instanceof NotFound;
 				if (gone && instance.expired !== undefined && sequence <= instance.expired) continue;
 				// Unlike Rust, an ended JS reader follows no route, so a route failure ends a group still read.
-				if (reader.end === null && reading.end instanceof Error && routeFailed(reading.end)) continue;
+				if (ended && reading.end instanceof Error && routeFailed(reading.end)) continue;
 				problems += `group ${sequence} stopped at frame ${reading.frames} (${reading.end}); `;
 			}
 		}
 		const live = finish && instance.live().length > 0;
 		const end = reader.end;
 		const ends =
-			(end === undefined && (!live || capped)) ||
+			(end === undefined && (!live || capped(reader))) ||
 			(end === null && live) ||
 			(end === null && !live && instance.ended);
 		if (!ends) problems += `track end ${end}; `;
@@ -855,6 +938,17 @@ test("regressions", async () => {
 				{ kind: "join", reader: 0, spec: spec(false, "hour", undefined, true) },
 				{ kind: "giveUp", epoch: 1, slot: 2, group: 0 },
 				{ kind: "down", epoch: 1, slot: 2 },
+			],
+			finish: false,
+		},
+		// A group read on from the serving copy outlives the replaced copy it was handed out from.
+		{
+			ops: [
+				{ kind: "join", reader: 0, spec: spec(false, "hour", undefined, false) },
+				{ kind: "up", epoch: 0, slot: 1 },
+				{ kind: "write", epoch: 0, slot: 0, group: 8, frames: 1 },
+				{ kind: "giveUp", epoch: 0, slot: 0, group: 8 },
+				{ kind: "write", epoch: 0, slot: 1, group: 0, frames: 1 },
 			],
 			finish: false,
 		},
