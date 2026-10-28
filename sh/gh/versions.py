@@ -66,16 +66,21 @@ def show(rev: str, path: str) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
+def precedence(version: str) -> tuple | None:
+    """A sort key for semver precedence, or None if `version` is not semver."""
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?", version)
+    if not match:
+        return None
+    major, minor, micro, pre = match.groups()
+    # A prerelease sorts before its release. Its identifiers compare in order,
+    # numeric ones by value and below alphanumeric ones; build metadata is ignored.
+    ids = [(0, int(part), "") if part.isdigit() else (1, 0, part) for part in pre.split(".")] if pre else []
+    return (int(major), int(minor), int(micro), pre is None, ids)
+
+
 def newer(version: str, than: str) -> bool | None:
     """Whether `version` sorts after `than` by semver, or None if either is not one."""
-    def key(text: str):
-        match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", text)
-        if not match:
-            return None
-        major, minor, micro, pre = match.groups()
-        # A prerelease sorts before its release; prereleases compare as text.
-        return (int(major), int(minor), int(micro), pre is None, pre or "")
-    a, b = key(version), key(than)
+    a, b = precedence(version), precedence(than)
     return None if a is None or b is None else a > b
 
 
@@ -319,8 +324,12 @@ def check(base: str, head: str) -> tuple[list[str], list[str]]:
         if pkg.name not in touched:
             continue
         old, new = pkg.version(base), pkg.version(merged)
-        if old and new != old and newer(new, old) is False:
-            problems.append(f"{pkg.name}: {new} does not come after {old}, the version on {base}.")
+        if old and new != old:
+            order = newer(new, old)
+            if order is None:
+                problems.append(f"{pkg.name}: cannot order {new} after {old}, the version on {base}, as semver.")
+            elif not order:
+                problems.append(f"{pkg.name}: {new} does not come after {old}, the version on {base}.")
         for lock in pkg.locks:
             text = show(merged, lock.path)
             have = lock.read(text) if text is not None else None

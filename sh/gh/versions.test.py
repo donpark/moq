@@ -325,11 +325,23 @@ class VersionsTest(unittest.TestCase):
             self.assertEqual(self.pending(), {})
             self.assertEqual(self.backport({"js/a/src/index.ts": FIX}), (["@moq/a"], []), self.problems)
 
+    def test_a_version_semver_cannot_order_fails(self):
+        self.assertEqual(self.backport({"js/a/src/index.ts": FIX, **self.bump_a("next")}), (["@moq/a"], []))
+        self.assertIn("cannot order next after 0.1.0", self.problems[0])
+
     def test_newer(self):
         self.assertTrue(versions.newer("0.9.10", "0.9.9"))
         self.assertTrue(versions.newer("0.1.0", "0.1.0-rc.1"))
         self.assertFalse(versions.newer("0.1.0-rc.1", "0.1.0"))
         self.assertFalse(versions.newer("0.1.0", "0.1.0"))
+        # Numeric prerelease identifiers compare by value, below alphanumeric ones.
+        self.assertTrue(versions.newer("1.0.0-rc.10", "1.0.0-rc.9"))
+        self.assertFalse(versions.newer("1.0.0-rc.9", "1.0.0-rc.10"))
+        self.assertTrue(versions.newer("1.0.0-alpha.beta", "1.0.0-alpha.1"))
+        self.assertTrue(versions.newer("1.0.0-alpha.1", "1.0.0-alpha"))
+        # Build metadata takes no part in precedence.
+        self.assertFalse(versions.newer("0.4.0+fix", "0.5.0"))
+        self.assertFalse(versions.newer("0.5.0+fix", "0.5.0"))
         self.assertIsNone(versions.newer("next", "0.1.0"))
 
 
