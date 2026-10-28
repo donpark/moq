@@ -4,69 +4,69 @@ Running interop tests...
   Relay:  moq-interop-relay:local
   Client: ghcr.io/englishm/moq-interop-runner-moq-test-client:latest
   URL:    https://relay:4443
-time="2026-10-28T00:35:29Z" level=warning msg="The \"PORT\" variable is not set. Defaulting to a blank string."
-time="2026-10-28T00:35:29Z" level=warning msg="The \"PORT\" variable is not set. Defaulting to a blank string."
-time="2026-10-28T00:35:29Z" level=warning msg="The \"PORT\" variable is not set. Defaulting to a blank string."
-time="2026-10-28T00:35:29Z" level=warning msg="The \"HEX\" variable is not set. Defaulting to a blank string."
-time="2026-10-28T00:35:29Z" level=warning msg="The \"HEX\" variable is not set. Defaulting to a blank string."
+time="2026-10-28T07:27:12Z" level=warning msg="The \"PORT\" variable is not set. Defaulting to a blank string."
+time="2026-10-28T07:27:12Z" level=warning msg="The \"PORT\" variable is not set. Defaulting to a blank string."
+time="2026-10-28T07:27:12Z" level=warning msg="The \"PORT\" variable is not set. Defaulting to a blank string."
+time="2026-10-28T07:27:12Z" level=warning msg="The \"HEX\" variable is not set. Defaulting to a blank string."
+time="2026-10-28T07:27:12Z" level=warning msg="The \"HEX\" variable is not set. Defaulting to a blank string."
  Container runner-upstream-test-client-1  Recreate
  Container runner-upstream-test-client-1  Recreated
 Attaching to relay-1, test-client-1
-relay-1        | [2m2026-10-28T00:35:29.447275Z[0m [33m WARN[0m [2mmoq_sock::bind[0m[2m:[0m UDP receive buffer is smaller than requested; raise `net.core.rmem_max` or expect packet loss under load [3mwanted[0m[2m=[0m8388608 [3mgranted[0m[2m=[0m1048576
-relay-1        | [2m2026-10-28T00:35:29.447291Z[0m [33m WARN[0m [2mmoq_sock::bind[0m[2m:[0m UDP send buffer is smaller than requested; raise `net.core.wmem_max` or expect packet loss under load [3mwanted[0m[2m=[0m8388608 [3mgranted[0m[2m=[0m212992
-relay-1        | [2m2026-10-28T00:35:29.447434Z[0m [32m INFO[0m [2mmoq_relay::cluster[0m[2m:[0m cluster initialized [3mhop_id[0m[2m=[0m203602210751136 [3mconfigured[0m[2m=[0mfalse
-relay-1        | [2m2026-10-28T00:35:29.447468Z[0m [32m INFO[0m [2mmoq_relay::relay[0m[2m:[0m listening [3maddr[0m[2m=[0m[::]:4443 [3mkind[0m[2m=[0m"quic"
-relay-1        | [2m2026-10-28T00:35:29.447560Z[0m [32m INFO[0m [2mmoq_relay::cluster[0m[2m:[0m no cluster peers configured; running standalone
+relay-1        | [2m2026-10-28T07:27:12.789076Z[0m [33m WARN[0m [2mmoq_sock::bind[0m[2m:[0m UDP receive buffer is smaller than requested; raise `net.core.rmem_max` or expect packet loss under load [3mwanted[0m[2m=[0m8388608 [3mgranted[0m[2m=[0m1048576
+relay-1        | [2m2026-10-28T07:27:12.789094Z[0m [33m WARN[0m [2mmoq_sock::bind[0m[2m:[0m UDP send buffer is smaller than requested; raise `net.core.wmem_max` or expect packet loss under load [3mwanted[0m[2m=[0m8388608 [3mgranted[0m[2m=[0m212992
+relay-1        | [2m2026-10-28T07:27:12.789268Z[0m [32m INFO[0m [2mmoq_relay::cluster[0m[2m:[0m cluster initialized [3mhop_id[0m[2m=[0m7328033346423487 [3mconfigured[0m[2m=[0mfalse
+relay-1        | [2m2026-10-28T07:27:12.789315Z[0m [32m INFO[0m [2mmoq_relay::relay[0m[2m:[0m listening [3maddr[0m[2m=[0m[::]:4443 [3mkind[0m[2m=[0m"quic"
+relay-1        | [2m2026-10-28T07:27:12.789459Z[0m [32m INFO[0m [2mmoq_relay::cluster[0m[2m:[0m no cluster peers configured; running standalone
 test-client-1  | TAP version 14
 test-client-1  | # moq-test-client v0.1.15
 test-client-1  | # Relay: https://relay:4443/
 test-client-1  | 1..8
-test-client-1  | [2m2026-10-28T00:35:35.036771Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:58801 [3mdual_stack[0m[2m=[0mtrue
+test-client-1  | [2m2026-10-28T07:27:18.402076Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:34709 [3mdual_stack[0m[2m=[0mtrue
 test-client-1  | not ok 1 - setup-only
 test-client-1  |   ---
-test-client-1  |   duration_ms: 23
+test-client-1  |   duration_ms: 47
 test-client-1  |   message: "SETUP exchange failed: webtransport error: read error: RESET_STREAM: 1: read error: RESET_STREAM: 1"
 test-client-1  |   ...
-test-client-1  | [2m2026-10-28T00:35:35.060203Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:46805 [3mdual_stack[0m[2m=[0mtrue
+test-client-1  | [2m2026-10-28T07:27:18.449040Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:49637 [3mdual_stack[0m[2m=[0mtrue
 test-client-1  | not ok 2 - publish-namespace-only
 test-client-1  |   ---
-test-client-1  |   duration_ms: 1
+test-client-1  |   duration_ms: 2
 test-client-1  |   message: "SETUP exchange failed: webtransport error: read error: RESET_STREAM: 1: read error: RESET_STREAM: 1"
 test-client-1  |   ...
-test-client-1  | [2m2026-10-28T00:35:35.062101Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:43396 [3mdual_stack[0m[2m=[0mtrue
+test-client-1  | [2m2026-10-28T07:27:18.451830Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:47582 [3mdual_stack[0m[2m=[0mtrue
 test-client-1  | not ok 3 - subscribe-error
 test-client-1  |   ---
-test-client-1  |   duration_ms: 1
+test-client-1  |   duration_ms: 2
 test-client-1  |   message: "SETUP exchange failed: webtransport error: read error: RESET_STREAM: 1: read error: RESET_STREAM: 1"
 test-client-1  |   ...
-test-client-1  | [2m2026-10-28T00:35:35.063768Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:44160 [3mdual_stack[0m[2m=[0mtrue
+test-client-1  | [2m2026-10-28T07:27:18.454307Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:53566 [3mdual_stack[0m[2m=[0mtrue
 test-client-1  | not ok 4 - publish-namespace-subscribe
 test-client-1  |   ---
-test-client-1  |   duration_ms: 1
+test-client-1  |   duration_ms: 2
 test-client-1  |   message: "publisher SETUP failed: webtransport error: read error: RESET_STREAM: 1: read error: RESET_STREAM: 1"
 test-client-1  |   ...
-test-client-1  | [2m2026-10-28T00:35:35.065337Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:48696 [3mdual_stack[0m[2m=[0mtrue
-test-client-1  | [2m2026-10-28T00:35:35.066788Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:60768 [3mdual_stack[0m[2m=[0mtrue
+test-client-1  | [2m2026-10-28T07:27:18.456799Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:59060 [3mdual_stack[0m[2m=[0mtrue
 test-client-1  | not ok 5 - subscribe-before-publish-namespace
 test-client-1  |   ---
-test-client-1  |   duration_ms: 1
+test-client-1  |   duration_ms: 2
 test-client-1  |   message: "subscriber SETUP failed: webtransport error: read error: RESET_STREAM: 1: read error: RESET_STREAM: 1"
 test-client-1  |   ...
+test-client-1  | [2m2026-10-28T07:27:18.459227Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:53221 [3mdual_stack[0m[2m=[0mtrue
 test-client-1  | not ok 6 - publish-namespace-done
 test-client-1  |   ---
-test-client-1  |   duration_ms: 1
+test-client-1  |   duration_ms: 2
 test-client-1  |   message: "SETUP exchange failed: webtransport error: read error: RESET_STREAM: 1: read error: RESET_STREAM: 1"
 test-client-1  |   ...
-test-client-1  | [2m2026-10-28T00:35:35.068289Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:47316 [3mdual_stack[0m[2m=[0mtrue
+test-client-1  | [2m2026-10-28T07:27:18.461663Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:43525 [3mdual_stack[0m[2m=[0mtrue
 test-client-1  | not ok 7 - publish-track-only
 test-client-1  |   ---
-test-client-1  |   duration_ms: 1
+test-client-1  |   duration_ms: 2
 test-client-1  |   message: "publisher SETUP failed: webtransport error: read error: RESET_STREAM: 1: read error: RESET_STREAM: 1"
 test-client-1  |   ...
-test-client-1  | [2m2026-10-28T00:35:35.069755Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:36437 [3mdual_stack[0m[2m=[0mtrue
+test-client-1  | [2m2026-10-28T07:27:18.464069Z[0m [32m INFO[0m [2mmoq_native_ietf::quic[0m[2m:[0m UDP socket bound [3mbind[0m[2m=[0m[::]:0 [3mlocal[0m[2m=[0m[::]:38180 [3mdual_stack[0m[2m=[0mtrue
 test-client-1  | not ok 8 - publish-track-subscribe
 test-client-1  |   ---
-test-client-1  |   duration_ms: 1
+test-client-1  |   duration_ms: 2
 test-client-1  |   message: "publisher SETUP failed: webtransport error: read error: RESET_STREAM: 1: read error: RESET_STREAM: 1"
 test-client-1  |   ...
 [Ktest-client-1 exited with code 1
