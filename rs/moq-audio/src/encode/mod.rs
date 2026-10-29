@@ -27,7 +27,7 @@ mod capture;
 
 pub use encoded::Encoded;
 pub use encoder::{Codec, Config, Encoder, Finish, Input};
-pub use producer::{Options, Producer};
+pub use producer::{BitrateControl, Options, Producer};
 
 #[cfg(feature = "capture")]
 pub use capture::{Driver, Level, Publication, PublicationOptions, State, Status, publish_capture};

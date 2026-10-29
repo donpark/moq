@@ -1,5 +1,7 @@
 //! Encode raw PCM and publish it as a moq audio track.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -46,6 +48,44 @@ pub struct Options {
 	/// Encoded frame duration. Opus accepts 2.5 / 5 / 10 / 20 / 40 / 60 ms.
 	/// PCM accepts any duration containing a whole number of samples.
 	pub frame_duration: Duration,
+	/// A live bitrate target the encode loop applies as frames flow.
+	///
+	/// [`Producer::set_bitrate`] needs `&mut Producer`, which the publish loop
+	/// owns; this handle is how something outside that loop — a congestion
+	/// controller running a rate policy — retunes the encoder anyway. `None`
+	/// (the default) keeps [`bitrate`](Self::bitrate) fixed for the track's
+	/// life. Only meaningful for Opus; a fixed-rate codec ignores it.
+	pub bitrate_control: Option<BitrateControl>,
+}
+
+/// A shareable bitrate request for a running [`Producer`].
+///
+/// Clones observe and drive the same request. The request is advisory until
+/// the producer's next [`write`](Producer::write) applies it, and a codec that
+/// rejects the retune (out of its range, or fixed-rate) simply keeps its
+/// current rate — retuning is never fatal to the stream.
+#[derive(Clone, Debug, Default)]
+pub struct BitrateControl(Arc<AtomicU64>);
+
+impl BitrateControl {
+	/// A control with no request pending.
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Request `bitrate` bits per second from the next encoded frame on.
+	/// `0` clears the request, leaving the encoder at its current rate.
+	pub fn set(&self, bitrate: u64) {
+		self.0.store(bitrate, Ordering::Relaxed);
+	}
+
+	/// The requested bitrate in bits per second, or `None` while no request is pending.
+	pub fn get(&self) -> Option<u64> {
+		match self.0.load(Ordering::Relaxed) {
+			0 => None,
+			bitrate => Some(bitrate),
+		}
+	}
 }
 
 impl Default for Options {
@@ -59,6 +99,7 @@ impl Default for Options {
 			fec: false,
 			dtx: false,
 			frame_duration: Duration::from_millis(20),
+			bitrate_control: None,
 		}
 	}
 }
@@ -91,6 +132,9 @@ impl Options {
 pub struct Producer<E: CatalogExt = ()> {
 	encoder: Encoder,
 	resampler: Option<Resampler>,
+	/// A live bitrate request applied as frames are encoded, if the caller
+	/// brought one (see [`Options::bitrate_control`]).
+	bitrate_control: Option<BitrateControl>,
 	track: moq_mux::container::Producer<moq_mux::container::legacy::Wire>,
 	/// Owns the catalog rendition, retiring it when this producer goes away.
 	rendition: Rendition<E>,
@@ -128,6 +172,7 @@ pub(crate) struct Reserved<E: CatalogExt = ()> {
 	catalog: moq_mux::catalog::Producer<E>,
 	track: moq_mux::container::Producer<moq_mux::container::legacy::Wire>,
 	name: String,
+	bitrate_control: Option<BitrateControl>,
 }
 
 impl<E: CatalogExt> Reserved<E> {
@@ -148,7 +193,12 @@ impl<E: CatalogExt> Reserved<E> {
 		let name = track.name().to_string();
 		let track = catalog.media_producer(track, moq_mux::container::legacy::Wire)?;
 
-		Ok(Self { catalog, track, name })
+		Ok(Self {
+			catalog,
+			track,
+			name,
+			bitrate_control: options.bitrate_control.clone(),
+		})
 	}
 
 	/// Build the encoder for `input` and register the rendition describing it.
@@ -187,6 +237,7 @@ impl<E: CatalogExt> Reserved<E> {
 		Producer {
 			encoder: registered.encoder,
 			resampler: registered.resampler,
+			bitrate_control: self.bitrate_control,
 			track: self.track,
 			rendition: Rendition {
 				catalog: self.catalog,
@@ -353,6 +404,14 @@ impl<E: CatalogExt> Producer<E> {
 	/// Encode and publish every full frame in `pending`, keeping any partial
 	/// trailing frame for the next call.
 	fn publish_full_frames(&mut self, epoch_us: u64) -> Result<(), Error> {
+		// Apply a pending bitrate request here, at the encode step, so it lands
+		// on the next frame regardless of which publish path brought it. A
+		// rejected retune leaves the encoder at its current rate.
+		if let Some(bitrate) = self.bitrate_control.as_ref().and_then(|control| control.get()) {
+			if bitrate != self.encoder.bitrate() {
+				let _ = self.encoder.set_bitrate(bitrate);
+			}
+		}
 		let frame_samples = self.encoder.frame_size() * self.encoder.codec_channels() as usize;
 		while self.pending.len() >= frame_samples {
 			let chunk: Vec<f32> = self.pending.drain(..frame_samples).collect();
@@ -512,6 +571,47 @@ mod tests {
 	use super::*;
 	use crate::decode::{Config as DecodeConfig, Consumer as AudioConsumer};
 	use crate::{Activity, Format};
+
+	/// A `BitrateControl` request retunes the encoder on the next frame, and
+	/// one the codec rejects leaves the stream running at its current rate.
+	#[tokio::test]
+	async fn bitrate_control_retargets_the_encoder() {
+		let input = Input {
+			format: Format::F32,
+			sample_rate: 48_000,
+			channels: 1,
+		};
+		let control = BitrateControl::new();
+		let options = Options {
+			track: Some("audio".to_string()),
+			bitrate: Some(128_000),
+			bitrate_control: Some(control.clone()),
+			..Options::default()
+		};
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut producer = Producer::new(&mut broadcast, catalog, input, &options).unwrap();
+
+		let frame = |samples: usize| {
+			let pcm = vec![0.0f32; samples];
+			let data: Vec<u8> = pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+			Frame::new(Bytes::from(data), Timestamp::ZERO)
+		};
+
+		// One 20 ms frame is a full encode unit at the default frame duration.
+		producer.write(&frame(960)).unwrap();
+		assert_eq!(producer.bitrate(), 128_000);
+
+		control.set(32_000);
+		producer.write(&frame(960)).unwrap();
+		assert_eq!(producer.bitrate(), 32_000, "a pending request lands on the next frame");
+
+		// A request below the codec's range is refused, not fatal.
+		control.set(1);
+		producer.write(&frame(960)).unwrap();
+		assert_eq!(producer.bitrate(), 32_000, "a rejected retune keeps the current rate");
+	}
 
 	/// Terminal Opus lookahead samples survive both exact-frame and partial-frame input.
 	#[tokio::test]
