@@ -572,7 +572,6 @@ mod tests {
 		}
 	}
 
-
 	/// A public builder taking a config this crate did not check, so it refuses
 	/// before it touches the key file or a socket.
 	///

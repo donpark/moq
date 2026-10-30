@@ -1556,7 +1556,9 @@ impl Request {
 		if let Some(url) = &self.url {
 			url.query()
 		} else {
-			request_ref!(self, r => r.path()).split_once('?').map(|(_, query)| query)
+			request_ref!(self, r => r.path())
+				.split_once('?')
+				.map(|(_, query)| query)
 		}
 	}
 
@@ -1782,7 +1784,12 @@ mod tests {
 
 		let url: Url = "wss://example.com/room?jwt=url-token".parse().unwrap();
 		for protocol in ["qmux-01.moq-lite-06", "qmux-01.moqt-18", "qmux-01.moqt-22"] {
-			for path in [None, Some(""), Some("/room?jwt=url-token"), Some("/other?jwt=setup-token")] {
+			for path in [
+				None,
+				Some(""),
+				Some("/room?jwt=url-token"),
+				Some("/other?jwt=setup-token"),
+			] {
 				let (client, server) = tokio::io::duplex(64 * 1024);
 				let client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
 				let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
@@ -1792,7 +1799,11 @@ mod tests {
 				// At most a single Path parameter: lite uses a counted parameter bag;
 				// IETF uses a u16-sized SETUP option block.
 				let lite = protocol.contains("moq-lite");
-				let mut params = if lite { vec![u8::from(path.is_some())] } else { Vec::new() };
+				let mut params = if lite {
+					vec![u8::from(path.is_some())]
+				} else {
+					Vec::new()
+				};
 				if let Some(path) = path {
 					params.extend_from_slice(&[if lite { 2 } else { 1 }, path.len() as u8]);
 					params.extend_from_slice(path.as_bytes());
