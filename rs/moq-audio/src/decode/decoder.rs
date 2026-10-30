@@ -249,6 +249,83 @@ pub(crate) mod tests {
 		assert!(matches!(decoder.decode(&[0xFF; 3]), Err(Error::Decode(_))));
 	}
 
+	/// Stepped-frequency sines: a lost frame's content cannot be guessed from
+	/// its neighbors, so a recovered in-band copy must come measurably closer
+	/// to the original than concealment does.
+	fn stepped_sine_packets(fec: bool) -> Vec<bytes::Bytes> {
+		let mut config = crate::encode::Settings::new(48_000, Layout::Mono);
+		config.fec = fec;
+		let mut encoder = crate::encode::Encoder::new(&config).unwrap();
+		let frames = encoder.frame_size();
+		(1..=6)
+			.map(|step| {
+				let freq = 440.0 * step as f32;
+				let pcm: Vec<f32> = (0..frames)
+					.map(|n| (std::f32::consts::TAU * freq * n as f32 / 48_000.0).sin() * 0.5)
+					.collect();
+				encoder.encode(&pcm).unwrap().payload
+			})
+			.collect()
+	}
+
+	fn mono_catalog() -> hang::catalog::AudioConfig {
+		let head = moq_mux::codec::opus::Config::new(48_000, 1).encode().unwrap();
+		let mut catalog = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48_000, 1);
+		catalog.description = Some(head);
+		catalog
+	}
+
+	/// A lost packet comes back whole from the next packet's in-band copy,
+	/// closer to the original than concealment manages.
+	#[test]
+	fn opus_recover_uses_the_in_band_copy_of_the_lost_frame() {
+		let packets = stepped_sine_packets(true);
+		let mut clean = Decoder::new(&mono_catalog(), &Config::default()).unwrap();
+		let decoded: Vec<Vec<f32>> = packets
+			.iter()
+			.map(|packet| clean.decode(packet).unwrap().samples)
+			.collect();
+
+		// Lose the fourth of six; the fifth carries its in-band copy.
+		let mut recovered = Decoder::new(&mono_catalog(), &Config::default()).unwrap();
+		for packet in &packets[..3] {
+			recovered.decode(packet).unwrap();
+		}
+		let fec = recovered.recover(Some(&packets[4])).unwrap().samples;
+
+		let mut concealed = Decoder::new(&mono_catalog(), &Config::default()).unwrap();
+		for packet in &packets[..3] {
+			concealed.decode(packet).unwrap();
+		}
+		let plc = concealed.recover(None).unwrap().samples;
+
+		assert_eq!(fec.len(), decoded[3].len());
+		let mse = |a: &[f32], b: &[f32]| {
+			a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>() / a.len() as f32
+		};
+		assert!(
+			mse(&fec, &decoded[3]) * 2.0 < mse(&plc, &decoded[3]),
+			"the in-band copy should beat concealment against the original: fec={} plc={}",
+			mse(&fec, &decoded[3]),
+			mse(&plc, &decoded[3]),
+		);
+	}
+
+	/// Without a next packet there is nothing to recover from: the loss
+	/// conceals at the last packet's length, still active because the audio
+	/// around it was.
+	#[test]
+	fn opus_recover_without_a_next_packet_conceals() {
+		let packets = stepped_sine_packets(false);
+		let mut decoder = Decoder::new(&mono_catalog(), &Config::default()).unwrap();
+		for packet in &packets[..3] {
+			decoder.decode(packet).unwrap();
+		}
+		let concealed = decoder.recover(None).unwrap();
+		assert_eq!(concealed.samples.len(), 960);
+		assert!(!concealed.activity.is_dtx());
+	}
+
 	/// Real Opus: 20 ms packets of a continuous 440 Hz sine, mono, from libopus
 	/// with its 312-sample lookahead.
 	pub(crate) fn opus_packets(count: usize) -> Vec<bytes::Bytes> {
