@@ -1,5 +1,8 @@
 //! Encode raw PCM and publish it as a moq audio track.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::Bytes;
 
 use moq_mux::catalog::hang::CatalogExt;
@@ -51,6 +54,44 @@ pub struct Options {
 	/// across a pause or [`Producer::reanchor`] until the next write; use
 	/// [`Producer::discontinuity`] to close it when capture stops.
 	pub group_duration: std::time::Duration,
+	/// A live bitrate target the encode loop applies as frames flow.
+	///
+	/// [`Producer::set_bitrate`] needs `&mut Producer`, which the publish loop
+	/// owns; this handle is how something outside that loop — a congestion
+	/// controller running a rate policy — retunes the encoder anyway. `None`
+	/// (the default) keeps the configured bitrate fixed for the track's life.
+	/// Only meaningful for Opus; a fixed-rate codec ignores it.
+	pub bitrate_control: Option<BitrateControl>,
+}
+
+/// A shareable bitrate request for a running [`Producer`].
+///
+/// Clones observe and drive the same request. The request is advisory until
+/// the producer's next encode applies it, and a codec that rejects the retune
+/// (out of its range, or fixed-rate) simply keeps its current rate — retuning
+/// is never fatal to the stream.
+#[derive(Clone, Debug, Default)]
+pub struct BitrateControl(Arc<AtomicU64>);
+
+impl BitrateControl {
+	/// A control with no request pending.
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Request `bitrate` bits per second from the next encoded frame on.
+	/// `0` clears the request, leaving the encoder at its current rate.
+	pub fn set(&self, bitrate: u64) {
+		self.0.store(bitrate, Ordering::Relaxed);
+	}
+
+	/// The requested bitrate in bits per second, or `None` while no request is pending.
+	pub fn get(&self) -> Option<u64> {
+		match self.0.load(Ordering::Relaxed) {
+			0 => None,
+			bitrate => Some(bitrate),
+		}
+	}
 }
 
 impl Default for Options {
@@ -60,6 +101,7 @@ impl Default for Options {
 			config: Config::default(),
 			bandwidth: moq_net::bandwidth::Allocator::unlimited(),
 			group_duration: std::time::Duration::from_millis(20),
+			bitrate_control: None,
 		}
 	}
 }
@@ -99,6 +141,9 @@ pub struct Producer {
 	decoder_boundary: bool,
 	/// How the encoder classified the packet it published most recently.
 	activity: Activity,
+	/// A live bitrate request applied as frames are encoded, if the caller
+	/// brought one (see [`Options::bitrate_control`]).
+	bitrate_control: Option<BitrateControl>,
 }
 
 struct Terminal {
@@ -118,6 +163,7 @@ struct Terminal {
 /// subscribers see the broadcast without this rendition until it resolves.
 pub(crate) struct Reserved {
 	track: moq_mux::container::Producer<moq_mux::container::legacy::Wire, hang::catalog::AudioConfig>,
+	bitrate_control: Option<BitrateControl>,
 }
 
 impl Reserved {
@@ -144,7 +190,10 @@ impl Reserved {
 			None,
 		)?;
 
-		Ok(Self { track })
+		Ok(Self {
+			track,
+			bitrate_control: options.bitrate_control.clone(),
+		})
 	}
 
 	/// Build the encoder for `input` and register the rendition describing it.
@@ -203,6 +252,7 @@ impl Reserved {
 			pending_discontinuity: false,
 			decoder_boundary: true,
 			activity: Activity::Active,
+			bitrate_control: self.bitrate_control,
 		}
 	}
 }
@@ -394,6 +444,14 @@ impl Producer {
 	/// Encode and publish every full frame in `pending`, keeping any partial
 	/// trailing frame for the next call.
 	fn publish_full_frames(&mut self, anchor_us: u64) -> Result<(), Error> {
+		// Apply a pending bitrate request here, at the encode step, so it lands
+		// on the next frame regardless of which publish path brought it. A
+		// rejected retune leaves the encoder at its current rate.
+		if let Some(bitrate) = self.bitrate_control.as_ref().and_then(|control| control.get()) {
+			if bitrate != self.bitrate.as_bps() {
+				let _ = self.set_bitrate(moq_net::bandwidth::Rate::from_bps(bitrate));
+			}
+		}
 		let frame_samples = self.encoder()?.frame_size() * self.encoder()?.codec_channels() as usize;
 		while self.pending.len() >= frame_samples {
 			let chunk: Vec<f32> = self.pending.drain(..frame_samples).collect();
