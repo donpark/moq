@@ -1,10 +1,10 @@
-//! Opus through libopus 1.3.1, via [`unsafe_libopus`].
+//! Opus through libopus 1.6.1, via [`opusic_sys`] (vendored C, `bundled`).
 
 use bytes::Bytes;
-use unsafe_libopus::{
+use opusic_sys::{
 	OPUS_APPLICATION_AUDIO, OPUS_GET_BITRATE_REQUEST, OPUS_GET_LOOKAHEAD_REQUEST, OPUS_OK, OPUS_RESET_STATE,
 	OPUS_SET_BITRATE_REQUEST, OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
-	OpusEncoder, opus_encode_float, opus_encoder_create, opus_encoder_ctl_impl, opus_encoder_destroy, varargs,
+	OpusEncoder, opus_encode_float, opus_encoder_create, opus_encoder_ctl, opus_encoder_destroy,
 };
 
 use super::Backend;
@@ -105,7 +105,7 @@ impl Libopus {
 
 	fn set_ctl(&mut self, request: i32, value: i32, name: &'static str) -> Result<(), Error> {
 		// SAFETY: `inner` owns a live encoder and each request here expects one i32.
-		let rc = unsafe { opus_encoder_ctl_impl(self.inner, request, varargs![value]) };
+		let rc = unsafe { opus_encoder_ctl(self.inner, request, value) };
 		if rc != OPUS_OK {
 			return Err(opus::error(rc, name));
 		}
@@ -116,7 +116,7 @@ impl Libopus {
 		let mut value = 0;
 		// SAFETY: `inner` owns a live encoder and each request here expects one
 		// valid mutable i32 output.
-		let rc = unsafe { opus_encoder_ctl_impl(self.inner, request, varargs![&mut value]) };
+		let rc = unsafe { opus_encoder_ctl(self.inner, request, &mut value) };
 		if rc != OPUS_OK {
 			return Err(opus::error(rc, name));
 		}
@@ -147,7 +147,7 @@ impl Backend for Libopus {
 
 	fn reset(&mut self) {
 		// SAFETY: `inner` owns a live encoder and OPUS_RESET_STATE takes no arguments.
-		let rc = unsafe { opus_encoder_ctl_impl(self.inner, OPUS_RESET_STATE, varargs![]) };
+		let rc = unsafe { opus_encoder_ctl(self.inner, OPUS_RESET_STATE) };
 		debug_assert_eq!(rc, OPUS_OK, "OPUS_RESET_STATE failed with {rc}");
 	}
 
@@ -181,7 +181,7 @@ impl Drop for Libopus {
 
 #[cfg(test)]
 mod tests {
-	use unsafe_libopus::OPUS_GET_DTX_REQUEST;
+	use opusic_sys::OPUS_GET_DTX_REQUEST;
 
 	use super::*;
 

@@ -3,9 +3,9 @@
 //! Every stream goes through the multistream decoder, which is also how a
 //! family 0 (mono/stereo) stream decodes: one stream, coupled when stereo.
 
-use unsafe_libopus::{
+use opusic_sys::{
 	OPUS_OK, OPUS_RESET_STATE, OPUS_SET_GAIN_REQUEST, OpusMSDecoder, opus_multistream_decode_float,
-	opus_multistream_decoder_create, opus_multistream_decoder_ctl_impl, opus_multistream_decoder_destroy, varargs,
+	opus_multistream_decoder_create, opus_multistream_decoder_ctl, opus_multistream_decoder_destroy,
 };
 
 use super::Backend;
@@ -106,7 +106,7 @@ impl Libopus {
 		// Same Q7.8 dB units as OpusHead, and it survives OPUS_RESET_STATE.
 		// SAFETY: `inner` owns a live decoder and OPUS_SET_GAIN takes one i32.
 		let rc = unsafe {
-			opus_multistream_decoder_ctl_impl(decoder.inner, OPUS_SET_GAIN_REQUEST, varargs![head.output_gain as i32])
+			opus_multistream_decoder_ctl(decoder.inner, OPUS_SET_GAIN_REQUEST, head.output_gain as i32)
 		};
 		if rc != OPUS_OK {
 			return Err(opus::error(rc, "OPUS_SET_GAIN"));
@@ -250,7 +250,7 @@ impl Backend for Libopus {
 
 	fn reset(&mut self) -> Result<(), Error> {
 		// SAFETY: `inner` owns a live decoder and OPUS_RESET_STATE takes no arguments.
-		let rc = unsafe { opus_multistream_decoder_ctl_impl(self.inner, OPUS_RESET_STATE, varargs![]) };
+		let rc = unsafe { opus_multistream_decoder_ctl(self.inner, OPUS_RESET_STATE) };
 		if rc != OPUS_OK {
 			return Err(opus::error(rc, "OPUS_RESET_STATE"));
 		}
@@ -284,7 +284,7 @@ impl Drop for Libopus {
 
 #[cfg(test)]
 mod tests {
-	use unsafe_libopus::{
+	use opusic_sys::{
 		OPUS_APPLICATION_AUDIO, opus_multistream_encode_float, opus_multistream_encoder_destroy,
 		opus_multistream_surround_encoder_create,
 	};

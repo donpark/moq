@@ -5,7 +5,7 @@
 //! back the ids it takes. The turnkey entry point is
 //! [`encode::publish_capture`](crate::encode::publish_capture), which yields
 //! interleaved-`f32` PCM and publishes it as an encoded track; encoding stays on
-//! `unsafe-libopus`, so audio never touches ffmpeg.
+//! `opusic-sys`, so audio never touches ffmpeg.
 //!
 //! Both backends deliver buffers from a realtime callback through a bounded
 //! async channel that the on-demand capture loop awaits, so dropping the

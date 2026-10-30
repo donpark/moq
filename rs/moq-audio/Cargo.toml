@@ -68,7 +68,7 @@ aec = ["capture", "dep:sonora", "playback"]
 [dependencies]
 bytes = { workspace = true }
 # Pure-Rust cross-platform audio I/O. Optional: only the `capture` and
-# `playback` features need it. Encode stays on unsafe-libopus, so a build
+# `playback` features need it. Encode stays on opusic-sys, so a build
 # without either pulls no new dependency.
 cpal = { version = "0.18", optional = true }
 # The realtime SPSC channel between a caller thread and the audio callback: a
@@ -112,14 +112,13 @@ thiserror = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["rt", "macros", "sync", "time"] }
 # Only used by the device features, for stream-error logging.
 tracing = { workspace = true, optional = true }
-# Pure-Rust transpilation of libopus 1.3.1. No CMake toolchain, no C
-# linker hackery, and crucially still maintained, unlike the
-# `opus`/`audiopus_sys` combo which is stuck on a 5-year-old vendored
-# libopus that breaks under CMake 4 (RUSTSEC-2026-0150). Trade-off:
-# ~20% slower than the C version with intrinsics enabled, but for the
-# 20 ms Opus frames moq-audio publishes that's still well under any
-# real-time budget.
-unsafe-libopus = "0.2"
+# Maintained C bindings to libopus 1.6.1 (vendored source, `bundled` build
+# via cc — same toolchain the rest of the workspace already needs through
+# aws-lc-sys). The `dred` feature compiles Opus 1.5+ deep redundancy.
+# Replaces `unsafe-libopus` (c2rust transpile of libopus 1.3.1, unmaintained
+# since 2024-11): 1.6.1 adds DRED + deep PLC and fixes the CMake-4 build
+# breakage (RUSTSEC-2026-0150) that motivated the transpile.
+opusic-sys = { version = "0.7", features = ["dred"] }
 
 # macOS-only, and only pulled in by the `capture` feature (see above); a no-op on
 # other platforms. AVFoundation queries/requests the microphone TCC permission so
