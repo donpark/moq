@@ -30,11 +30,13 @@ pub(crate) trait Backend: Send + std::panic::UnwindSafe + std::panic::RefUnwindS
 	/// and [`layout`](Self::layout), untrimmed.
 	fn decode(&mut self, packet: &[u8]) -> Result<Decoded, Error>;
 
-	/// Recover one lost packet: the in-band forward error copy of the previous
-	/// frame `next` carries when it has one, concealment when it does not (and
-	/// when `next` is `None`). The recovered length is the last packet's, the
-	/// same assumption [`decode`](Self::decode)'s concealment path makes.
-	fn recover(&mut self, _next: Option<&[u8]>) -> Result<Decoded, Error> {
+	/// Recover one lost packet, `frames_to_next` frames before the arriving
+	/// packet `next` carries: the packet's in-band forward error copy for the
+	/// frame right before it, its deep redundancy (DRED) at that offset when
+	/// it carries any, or concealment. The recovered length is the last
+	/// packet's, the same assumption [`decode`](Self::decode)'s concealment
+	/// path makes. `frames_to_next` selects the source and the DRED offset.
+	fn recover(&mut self, _next: Option<&[u8]>, _frames_to_next: usize) -> Result<Decoded, Error> {
 		Err(Error::Unsupported("this backend cannot recover lost packets".into()))
 	}
 

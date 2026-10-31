@@ -126,13 +126,14 @@ impl Decoder {
 		Ok(decoded)
 	}
 
-	/// Recover one lost packet: the in-band forward error copy of the previous
-	/// frame `next` carries when it has one, concealment when it does not (and
-	/// when `next` is `None`). Recovery advances the decoder as if the lost
-	/// frame had decoded, so the arriving packet continues the stream instead of
-	/// starting over.
-	pub fn recover(&mut self, next: Option<&[u8]>) -> Result<Decoded, Error> {
-		let mut decoded = self.backend.recover(next)?;
+	/// Recover one lost packet, `frames_to_next` frames before the arriving
+	/// packet `next` carries: the packet's in-band forward error copy for the
+	/// frame right before it, its deep redundancy (DRED) at that offset when it
+	/// carries any, or concealment. Recovery advances the decoder as if the
+	/// lost frame had decoded, so the arriving packet continues the stream
+	/// instead of starting over.
+	pub fn recover(&mut self, next: Option<&[u8]>, frames_to_next: usize) -> Result<Decoded, Error> {
+		let mut decoded = self.backend.recover(next, frames_to_next)?;
 		let channels = self.backend.layout().channels() as usize;
 		let trim = self.delay_remaining.min(decoded.samples.len() / channels);
 		if trim > 0 {
@@ -252,9 +253,10 @@ pub(crate) mod tests {
 	/// Stepped-frequency sines: a lost frame's content cannot be guessed from
 	/// its neighbors, so a recovered in-band copy must come measurably closer
 	/// to the original than concealment does.
-	fn stepped_sine_packets(fec: bool) -> Vec<bytes::Bytes> {
+	fn stepped_sine_packets(fec: bool, dred: Option<std::time::Duration>) -> Vec<bytes::Bytes> {
 		let mut config = crate::encode::Settings::new(48_000, Layout::Mono);
 		config.fec = fec;
+		config.dred = dred;
 		let mut encoder = crate::encode::Encoder::new(&config).unwrap();
 		let frames = encoder.frame_size();
 		(1..=6)
@@ -279,7 +281,7 @@ pub(crate) mod tests {
 	/// closer to the original than concealment manages.
 	#[test]
 	fn opus_recover_uses_the_in_band_copy_of_the_lost_frame() {
-		let packets = stepped_sine_packets(true);
+		let packets = stepped_sine_packets(true, None);
 		let mut clean = Decoder::new(&mono_catalog(), &Config::default()).unwrap();
 		let decoded: Vec<Vec<f32>> = packets
 			.iter()
@@ -291,13 +293,13 @@ pub(crate) mod tests {
 		for packet in &packets[..3] {
 			recovered.decode(packet).unwrap();
 		}
-		let fec = recovered.recover(Some(&packets[4])).unwrap().samples;
+		let fec = recovered.recover(Some(&packets[4]), 1).unwrap().samples;
 
 		let mut concealed = Decoder::new(&mono_catalog(), &Config::default()).unwrap();
 		for packet in &packets[..3] {
 			concealed.decode(packet).unwrap();
 		}
-		let plc = concealed.recover(None).unwrap().samples;
+		let plc = concealed.recover(None, 1).unwrap().samples;
 
 		assert_eq!(fec.len(), decoded[3].len());
 		let mse = |a: &[f32], b: &[f32]| {
@@ -316,14 +318,76 @@ pub(crate) mod tests {
 	/// around it was.
 	#[test]
 	fn opus_recover_without_a_next_packet_conceals() {
-		let packets = stepped_sine_packets(false);
+		let packets = stepped_sine_packets(false, None);
 		let mut decoder = Decoder::new(&mono_catalog(), &Config::default()).unwrap();
 		for packet in &packets[..3] {
 			decoder.decode(packet).unwrap();
 		}
-		let concealed = decoder.recover(None).unwrap();
+		let concealed = decoder.recover(None, 1).unwrap();
 		assert_eq!(concealed.samples.len(), 960);
 		assert!(!concealed.activity.is_dtx());
+	}
+
+	/// Deep redundancy rebuilds a whole burst of losses from the arriving
+	/// packet, closer to the original than concealment manages.
+	#[test]
+	fn opus_dred_recovers_a_burst_of_lost_packets() {
+		let mut settings = crate::encode::Settings::new(48_000, Layout::Mono);
+		settings.fec = true;
+		settings.dred = Some(std::time::Duration::from_millis(120));
+		// DRED's chunk budget is rate-controlled (compute_dred_bitrate): below
+		// ~2 chunks affordable it drops to nothing. Pay for the depth.
+		settings.bitrate = Some(moq_net::bandwidth::Rate::from_bps(128_000));
+		let mut encoder = crate::encode::Encoder::new(&settings).unwrap();
+		let frames = encoder.frame_size();
+		// A long enough stream for the redundancy to reach full depth: DRED
+		// carries the past in 10 ms latent frames that build as the encoder runs.
+		let packets: Vec<bytes::Bytes> = (0..30)
+			.map(|step| {
+				// Stepped frequencies: a lost frame's content cannot be guessed
+				// from its neighbors, and a wrong DRED offset reconstructs a
+				// neighbor's frequency instead.
+				let freq = 440.0 * (1 + step % 6) as f32;
+				let pcm: Vec<f32> = (0..frames)
+					.map(|n| (std::f32::consts::TAU * freq * n as f32 / 48_000.0).sin() * 0.5)
+					.collect();
+				encoder.encode(&pcm).unwrap().payload
+			})
+			.collect();
+		let mut clean = Decoder::new(&mono_catalog(), &Config::default()).unwrap();
+		let decoded: Vec<Vec<f32>> = packets
+			.iter()
+			.map(|packet| clean.decode(packet).unwrap().samples)
+			.collect();
+
+		// Lose a three-frame burst deep in the stream (packets 20..23);
+		// packet 23 carries DRED for it.
+		let mut recovered = Decoder::new(&mono_catalog(), &Config::default()).unwrap();
+		let mut concealed = Decoder::new(&mono_catalog(), &Config::default()).unwrap();
+		for packet in &packets[..20] {
+			recovered.decode(packet).unwrap();
+			concealed.decode(packet).unwrap();
+		}
+		let mse = |a: &[f32], b: &[f32]| {
+			a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>() / a.len() as f32
+		};
+		let mut ratios = Vec::new();
+		for frames_to_next in (1..=3).rev() {
+			let dred = recovered.recover(Some(&packets[23]), frames_to_next).unwrap().samples;
+			let plc = concealed.recover(None, frames_to_next).unwrap().samples;
+			let lost = &decoded[23 - frames_to_next];
+			assert_eq!(dred.len(), lost.len());
+			ratios.push((frames_to_next, mse(&dred, lost), mse(&plc, lost)));
+		}
+		for (frames_to_next, dred, plc) in ratios {
+			// Measured on these tones: 1.1-1.8x, thinning with depth (the older
+			// latents are quantized coarser; the near frame rides LBRR). Strictly
+			// better at every depth is the wiring guarantee.
+			assert!(
+				dred < plc,
+				"DRED should beat concealment {frames_to_next} frames out: dred={dred} plc={plc}",
+			);
+		}
 	}
 
 	/// Real Opus: 20 ms packets of a continuous 440 Hz sine, mono, from libopus

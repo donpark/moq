@@ -145,6 +145,12 @@ pub struct Settings {
 	/// This is the knob upstream removed as "ineffective"; it works when the
 	/// encoder also gets an expected loss rate (see the libopus backend).
 	pub fec: bool,
+	/// Deep redundancy (DRED): each packet carries up to this much of the past
+	/// (`None`, the default, disables it), so a receiver can rebuild whole
+	/// bursts of lost packets instead of the one frame LBRR covers. Opus 1.5+
+	/// only, and the encoder pays for it in CPU (a DNN) and some bitrate;
+	/// the recovery side is [`recover`](crate::decode::Decoder::recover).
+	pub dred: Option<Duration>,
 	/// Encoded frame duration. Opus accepts 2.5 / 5 / 10 / 20 / 40 / 60 ms.
 	/// PCM accepts any duration containing a whole number of samples. AAC frames
 	/// are 1024 samples, so it accepts the duration that rounds to that at
@@ -165,6 +171,7 @@ impl Settings {
 			bitrate: None,
 			dtx: false,
 			fec: false,
+			dred: None,
 			frame_duration: Duration::from_millis(20),
 			kind: Kind::Auto,
 		}

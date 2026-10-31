@@ -3,7 +3,8 @@
 use bytes::Bytes;
 use opusic_sys::{
 	OPUS_APPLICATION_AUDIO, OPUS_GET_BITRATE_REQUEST, OPUS_GET_LOOKAHEAD_REQUEST, OPUS_OK, OPUS_RESET_STATE,
-	OPUS_SET_BITRATE_REQUEST, OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+	OPUS_SET_BITRATE_REQUEST, OPUS_SET_DRED_DURATION_REQUEST, OPUS_SET_DTX_REQUEST,
+	OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST,
 	OpusEncoder, opus_encode_float, opus_encoder_create, opus_encoder_ctl, opus_encoder_destroy,
 };
 
@@ -77,6 +78,11 @@ impl Libopus {
 			// at all, leaving the knob half-wired: the copy needs something to
 			// allocate against. 10% is the conservative speech default.
 			backend.set_ctl(OPUS_SET_PACKET_LOSS_PERC_REQUEST, 10, "OPUS_SET_PACKET_LOSS_PERC")?;
+		}
+		if let Some(dred) = settings.dred {
+			// DRED duration is in 10-ms frames; cap at the 1.2 s the codec carries.
+			let frames = dred.as_millis().div_ceil(10).clamp(1, 120) as i32;
+			backend.set_ctl(OPUS_SET_DRED_DURATION_REQUEST, frames, "OPUS_SET_DRED_DURATION")?;
 		}
 		backend.set_ctl(OPUS_SET_DTX_REQUEST, i32::from(settings.dtx), "OPUS_SET_DTX")?;
 

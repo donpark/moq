@@ -484,7 +484,8 @@ impl Consumer {
 		{
 			return Ok((frames, 0));
 		}
-		let Some(conceal_len) = self.decoder.conceal_len() else {
+		if self.decoder.conceal_len().is_none() {
+			// Only where the decoder can conceal at all.
 			return Ok((frames, 0));
 		};
 		let rate = self.decoder.sample_rate();
@@ -496,7 +497,7 @@ impl Consumer {
 		let mut covered = 0usize;
 		while covered < hole {
 			let remaining = hole - covered;
-			let decoded = self.decoder.recover((remaining <= conceal_len).then_some(next_packet))?;
+			let decoded = self.decoder.recover(Some(next_packet), remaining)?;
 			let activity = decoded.activity;
 			let mut samples = decoded.samples;
 			let mut length = samples.len() / channels;
