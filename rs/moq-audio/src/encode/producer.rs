@@ -12,6 +12,7 @@ use moq_net::Timestamp;
 
 use super::encoded::Encoded;
 use super::encoder::{Encoder, Input, Settings};
+use crate::parity;
 use crate::resample::{Remix, Resampler};
 use crate::{Activity, Error, Frame};
 
@@ -50,6 +51,14 @@ pub struct Options {
 	/// (the default) keeps the configured bitrate fixed for the track's life.
 	/// Only meaningful for Opus; a fixed-rate codec ignores it.
 	pub bitrate_control: Option<BitrateControl>,
+	/// Transport-layer parity window, in packets: publish a
+	/// [`parity::sidecar_name`] track carrying an XOR parity block over every
+	/// `window` encoded packets, so a subscriber that misses one packet of a
+	/// block rebuilds it exactly (docs/media-adaptation.md §D7.1 `transport`
+	/// mode). Codec-independent — it covers the encoded bytes, not codec state —
+	/// and is the redundancy that also spans holes longer than the codec's own
+	/// cover. `None` (the default) publishes no sidecar.
+	pub parity_window: Option<usize>,
 }
 
 /// A shareable bitrate request for a running [`Producer`].
@@ -89,6 +98,7 @@ impl Default for Options {
 			settings: Settings::default(),
 			bandwidth: moq_net::bandwidth::Allocator::unlimited(),
 			bitrate_control: None,
+			parity_window: None,
 		}
 	}
 }
@@ -102,6 +112,22 @@ impl Default for Options {
 /// The catalog rendition is registered at construction (not on first write), so
 /// a subscriber that opens the catalog before any frames arrive still sees the
 /// track.
+/// The parity sidecar of a track: its publisher plus the block accumulator.
+struct ParitySend {
+	track: moq_mux::container::Producer<moq_mux::container::legacy::Wire>,
+	writer: parity::Writer,
+}
+
+impl ParitySend {
+	/// Mark a break in the published timeline: pending block members straddle a
+	/// codec reset the receiver shows as a hole, which parity must not fill.
+	fn discontinuity(&mut self) -> Result<(), Error> {
+		self.writer.reset();
+		self.track.discontinuity()?;
+		Ok(())
+	}
+}
+
 pub struct Producer<E: CatalogExt = ()> {
 	encoder: Encoder,
 	input: Input,
@@ -129,6 +155,9 @@ pub struct Producer<E: CatalogExt = ()> {
 	/// A live bitrate request applied as frames are encoded, if the caller
 	/// brought one (see [`Options::bitrate_control`]).
 	bitrate_control: Option<BitrateControl>,
+	/// The parity sidecar, if the caller asked for one
+	/// (see [`Options::parity_window`]).
+	parity: Option<ParitySend>,
 }
 
 struct Terminal {
@@ -150,6 +179,7 @@ pub(crate) struct Reserved<E: CatalogExt = ()> {
 	track: moq_mux::container::Producer<moq_mux::container::legacy::Wire, hang::catalog::AudioConfig>,
 	_ext: std::marker::PhantomData<fn() -> E>,
 	bitrate_control: Option<BitrateControl>,
+	parity: Option<ParitySend>,
 }
 
 impl<E: CatalogExt> Reserved<E> {
@@ -176,8 +206,24 @@ impl<E: CatalogExt> Reserved<E> {
 			None,
 		)?;
 
+		let parity = match options.parity_window {
+			Some(window) => {
+				let name = parity::sidecar_name(track.name());
+				let track = broadcast.create_track(name, catalog.track_info(hang::catalog::PRIORITY.audio))?;
+				Some(ParitySend {
+					track: moq_mux::container::Producer::new(
+						track,
+						moq_mux::container::legacy::Wire(moq_mux::container::Kind::Data),
+					),
+					writer: parity::Writer::new(window),
+				})
+			}
+			None => None,
+		};
+
 		Ok(Self {
 			track,
+			parity,
 			_ext: std::marker::PhantomData,
 			bitrate_control: options.bitrate_control.clone(),
 		})
@@ -227,6 +273,7 @@ impl<E: CatalogExt> Reserved<E> {
 			resampler: registered.resampler,
 			track: self.track,
 			_ext: self._ext,
+			parity: self.parity,
 			pending: Vec::new(),
 			frames_produced: 0,
 			epoch_us: None,
@@ -380,6 +427,9 @@ impl<E: CatalogExt> Producer<E> {
 		}
 		if self.pending_discontinuity {
 			self.track.discontinuity()?;
+			if let Some(parity) = self.parity.as_mut() {
+				parity.discontinuity()?;
+			}
 			self.pending_discontinuity = false;
 			self.decoder_boundary = true;
 		}
@@ -430,7 +480,23 @@ impl<E: CatalogExt> Producer<E> {
 			)?;
 			self.frames_produced += self.encoder.frame_size() as u64;
 			self.activity = packet.activity;
+			// Parity covers the encoded bytes, so it is fed from the packet
+			// exactly as published.
+			let parity_payload = self.parity.as_ref().map(|_| packet.payload.clone());
 			Self::publish(&mut self.track, packet, timestamp)?;
+			if let (Some(parity), Some(payload)) = (self.parity.as_mut(), parity_payload) {
+				let stamp_us = u64::try_from(timestamp.as_micros()).unwrap_or_default();
+				if let Some(blob) = parity.writer.push(stamp_us, &payload) {
+					parity.track.write(MuxFrame {
+						timestamp,
+						payload: blob,
+						keyframe: true,
+						duration: None,
+					})?;
+					parity.track.cut(None)?;
+					parity.track.flush(timestamp, Instant::now())?;
+				}
+			}
 			self.decoder_boundary = false;
 		}
 
@@ -511,6 +577,9 @@ impl<E: CatalogExt> Producer<E> {
 	/// [`Producer::discontinuity`](moq_mux::container::Producer::discontinuity).
 	pub fn discontinuity(&mut self) -> Result<(), Error> {
 		self.track.discontinuity()?;
+		if let Some(parity) = self.parity.as_mut() {
+			parity.discontinuity()?;
+		}
 		self.pending_discontinuity = false;
 		self.decoder_boundary = true;
 		self.reset_state();
@@ -571,6 +640,9 @@ impl<E: CatalogExt> Producer<E> {
 			}
 		}
 
+		if let Some(parity) = self.parity.as_mut() {
+			parity.track.finish()?;
+		}
 		self.track.finish()?;
 		self.finished = true;
 		Ok(())
@@ -581,6 +653,9 @@ impl<E: CatalogExt> Producer<E> {
 	///
 	/// Consumes the producer. Still callable after [`finish`](Self::finish).
 	pub fn abort(self, err: moq_net::Error) {
+		if let Some(parity) = self.parity {
+			parity.track.abort(err.clone());
+		}
 		self.track.abort(err);
 	}
 }
@@ -1147,5 +1222,70 @@ mod tests {
 
 		let second = Producer::new(&mut broadcast, catalog, Input::default(), &Options::default()).unwrap();
 		assert_eq!(second.track_name(), "1.opus");
+	}
+
+	/// The parity sidecar covers exactly the encoded packets: a reader holding
+	/// every packet but one rebuilds the missing one from the sidecar alone.
+	#[tokio::test]
+	async fn parity_sidecar_covers_the_encoded_packets() {
+		let input = Input {
+			format: Format::F32,
+			sample_rate: 48_000,
+			layout: Layout::Mono,
+		};
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
+		let consumer = broadcast.consume();
+		let options = Options {
+			track: Some("audio".to_string()),
+			settings: Settings::new(48_000, Layout::Mono),
+			parity_window: Some(2),
+			..Options::default()
+		};
+		let mut producer = Producer::new(&mut broadcast, catalog, input.clone(), &options).unwrap();
+
+		let mut media = moq_mux::container::Consumer::new(
+			consumer
+				.track("audio")
+				.unwrap()
+				.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_secs(1)))
+				.await
+				.unwrap(),
+			moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Audio),
+		);
+		let mut sidecar = moq_mux::container::Consumer::new(
+			consumer
+				.track("audio.parity")
+				.unwrap()
+				.subscribe(moq_net::track::Subscription::default().with_max_age(Duration::from_secs(1)))
+				.await
+				.unwrap(),
+			moq_mux::container::legacy::Wire(moq_mux::container::Kind::Data),
+		);
+
+		// 4 × 960 samples is exactly four 20 ms packets at 48 kHz.
+		let samples = vec![0.25f32; 960 * 4];
+		let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+		producer.write(&Frame::new(data.into(), moq_net::Timestamp::ZERO)).unwrap();
+
+		let mut frames = Vec::new();
+		for _ in 0..4 {
+			frames.push(media.read().await.unwrap().expect("packet"));
+		}
+
+		// The sidecar closes a block every two packets, in publication order.
+		let mut reader = parity::Reader::new();
+		for _ in 0..2 {
+			let block = sidecar.read().await.unwrap().expect("parity block");
+			reader.offer(&block.payload);
+		}
+		let stamp = |frame: &moq_mux::container::Frame| u64::try_from(frame.timestamp.as_micros()).unwrap();
+		for frame in [&frames[0], &frames[2], &frames[3]] {
+			reader.record(stamp(frame), frame.payload.clone());
+		}
+		// Packet 1 is the one the reader never saw.
+		let rebuilt = reader.reconstruct_span(stamp(&frames[1]) - 1_000, stamp(&frames[1]) + 1_000);
+		assert_eq!(rebuilt, vec![(stamp(&frames[1]), frames[1].payload.clone())]);
 	}
 }

@@ -6,6 +6,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use super::decoder::{Config, Decoder};
+use crate::parity;
 use crate::resample::{Remix, Resampler};
 use crate::{Activity, Error, Format, Frame, Layout};
 
@@ -107,6 +108,12 @@ pub struct Consumer {
 	terminal_start: Option<moq_net::Timestamp>,
 	/// Last container playhead generation applied to timeline state.
 	discontinuity: u64,
+	/// The parity sidecar, when the publisher runs one ([`parity::sidecar_name`]).
+	parity: Option<moq_mux::container::Consumer<moq_mux::container::legacy::Wire>>,
+	/// Packets and parity blocks seen, for reconstruction.
+	parity_reader: parity::Reader,
+	/// Packets rebuilt from parity, decoded as if they had arrived in order.
+	pending_in: VecDeque<moq_mux::container::Frame>,
 }
 
 struct ActivitySpan {
@@ -186,9 +193,25 @@ impl Consumer {
 		let container = moq_mux::catalog::hang::Container::try_from(catalog)?;
 		let track = moq_mux::container::Consumer::new(track, container);
 
+		// The parity sidecar rides a companion track older publishers do not
+		// run; absent is simply redundancy off.
+		let parity = match broadcast.track(&parity::sidecar_name(&name)) {
+			Ok(track) => match track.subscribe(None).await {
+				Ok(subscriber) => Some(moq_mux::container::Consumer::new(
+					subscriber,
+					moq_mux::container::legacy::Wire(moq_mux::container::Kind::Data),
+				)),
+				Err(_) => None,
+			},
+			Err(_) => None,
+		};
+
 		Ok(Self {
 			decoder,
 			track,
+			parity,
+			parity_reader: parity::Reader::new(),
+			pending_in: VecDeque::new(),
 			resampler,
 			remix,
 			options,
@@ -255,11 +278,18 @@ impl Consumer {
 				return Ok(Some(frame));
 			}
 
-			let mux_frame = self.track.read().await?;
+			let mux_frame = match self.pending_in.pop_front() {
+				Some(frame) => Some(frame),
+				None => self.track.read().await?,
+			};
 			self.apply_discontinuity()?;
 			let Some(mux_frame) = mux_frame else {
 				return self.flush();
 			};
+			if self.parity.is_some() {
+				let stamp_us = u64::try_from(mux_frame.timestamp.as_micros()).unwrap_or_default();
+				self.parity_reader.record(stamp_us, mux_frame.payload.clone());
+			}
 
 			if let Some(end) = self.track.end()
 				&& self.end != Some(end)
@@ -280,6 +310,17 @@ impl Consumer {
 				&& let Some(next) = self.next_start
 				&& discontinuous(next, mux_frame.timestamp)
 			{
+				// Transport parity first: a rebuilt packet is the real bytes,
+				// better than any codec recovery. Re-inject what it covers ahead
+				// of the arriving packet and re-run detection over both: whatever
+				// parity cannot cover falls through to the codec path below, a
+				// sub-hole at a time.
+				let rebuilt = self.try_reconstruct(next, mux_frame.timestamp).await?;
+				if !rebuilt.is_empty() {
+					self.pending_in.extend(rebuilt);
+					self.pending_in.push_back(mux_frame);
+					continue;
+				}
 				// What the resampler held from before the hole belongs before
 				// anything recovered over it, and recovery reads the prediction
 				// history a reset clears: drain first, then recover.
@@ -401,6 +442,60 @@ impl Consumer {
 
 	/// A playhead event re-applies startup delay and skip. The decoder is not reset:
 	/// the next group already starts on a keyframe, and pre-skip is a play-path concern.
+	/// Rebuild the hole `next..arriving` from the parity sidecar.
+	///
+	/// Waits on the sidecar, not the clock: blocks close a window of packets
+	/// past the loss, and blocks cover disjoint windows in publication order,
+	/// so the first block stamped at or past the hole is the last one that can
+	/// hold its members. That wait is the parity block latency the transport
+	/// mode pays (docs/media-adaptation.md §D7.1). A publisher that dies
+	/// mid-hole holds this read, as it would the next media read.
+	async fn try_reconstruct(
+		&mut self,
+		next: moq_net::Timestamp,
+		arriving: moq_net::Timestamp,
+	) -> Result<Vec<moq_mux::container::Frame>, Error> {
+		let Some(parity) = self.parity.as_mut() else {
+			return Ok(Vec::new());
+		};
+		let from_us = u64::try_from(next.as_micros()).unwrap_or_default();
+		let to_us = u64::try_from(arriving.as_micros()).unwrap_or_default();
+
+		let rebuild = |reader: &mut parity::Reader| {
+			reader
+				.reconstruct_span(from_us, to_us)
+				.into_iter()
+				.map(|(stamp_us, payload)| {
+					Ok(moq_mux::container::Frame {
+						timestamp: moq_net::Timestamp::from_micros(stamp_us)?,
+						payload,
+						keyframe: false,
+						duration: None,
+					})
+				})
+				.collect::<Result<Vec<_>, Error>>()
+		};
+
+		let rebuilt = rebuild(&mut self.parity_reader)?;
+		if !rebuilt.is_empty() {
+			return Ok(rebuilt);
+		}
+		loop {
+			let frame = match parity.read().await {
+				Ok(Some(frame)) => frame,
+				// The sidecar ended or failed: what the reader holds is all
+				// there is, and the rebuild above already came up empty.
+				_ => return Ok(Vec::new()),
+			};
+			let past_hole = u64::try_from(frame.timestamp.as_micros()).unwrap_or_default() >= to_us;
+			self.parity_reader.offer(&frame.payload);
+			let rebuilt = rebuild(&mut self.parity_reader)?;
+			if !rebuilt.is_empty() || past_hole {
+				return Ok(rebuilt);
+			}
+		}
+	}
+
 	fn apply_discontinuity(&mut self) -> Result<(), Error> {
 		let discontinuity = self.track.discontinuity();
 		if discontinuity == self.discontinuity {
@@ -409,6 +504,8 @@ impl Consumer {
 
 		self.discontinuity = discontinuity;
 		self.next_start = None;
+		self.pending_in.clear();
+		self.parity_reader.reset();
 		self.spans.clear();
 		self.trailing = Activity::Active;
 		self.frames_decoded = 0;
@@ -1548,5 +1645,88 @@ mod tests {
 		assert_eq!(frame.timestamp.as_micros(), 0);
 		let samples = Format::F32.as_interleaved_f32(&frame.data, 2).unwrap();
 		assert_eq!(samples.len(), (960 - 312) * 2);
+	}
+
+	/// A packet lost in transit comes back byte-exact from the parity sidecar:
+	/// the hole closes before the codec path is consulted. The block covering
+	/// the loss closes a window past it, so the read waits on the sidecar — the
+	/// parity block latency the transport mode pays — and the timeline continues
+	/// without a gap.
+	#[tokio::test]
+	async fn parity_rebuilds_a_lost_packet() {
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		let parity_track = broadcast
+			.create_track("audio.parity", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		let subscriber = broadcast.consume();
+
+		let catalog = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Pcm, 48_000, 1);
+		let mut producer = moq_mux::container::Producer::new(
+			track,
+			moq_mux::catalog::hang::Container::Legacy(moq_mux::container::Kind::Audio),
+		);
+		let mut parity =
+			moq_mux::container::Producer::new(parity_track, moq_mux::container::legacy::Wire(moq_mux::container::Kind::Data));
+
+		let mut consumer = Consumer::new(
+			&subscriber,
+			&catalog,
+			"audio",
+			Options {
+				max_age: std::time::Duration::from_secs(1),
+				..Options::new()
+			},
+		)
+		.await
+		.unwrap();
+
+		// Five 1024-sample f32 packets, each filled with its own sample value.
+		// Packet 2 feeds the parity block but its media group is lost in transit.
+		const FRAMES: usize = 1024;
+		let payloads: Vec<Bytes> = (0..5u8)
+			.map(|packet| {
+				let sample = f32::from(packet).to_le_bytes();
+				Bytes::from(sample.repeat(FRAMES))
+			})
+			.collect();
+		let stamp = |packet: u64| Timestamp::from_scale(packet * FRAMES as u64, 48_000).unwrap();
+		let mut writer = crate::parity::Writer::new(2);
+		for packet in 0..5usize {
+			let blob = writer.push(
+				u64::try_from(stamp(packet as u64).as_micros()).unwrap(),
+				&payloads[packet],
+			);
+			if packet != 2 {
+				producer
+					.write(moq_mux::container::Frame {
+						timestamp: stamp(packet as u64),
+						payload: payloads[packet].clone(),
+						keyframe: true,
+						duration: None,
+					})
+					.unwrap();
+			}
+			if let Some(blob) = blob {
+				parity
+					.write(moq_mux::container::Frame {
+						timestamp: stamp(packet as u64),
+						payload: blob,
+						keyframe: true,
+						duration: None,
+					})
+					.unwrap();
+				parity.cut(None).unwrap();
+			}
+		}
+
+		// The lost packet comes out where it belonged, byte-exact, and the
+		// timeline never shows the hole (no gap, no concealment).
+		for expected in &payloads {
+			let frame = consumer.read().await.unwrap().expect("decoded frame");
+			assert_eq!(&frame.data, expected);
+		}
 	}
 }
