@@ -192,13 +192,12 @@ pipewire = { version = "0.10", optional = true }
 x11rb = { workspace = true, optional = true }
 zune-jpeg = { version = "0.5", optional = true }
 
-[target.'cfg(target_os="macos")'.dependencies]
+[target.'cfg(any(target_os="macos", target_os="ios"))'.dependencies]
 block2 = { workspace = true }
 dispatch2 = { workspace = true }
 objc2 = { workspace = true }
 objc2-av-foundation = { workspace = true }
 objc2-core-foundation = "0.3.2"
-objc2-core-graphics = { version = "0.3.2", features = ["CGDirectDisplay"] }
 objc2-core-media = { workspace = true }
 objc2-core-video = "0.3.2"
 objc2-foundation = { workspace = true }
@@ -206,8 +205,11 @@ objc2-foundation = { workspace = true }
 # import (CVMetalTextureCache aliases the decoder's IOSurface as a Metal texture,
 # which wgpu then adopts).
 objc2-metal = { version = "0.3.2", optional = true }
-objc2-screen-capture-kit = { workspace = true }
 objc2-video-toolbox = "0.3.2"
+
+[target.'cfg(target_os="macos")'.dependencies]
+objc2-core-graphics = { version = "0.3.2", features = ["CGDirectDisplay"] }
+objc2-screen-capture-kit = { workspace = true }
 
 [target.'cfg(target_os="windows")'.dependencies]
 # Native Media Foundation webcam capture + hardware H.264 encode (replaces

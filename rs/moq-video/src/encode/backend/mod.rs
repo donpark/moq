@@ -27,7 +27,7 @@ mod openh264;
 #[cfg(test)]
 pub(crate) mod probe;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod videotoolbox;
 
 #[cfg(target_os = "windows")]
@@ -126,7 +126,7 @@ struct Candidate {
 /// Hardware backends, in priority order. Platform-gated so only the ones that
 /// could plausibly work on this target are even listed.
 const HARDWARE: &[Candidate] = &[
-	#[cfg(target_os = "macos")]
+	#[cfg(any(target_os = "macos", target_os = "ios"))]
 	Candidate {
 		name: videotoolbox::NAME,
 		codecs: &[Codec::H264, Codec::H265],

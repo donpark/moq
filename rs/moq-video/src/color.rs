@@ -50,7 +50,7 @@ impl Color {
 	/// Only a surface whose pixel format spells out its range reaches this, which
 	/// is why it is macOS-only: CoreVideo's video-range and full-range NV12 name
 	/// theirs.
-	#[cfg(target_os = "macos")]
+	#[cfg(any(target_os = "macos", target_os = "ios"))]
 	pub(crate) fn with_range(self, limited: bool) -> Self {
 		match (self, limited) {
 			(Color::Bt601Limited | Color::Bt601Full, true) => Color::Bt601Limited,
@@ -151,7 +151,7 @@ mod tests {
 		assert_eq!(Color::infer(Size::new(1280, 720)), Color::Bt709Limited);
 	}
 
-	#[cfg(target_os = "macos")]
+	#[cfg(any(target_os = "macos", target_os = "ios"))]
 	#[test]
 	fn with_range_keeps_the_matrix() {
 		assert_eq!(Color::Bt709Limited.with_range(false), Color::Bt709Full);
