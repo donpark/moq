@@ -31,11 +31,12 @@ use objc2_core_video::{
 	kCVImageBufferYCbCrMatrix_ITU_R_709_2,
 };
 use objc2_video_toolbox::{
-	VTCompressionSession, VTEncodeInfoFlags, VTSessionSetProperty, kVTCompressionPropertyKey_AllowFrameReordering,
-	kVTCompressionPropertyKey_AverageBitRate, kVTCompressionPropertyKey_ColorPrimaries,
-	kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
-	kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
-	kVTCompressionPropertyKey_TransferFunction, kVTCompressionPropertyKey_YCbCrMatrix,
+	VTCompressionSession, VTEncodeInfoFlags, VTSessionCopyProperty, VTSessionSetProperty,
+	kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
+	kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_ExpectedFrameRate,
+	kVTCompressionPropertyKey_MaxKeyFrameInterval, kVTCompressionPropertyKey_ProfileLevel,
+	kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction,
+	kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, kVTCompressionPropertyKey_YCbCrMatrix,
 	kVTEncodeFrameOptionKey_ForceKeyFrame, kVTProfileLevel_H264_High_AutoLevel, kVTProfileLevel_HEVC_Main_AutoLevel,
 };
 
@@ -162,11 +163,14 @@ impl VideoToolbox {
 
 		let force_keyframe = force_keyframe_dict()?;
 
+		// VideoToolbox picks the hardware encoder by itself when it can (on iOS it is the only real-time
+		// H.264/HEVC path), but it can also hand back a software session; report which one we got.
 		tracing::info!(
 			encoder = NAME,
 			codec = ?config.codec,
 			width = config.width,
 			height = config.height,
+			hardware = ?uses_hardware(&session),
 			"opened video encoder"
 		);
 		let framerate_numerator = i32::try_from(config.framerate.numerator())
@@ -461,6 +465,29 @@ fn set_property(session: &VTCompressionSession, key: &CFString, value: &CFType) 
 		return Err(Error::Codec(anyhow::anyhow!("VTSessionSetProperty failed: {status}")));
 	}
 	Ok(())
+}
+
+/// Whether the session runs on the hardware encoder (`kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder`);
+/// `None` when the property is not available.
+fn uses_hardware(session: &VTCompressionSession) -> Option<bool> {
+	let mut value: *const c_void = ptr::null();
+	let status = unsafe {
+		VTSessionCopyProperty(
+			session,
+			kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+			None,
+			(&mut value as *mut *const c_void).cast(),
+		)
+	};
+	if status != 0 || value.is_null() {
+		return None;
+	}
+	let truthy = unsafe { kCFBooleanTrue }.map(|t| (t as *const _ as *const c_void) == value);
+	// The copy is owned by us: release it.
+	unsafe {
+		objc2_core_foundation::CFRetained::<objc2_core_foundation::CFType>::from_raw(NonNull::new(value as *mut _)?)
+	};
+	truthy
 }
 
 fn set_bool(session: &VTCompressionSession, key: &CFString, value: bool) -> Result<(), Error> {
