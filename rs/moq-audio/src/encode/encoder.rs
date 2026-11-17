@@ -38,6 +38,11 @@ pub enum Codec {
 	/// AAC-LC (`mp4a.40.2`), through the platform's encoder. A host without one
 	/// refuses it at construction.
 	Aac,
+	/// LiquidCodec, a neural speech codec: 24 kHz mono, 80 ms frames, about
+	/// 1.7 kbps. The application registers the implementation
+	/// ([`crate::external::register_liquid`]); without one it is refused at
+	/// construction.
+	Liquid,
 }
 
 impl Codec {
@@ -48,6 +53,7 @@ impl Codec {
 			Self::Opus => "opus",
 			Self::Pcm => "pcm",
 			Self::Aac => "aac",
+			Self::Liquid => "liquid",
 		}
 	}
 }
@@ -66,6 +72,7 @@ impl FromStr for Codec {
 			"opus" => Ok(Self::Opus),
 			"pcm" => Ok(Self::Pcm),
 			"aac" => Ok(Self::Aac),
+			"liquid" => Ok(Self::Liquid),
 			other => Err(Error::Unsupported(format!("unknown codec: {other}"))),
 		}
 	}
@@ -182,15 +189,22 @@ impl Settings {
 		let sample_rate = match codec {
 			Codec::Opus => opus::pick_rate(input.sample_rate),
 			Codec::Pcm | Codec::Aac => input.sample_rate,
+			Codec::Liquid => crate::external::liquid::SAMPLE_RATE,
 		};
 		let defaults = Self::new(sample_rate, input.layout);
 		let frame_duration = match codec {
 			Codec::Aac => aac_frame_duration(sample_rate),
+			Codec::Liquid => LIQUID_FRAME_DURATION,
 			Codec::Opus | Codec::Pcm => defaults.frame_duration,
+		};
+		let layout = match codec {
+			Codec::Liquid => Layout::Mono,
+			_ => defaults.layout,
 		};
 		Self {
 			codec,
 			frame_duration,
+			layout,
 			..defaults
 		}
 	}
@@ -247,6 +261,28 @@ impl Settings {
 				}
 				Ok(AAC_FRAME_SIZE)
 			}
+			Codec::Liquid => {
+				use crate::external::liquid;
+				if rate != liquid::SAMPLE_RATE || self.layout != Layout::Mono {
+					return Err(Error::Unsupported(format!(
+						"liquid is {} Hz mono (got {rate} Hz, {:?})",
+						liquid::SAMPLE_RATE,
+						self.layout
+					)));
+				}
+				if self.bitrate.is_some() || self.dtx || self.fec || self.dred.is_some() {
+					return Err(Error::Unsupported(
+						"liquid has a fixed bitrate and no DTX, FEC, or DRED; leave them unset".into(),
+					));
+				}
+				if self.frame_duration != LIQUID_FRAME_DURATION {
+					return Err(Error::Unsupported(format!(
+						"liquid frames are {LIQUID_FRAME_DURATION:?} (got {:?})",
+						self.frame_duration
+					)));
+				}
+				Ok(liquid::FRAME_SIZE)
+			}
 		}
 	}
 }
@@ -256,6 +292,9 @@ impl Default for Settings {
 		Self::new(48_000, Layout::Stereo)
 	}
 }
+
+/// One LiquidCodec frame.
+const LIQUID_FRAME_DURATION: Duration = Duration::from_millis(80);
 
 /// One AAC frame at `sample_rate`, to the nearest nanosecond.
 fn aac_frame_duration(sample_rate: u32) -> Duration {
@@ -363,7 +402,7 @@ impl Encoder {
 				Some(head)
 			}
 			Codec::Aac => Some(aac_config(settings)?.encode()),
-			Codec::Pcm => None,
+			Codec::Pcm | Codec::Liquid => None,
 		};
 
 		Ok(Self {
@@ -449,9 +488,9 @@ impl Encoder {
 	/// so nothing is folded. An AudioSpecificConfig has no such field, so each
 	/// AAC packet is stamped that much earlier and the priming lands before the
 	/// first input sample rather than delaying it.
-	pub(super) fn folded_delay(&self) -> usize {
+	pub(crate) fn folded_delay(&self) -> usize {
 		match self.settings.codec {
-			Codec::Aac => self.backend.delay(),
+			Codec::Aac | Codec::Liquid => self.backend.delay(),
 			Codec::Opus | Codec::Pcm => 0,
 		}
 	}
@@ -557,6 +596,7 @@ impl Encoder {
 				hang::catalog::AAC { profile: AAC_LC }.into(),
 				self.settings.bitrate.map(moq_net::bandwidth::Rate::as_bps),
 			),
+			Codec::Liquid => (hang::catalog::AudioCodec::Liquid, Some(self.backend.bitrate())),
 		};
 
 		let mut config = hang::catalog::AudioConfig::new(codec, rate, channels);

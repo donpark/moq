@@ -63,6 +63,7 @@ pub mod aec;
 pub mod capture;
 pub mod decode;
 pub mod encode;
+pub mod external;
 pub mod parity;
 
 #[cfg(feature = "playback")]

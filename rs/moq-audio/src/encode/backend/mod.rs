@@ -20,6 +20,7 @@ use super::encoder::{Codec, Kind, Settings};
 use crate::Error;
 
 mod libopus;
+mod liquid;
 mod pcm;
 
 #[cfg(test)]
@@ -83,6 +84,11 @@ const SOFTWARE: &[Candidate] = &[
 		name: pcm::NAME,
 		codecs: &[Codec::Pcm],
 		open: pcm::Pcm::open,
+	},
+	Candidate {
+		name: liquid::NAME,
+		codecs: &[Codec::Liquid],
+		open: liquid::Liquid::open,
 	},
 ];
 

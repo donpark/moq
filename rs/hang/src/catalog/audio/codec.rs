@@ -55,6 +55,12 @@ pub enum AudioCodec {
 	#[display("ec-3")]
 	Ec3,
 
+	/// LiquidCodec: a neural speech codec (24 kHz mono, 80 ms frames of 12
+	/// finite-scalar-quantized codes, about 1.7 kbps). The codec itself runs
+	/// outside this crate (an application-registered backend in moq-audio).
+	#[display("liquid")]
+	Liquid,
+
 	/// Unknown or unsupported codec with original string
 	#[display("{_0}")]
 	Unknown(String),
@@ -76,6 +82,8 @@ pub enum AudioCodecKind {
 	Mp3,
 	/// Uncompressed interleaved little-endian IEEE-754 binary32 PCM.
 	Pcm,
+	/// LiquidCodec neural speech codec.
+	Liquid,
 }
 
 impl AudioCodec {
@@ -87,6 +95,7 @@ impl AudioCodec {
 			Self::Pcm => AudioCodecKind::Pcm,
 			Self::Flac => AudioCodecKind::Flac,
 			Self::Mp3 => AudioCodecKind::Mp3,
+			Self::Liquid => AudioCodecKind::Liquid,
 			// Legacy TS-bridge codecs aren't WebCodecs-decodable, so they share the
 			// coarse Unknown family for tag-only matching.
 			Self::Mp2 | Self::Ac3 | Self::Ec3 | Self::Unknown(_) => AudioCodecKind::Unknown,
@@ -108,6 +117,8 @@ impl FromStr for AudioCodec {
 			return Ok(Self::Flac);
 		} else if s == "mp3" {
 			return Ok(Self::Mp3);
+		} else if s == "liquid" {
+			return Ok(Self::Liquid);
 		} else if s == "mp2" {
 			return Ok(Self::Mp2);
 		} else if s == "ac-3" {
@@ -123,6 +134,14 @@ impl FromStr for AudioCodec {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn liquid_roundtrip() {
+		let codec = AudioCodec::from_str("liquid").unwrap();
+		assert_eq!(codec, AudioCodec::Liquid);
+		assert_eq!(codec.to_string(), "liquid");
+		assert_eq!(codec.kind(), AudioCodecKind::Liquid);
+	}
 
 	#[test]
 	fn flac_roundtrip() {

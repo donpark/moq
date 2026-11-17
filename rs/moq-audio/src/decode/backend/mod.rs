@@ -18,6 +18,7 @@ use super::decoder::{Config, Kind};
 use crate::{Error, Layout};
 
 mod libopus;
+mod liquid;
 mod pcm;
 #[cfg(feature = "aac")]
 mod symphonia;
@@ -89,6 +90,11 @@ const SOFTWARE: &[Candidate] = &[
 		supports: |codec| matches!(codec, AudioCodec::Pcm),
 		open: pcm::Pcm::open,
 	},
+	Candidate {
+		name: liquid::NAME,
+		supports: |codec| matches!(codec, AudioCodec::Liquid),
+		open: liquid::Liquid::open,
+	},
 	// Claims every AAC profile and refuses at open what it can't decode: the
 	// profile that matters is the description's, which the catalog string can
 	// contradict.
@@ -106,6 +112,7 @@ fn codec_name(codec: &AudioCodec) -> Option<&'static str> {
 		AudioCodec::Opus => Some("opus"),
 		AudioCodec::Pcm => Some("pcm"),
 		AudioCodec::AAC(_) => Some("aac"),
+		AudioCodec::Liquid => Some("liquid"),
 		_ => None,
 	}
 }
