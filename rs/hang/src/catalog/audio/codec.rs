@@ -55,6 +55,12 @@ pub enum AudioCodec {
 	#[display("ec-3")]
 	Ec3,
 
+	/// LiquidCodec: a neural speech codec (24 kHz mono, 80 ms frames of 12
+	/// finite-scalar-quantized codes, about 1.7 kbps). The codec itself runs
+	/// outside this crate (an application-registered backend in moq-audio).
+	#[display("liquid")]
+	Liquid,
+
 	/// Unknown or unsupported codec with original string
 	#[display("{_0}")]
 	Unknown(String),
@@ -81,6 +87,8 @@ pub enum AudioCodecKind {
 	Ac3 = 6,
 	/// Dolby Digital Plus (E-AC-3).
 	Ec3 = 7,
+	/// LiquidCodec neural speech codec.
+	Liquid = 8,
 }
 
 impl AudioCodec {
@@ -95,6 +103,7 @@ impl AudioCodec {
 			// A decoder for one doesn't play the other, so selection must tell them apart.
 			Self::Ac3 => AudioCodecKind::Ac3,
 			Self::Ec3 => AudioCodecKind::Ec3,
+			Self::Liquid => AudioCodecKind::Liquid,
 			Self::Mp2 | Self::Unknown(_) => AudioCodecKind::Unknown,
 		}
 	}
@@ -114,6 +123,8 @@ impl FromStr for AudioCodec {
 			return Ok(Self::Flac);
 		} else if s == "mp3" {
 			return Ok(Self::Mp3);
+		} else if s == "liquid" {
+			return Ok(Self::Liquid);
 		} else if s == "mp2" {
 			return Ok(Self::Mp2);
 		} else if s == "ac-3" {

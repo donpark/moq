@@ -79,6 +79,7 @@ pub mod bus;
 pub mod capture;
 pub mod decode;
 pub mod encode;
+pub mod external;
 
 #[cfg(feature = "playback")]
 pub mod playback;

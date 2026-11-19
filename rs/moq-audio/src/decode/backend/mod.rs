@@ -21,6 +21,7 @@ use crate::{Error, Layout};
 mod conformance;
 
 mod libopus;
+mod liquid;
 mod pcm;
 mod symphonia;
 
@@ -84,6 +85,11 @@ const SOFTWARE: &[Candidate] = &[
 		name: pcm::NAME,
 		supports: |codec| matches!(codec, AudioCodec::Pcm),
 		open: pcm::Pcm::open,
+	},
+	Candidate {
+		name: liquid::NAME,
+		supports: |codec| matches!(codec, AudioCodec::Liquid),
+		open: liquid::Liquid::open,
 	},
 	// Claims every AAC profile and refuses at open what it can't decode: the
 	// profile that matters is the description's, which the catalog string can
