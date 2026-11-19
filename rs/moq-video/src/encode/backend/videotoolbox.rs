@@ -48,7 +48,8 @@ use objc2_core_video::{
 	kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_2020,
 };
 use objc2_video_toolbox::{
-	VTCompressionSession, VTEncodeInfoFlags, VTSessionCopySupportedPropertyDictionary, VTSessionSetProperty,
+	VTCompressionSession, VTEncodeInfoFlags, VTSessionCopyProperty, VTSessionCopySupportedPropertyDictionary,
+	VTSessionSetProperty, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
 	kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
 	kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_DataRateLimits,
 	kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
@@ -244,11 +245,14 @@ impl VideoToolbox {
 
 		let force_keyframe = force_keyframe_dict()?;
 
+		// VideoToolbox picks the hardware encoder by itself when it can (on iOS it is the only real-time
+		// H.264/HEVC path), but it can also hand back a software session; report which one we got.
 		tracing::info!(
 			encoder = NAME,
 			codec = ?config.codec,
 			width = config.width,
 			height = config.height,
+			hardware = ?uses_hardware(&session),
 			"opened video encoder"
 		);
 		let framerate_numerator = i32::try_from(config.framerate.numerator())
@@ -599,6 +603,30 @@ fn set_property(session: &VTCompressionSession, key: &CFString, value: &CFType) 
 		return Err(Error::codec(anyhow::anyhow!("VTSessionSetProperty failed: {status}")));
 	}
 	Ok(())
+}
+
+/// Whether the session runs on the hardware encoder
+/// (`kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder`); `None` when the property is not available.
+fn uses_hardware(session: &VTCompressionSession) -> Option<bool> {
+	let mut value: *const c_void = ptr::null();
+	// SAFETY: the out-pointer is a valid `*const c_void` slot, and the key is a static CFString.
+	let status = unsafe {
+		VTSessionCopyProperty(
+			session,
+			kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+			None,
+			(&mut value as *mut *const c_void).cast(),
+		)
+	};
+	if status != 0 || value.is_null() {
+		return None;
+	}
+	// SAFETY: a successful copy hands us a +1 reference, released when `owned` drops.
+	let owned = unsafe { CFRetained::<CFType>::from_raw(NonNull::new(value as *mut CFType)?) };
+	// SAFETY: reading a static CoreFoundation constant.
+	let truthy = unsafe { kCFBooleanTrue }.map(|t| ptr::eq((t as *const _) as *const c_void, value));
+	drop(owned);
+	truthy
 }
 
 fn set_bool(session: &VTCompressionSession, key: &CFString, value: bool) -> Result<(), Error> {
