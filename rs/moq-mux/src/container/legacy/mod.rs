@@ -116,6 +116,11 @@ impl Audio {
 			// AAC-LC codes 1024 samples per packet. SBR and PS packets decode to twice that, at a
 			// rate the catalog may or may not double, so they state nothing here.
 			hang::catalog::AudioCodec::AAC(aac) if aac.profile == 2 => Packets::Fixed { samples: 1024, rate },
+			// LiquidCodec codes one 80 ms frame per packet.
+			hang::catalog::AudioCodec::Liquid => Packets::Fixed {
+				samples: rate.checked_mul(2)? / 25,
+				rate,
+			},
 			hang::catalog::AudioCodec::Pcm => Packets::Pcm {
 				frame_bytes: config.channel_count.checked_mul(4).filter(|bytes| *bytes > 0)?,
 				rate,
