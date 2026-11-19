@@ -1244,6 +1244,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4243,6 +4252,7 @@ dependencies = [
  "objc2-core-media",
  "objc2-foundation 0.3.2",
  "objc2-screen-capture-kit",
+ "opusic-sys",
  "perf-event2",
  "rand 0.10.3",
  "ringbuf",
@@ -4255,7 +4265,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
- "unsafe-libopus",
  "workspace-hack",
 ]
 
@@ -6150,6 +6159,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aca39cf52b03268400c16eeb9b56382ea3c3353409309b63f5c8f0b1faf42754"
 dependencies = [
  "pastey",
+]
+
+[[package]]
+name = "opusic-sys"
+version = "0.7.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "986d749e9dc12035f11bf3ecc83a2a696ff7534d4143be9469a4a0faa25b9fd1"
+dependencies = [
+ "cmake",
 ]
 
 [[package]]
@@ -9591,17 +9609,6 @@ dependencies = [
  "textwrap",
  "uniffi_meta 0.32.2 (git+https://github.com/kixelated/uniffi-rs?rev=35209f3)",
  "weedle2 5.0.0 (git+https://github.com/kixelated/uniffi-rs?rev=35209f3)",
-]
-
-[[package]]
-name = "unsafe-libopus"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c757408e7256c910343c7b215c8c8b878948630eecc774baabcca0972376eb73"
-dependencies = [
- "arrayref",
- "num-complex",
- "num-traits",
 ]
 
 [[package]]

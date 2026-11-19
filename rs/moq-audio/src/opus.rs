@@ -76,7 +76,7 @@ pub(crate) fn frame_size(sample_rate: u32, duration: Duration) -> Result<usize, 
 pub(crate) fn error(code: i32, context: &str) -> Error {
 	let message = format!("libopus {context} failed (code {code})");
 	match code {
-		unsafe_libopus::OPUS_BAD_ARG | unsafe_libopus::OPUS_UNIMPLEMENTED => Error::Unsupported(message),
+		opusic_sys::OPUS_BAD_ARG | opusic_sys::OPUS_UNIMPLEMENTED => Error::Unsupported(message),
 		_ => Error::Codec(message),
 	}
 }
@@ -86,7 +86,7 @@ pub(crate) fn error(code: i32, context: &str) -> Error {
 /// Only a rejected packet is the stream's problem and worth skipping; the rest
 /// mean we handed libopus something wrong, which no later packet fixes.
 pub(crate) fn decode_error(code: i32) -> Error {
-	if code == unsafe_libopus::OPUS_INVALID_PACKET {
+	if code == opusic_sys::OPUS_INVALID_PACKET {
 		return Error::Decode(format!("libopus rejected the packet (code {code})"));
 	}
 	error(code, "opus_multistream_decode_float")
@@ -155,7 +155,7 @@ fn self_delimited(data: &[u8]) -> Option<(bool, usize)> {
 	if data.is_empty() {
 		return None;
 	}
-	let framesize = unsafe { unsafe_libopus::opus_packet_get_samples_per_frame(data.as_ptr(), 48_000) };
+	let framesize = unsafe { opusic_sys::opus_packet_get_samples_per_frame(data.as_ptr(), 48_000) };
 	if framesize <= 0 {
 		return None;
 	}
@@ -308,7 +308,7 @@ fn frame_sizes(packet: &[u8]) -> Option<([i16; 48], usize)> {
 	// it writes by that. Passing null for the TOC and frame pointers asks it to
 	// skip them, which it checks for; only `size` is required.
 	let count = unsafe {
-		unsafe_libopus::opus_packet_parse(
+		opusic_sys::opus_packet_parse(
 			packet.as_ptr(),
 			len,
 			std::ptr::null_mut(),
@@ -341,16 +341,16 @@ mod tests {
 	#[test]
 	fn only_argument_failures_are_unsupported() {
 		assert!(matches!(
-			error(unsafe_libopus::OPUS_BAD_ARG, "ctx"),
+			error(opusic_sys::OPUS_BAD_ARG, "ctx"),
 			Error::Unsupported(_)
 		));
 		assert!(matches!(
-			error(unsafe_libopus::OPUS_UNIMPLEMENTED, "ctx"),
+			error(opusic_sys::OPUS_UNIMPLEMENTED, "ctx"),
 			Error::Unsupported(_)
 		));
-		assert!(matches!(error(unsafe_libopus::OPUS_ALLOC_FAIL, "ctx"), Error::Codec(_)));
+		assert!(matches!(error(opusic_sys::OPUS_ALLOC_FAIL, "ctx"), Error::Codec(_)));
 		assert!(matches!(
-			error(unsafe_libopus::OPUS_INTERNAL_ERROR, "ctx"),
+			error(opusic_sys::OPUS_INTERNAL_ERROR, "ctx"),
 			Error::Codec(_)
 		));
 	}
