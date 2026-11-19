@@ -340,19 +340,13 @@ mod tests {
 
 	#[test]
 	fn only_argument_failures_are_unsupported() {
-		assert!(matches!(
-			error(opusic_sys::OPUS_BAD_ARG, "ctx"),
-			Error::Unsupported(_)
-		));
+		assert!(matches!(error(opusic_sys::OPUS_BAD_ARG, "ctx"), Error::Unsupported(_)));
 		assert!(matches!(
 			error(opusic_sys::OPUS_UNIMPLEMENTED, "ctx"),
 			Error::Unsupported(_)
 		));
 		assert!(matches!(error(opusic_sys::OPUS_ALLOC_FAIL, "ctx"), Error::Codec(_)));
-		assert!(matches!(
-			error(opusic_sys::OPUS_INTERNAL_ERROR, "ctx"),
-			Error::Codec(_)
-		));
+		assert!(matches!(error(opusic_sys::OPUS_INTERNAL_ERROR, "ctx"), Error::Codec(_)));
 	}
 
 	#[test]

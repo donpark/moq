@@ -11,6 +11,7 @@ use bytes::Bytes;
 
 use super::backpressure::{self, Backpressure};
 use super::decoder::{Config, Decoder};
+use super::recovery::{Losses, Recovery};
 use crate::jitter::{self, Target};
 use crate::resample::{Remix, Resampler};
 use crate::{Activity, Error, Format, Frame, Layout};
@@ -93,6 +94,16 @@ pub struct Options {
 	pub estimate: bool,
 	/// Initial cached-group policy.
 	pub start: Start,
+	/// Rebuild lost packets the codec can, from the redundancy later packets carry, rather
+	/// than report each hole as a [`Read::Gap`]. `None` (the default) leaves it to the codec:
+	/// LiquidCodec recovers, Opus does not. `Some(true)` on a codec without
+	/// [`Decoder::recovery`] changes nothing.
+	///
+	/// A recovering consumer holds at least the codec's [`Recovery::lookahead`] of playout
+	/// delay, fills a hole up to [`Recovery::max_burst`] with rebuilt or concealed audio once
+	/// the packet after it arrives, and counts what it filled in [`Consumer::losses`]. A
+	/// longer hole is still a gap.
+	pub recover: Option<bool>,
 }
 
 impl Default for Options {
@@ -103,6 +114,7 @@ impl Default for Options {
 			delay: Delay::default(),
 			estimate: true,
 			start: Start::default(),
+			recover: None,
 		}
 	}
 }
@@ -190,6 +202,13 @@ pub struct Consumer {
 	frame: Duration,
 	/// The group of the latest end read, until a later group or a loss arrives.
 	declared: Option<u64>,
+	/// How the codec recovers lost packets, when this consumer recovers.
+	recovery: Option<Recovery>,
+	/// A loss the container reported, held until the packet after it shows whether
+	/// recovery bridges it.
+	deferred: Option<(moq_net::Timestamp, moq_net::Timestamp)>,
+	/// What recovery filled in so far.
+	losses: Losses,
 }
 
 struct ActivitySpan {
@@ -232,7 +251,13 @@ impl Consumer {
 
 		let name = name.into();
 		let warmup = catalog.warmup.unwrap_or_default().min(moq_mux::container::DELAY_MAX);
-		let target = Target::new(options.delay.min.unwrap_or_default(), options.estimate, catalog.jitter);
+		let recovery = decoder
+			.recovery()
+			.filter(|recovery| options.recover.unwrap_or(recovery.by_default));
+		// A recovering codec needs the packet after a loss before the lost one plays.
+		let min = options.delay.min.unwrap_or_default();
+		let min = recovery.map_or(min, |recovery| min.max(recovery.lookahead));
+		let target = Target::new(min, options.estimate, catalog.jitter);
 		// The subscription states the playout delay as its min from the start, the estimate's cold
 		// start included: the container places an unfloored start and waits a missing group out
 		// by it (see `next`).
@@ -320,6 +345,9 @@ impl Consumer {
 			boundary: None,
 			frame: Duration::ZERO,
 			declared: None,
+			recovery,
+			deferred: None,
+			losses: Losses::default(),
 		})
 	}
 
@@ -392,6 +420,13 @@ impl Consumer {
 		self.arrived
 	}
 
+	/// What loss recovery filled in so far: packets rebuilt from later ones, packets
+	/// concealed, and holes too long to bridge. All zero unless this consumer recovers
+	/// (see [`Options::recover`]).
+	pub fn losses(&self) -> Losses {
+		self.losses
+	}
+
 	/// Read decoded PCM or a track boundary, or `None` when the track ends.
 	///
 	/// [`Frame::activity`] reports whether the packet these samples came from
@@ -427,7 +462,17 @@ impl Consumer {
 					(frame, first && self.track.is_skipped(0..group))
 				}
 				// Behind whatever the resampler held from before the loss.
+				// A recovering codec may bridge the loss once the packet after it arrives,
+				// so it waits for that packet before it becomes a gap.
+				Some(Encoded::Gap { timestamp, duration })
+					if self.recovery.is_some() && self.end.is_none() && self.next_start.is_some() =>
+				{
+					self.started = true;
+					self.deferred.get_or_insert((timestamp, duration));
+					continue;
+				}
 				Some(Encoded::Gap { timestamp, duration }) => {
+					self.flush_deferred()?;
 					self.boundary = Some(Duration::try_from(timestamp)?);
 					self.started = true;
 					// Groups lost past a declared end were the fresh encoder's, so the packet
@@ -446,6 +491,7 @@ impl Consumer {
 				// after the end, starting before it, once a fresh encoder or the track's end
 				// drains it.
 				Some(Encoded::End { group, end }) => {
+					self.flush_deferred()?;
 					self.boundary = Some(Duration::try_from(end)?);
 					self.end = Some(end);
 					self.end_group = group;
@@ -454,7 +500,13 @@ impl Consumer {
 					self.ready.push_back(Read::End { end });
 					continue;
 				}
-				None => return Ok(self.flush()?.map(Read::Frame)),
+				None => {
+					if self.deferred.is_some() {
+						self.flush_deferred()?;
+						continue;
+					}
+					return Ok(self.flush()?.map(Read::Frame));
+				}
 			};
 
 			let timestamp = mux_frame.timestamp;
@@ -466,10 +518,15 @@ impl Consumer {
 			// Skipped once an end marker arrives, because from there the terminal
 			// phase reconstructs each batch's time from the marker rather than
 			// reading it off the packet, so there is nothing left to compare.
+			let deferred = self.deferred.take();
 			if self.end.is_none()
 				&& let Some(next) = self.next_start
 				&& discontinuous(next, timestamp)?
+				&& !self.bridge(next, timestamp, &mux_frame.payload)?
 			{
+				if self.recovery.is_some() || deferred.is_some() {
+					self.losses.gaps += 1;
+				}
 				if let Some(frame) = self.gap()? {
 					self.ready.push_back(Read::Frame(frame));
 				}
@@ -485,141 +542,200 @@ impl Consumer {
 				});
 			}
 
-			let rate = self.decoder.sample_rate();
-			let epoch = *self.epoch.get_or_insert(mux_frame.timestamp);
 			let delay = self.decoder.delay_remaining();
 			self.decoder.decode(&mux_frame.payload)?;
-			// Each packet is placed by its own samples, which a decoder that holds or splits
-			// its output would hand back somewhere else.
-			let contract = |name: &str| {
-				Error::Codec(format!(
-					"{name} did not ready exactly one output for one packet, and playback places exactly one"
-				))
-			};
-			let Some(decoded) = self.decoder.receive()? else {
-				return Err(contract(self.decoder.name()));
-			};
-			if self.decoder.receive()?.is_some() {
-				return Err(contract(self.decoder.name()));
-			}
-			// Anchored only once a packet decodes: a refused one primed nothing. The track's
-			// first packet has no history to warm up from: the codec's pre-skip, trimmed by
-			// the decoder, is all the priming its encoder declared.
-			if std::mem::take(&mut self.warmup_pending) && !track_start {
-				let warmup = self.warmup.saturating_sub(self.primed);
-				if !warmup.is_zero() {
-					let warmup = moq_net::Timestamp::try_from(warmup)?
-						.convert(timestamp.scale().ok_or(moq_net::TimeOverflow)?)?;
-					self.warmup_until = Some(timestamp.checked_add(warmup)?);
-				}
-			}
-			// Codec delay trimmed off the front is media this packet covered even
-			// though no samples came out, so it still moves the packet after it along.
-			let trimmed = delay - self.decoder.delay_remaining();
-			self.delay_trimmed += trimmed;
-			let activity = decoded.activity;
-			let mut decoded = decoded.samples;
-			// The packet's duration as the codec states it, never read off the
-			// timestamps: those carry every tune-in and hole along with the spacing.
-			let covered = decoded.len() / self.decoder.layout().channels() as usize + trimmed;
-			if covered > 0 {
-				self.target.set_frame(covered as f64 * 1000.0 / rate as f64);
-				self.frame = Duration::from_secs_f64(covered as f64 / rate as f64);
-				self.primed = self.primed.saturating_add(self.frame).min(self.warmup);
-			}
-			if let Some(end) = self.end {
-				let terminal_start = *self
-					.terminal_start
-					.get_or_insert(later(rewind(mux_frame.timestamp, self.delay_trimmed, rate)?, epoch));
-				let total = frames_between(terminal_start, end, rate)?;
-				let remaining = total.saturating_sub(self.frames_decoded);
-				decoded.truncate(remaining.saturating_mul(self.decoder.layout().channels() as usize));
-			}
+			self.place(timestamp, delay, track_start)?;
+		}
+	}
 
-			let frames = decoded.len() / self.decoder.layout().channels() as usize;
-			let decoded_at = if let Some(terminal_start) = self.terminal_start {
-				advance(terminal_start, self.frames_decoded, rate)?
-			} else {
-				// The codec delay is padding before the epoch, not a hole after the
-				// first short frame. Keep later output contiguous by moving it back over
-				// everything trimmed since this decoder epoch began.
-				later(rewind(mux_frame.timestamp, self.delay_trimmed, rate)?, epoch)
-			};
-			if self.end.is_some() {
-				self.frames_decoded += frames;
-			}
-			// Packet continuity stays on the encoded timeline. `decoded_at` may be
-			// earlier because codec pre-skip is padding before the decoded epoch.
-			self.next_start = Some(advance(mux_frame.timestamp, frames + trimmed, rate)?);
-			if decoded.is_empty() {
-				continue;
-			}
-
-			if self.resampler.is_none() && rate != self.resolved_sample_rate {
-				// A decoded frame pays for the channel count. Bound the input
-				// window in frames, and its duration at low rates, so neither
-				// side's allocation grows with a catalog's rate declaration.
-				let chunk_frames = (rate as usize / 50).clamp(1, 960);
-				self.resampler = Some(Resampler::new(
-					rate,
-					self.resolved_sample_rate,
-					self.decoder.layout().channels(),
-					chunk_frames,
-				)?);
-			}
-
-			let (pcm, timestamp) = match self.resampler.as_mut() {
-				// The resampler works in fixed chunks, so it holds back whatever didn't
-				// fill one. What comes out next starts with those held-back samples, which
-				// arrived before this packet did, so it is stamped where they arrived.
-				// Reading that off this packet instead would place the audio late by up to
-				// a chunk, sawtoothing A/V sync, and drag it the whole way whenever the
-				// source jumps forward without declaring a hole.
-				Some(r) => {
-					let held = if r.pending_frames() == 0 {
-						decoded_at
-					} else {
-						r.held_at().unwrap_or(decoded_at)
-					};
-					let timestamp = r.output_at(held)?;
-					let pcm = r.process(&decoded, decoded_at)?;
-					(pcm, timestamp)
-				}
-				None => (decoded, decoded_at),
-			};
-
-			let decoded_end = advance(decoded_at, frames, rate)?;
-
-			// The resampler hands back samples it was holding from earlier packets,
-			// so what comes out starts before the packet that filled its chunk. Track
-			// where each packet's activity ends so the output can be labelled by
-			// where it actually begins, not by the packet just submitted.
-			let resampled = self.resampler.is_some();
-			if resampled {
-				self.spans.push_back(ActivitySpan {
-					end: decoded_end,
-					activity,
-				});
-			}
-
-			// A packet shorter than the resampler's chunk leaves nothing to hand
-			// over yet. Read on rather than returning a frame with no samples, which
-			// a caller would otherwise see as audio arriving.
-			if pcm.is_empty() {
-				continue;
-			}
-
-			let activity = if resampled {
-				self.activity_at(timestamp)
-			} else {
-				activity
-			};
-			// Queued rather than returned, so a tail drained at a gap earlier in this
-			// same iteration still comes out first. The next turn of the loop pops it.
-			if let Some(frame) = self.frame(pcm, timestamp, activity)? {
-				self.ready.push_back(Read::Frame(frame));
+	/// Fill the hole between `next`, where the timeline should have continued, and the
+	/// packet at `timestamp` with recovered audio, when this consumer recovers and the hole
+	/// is short enough. Returns whether it did, leaving the timeline continuous.
+	fn bridge(
+		&mut self,
+		next: moq_net::Timestamp,
+		timestamp: moq_net::Timestamp,
+		packet: &[u8],
+	) -> Result<bool, Error> {
+		let Some(recovery) = self.recovery else {
+			return Ok(false);
+		};
+		let next = next.convert(timestamp.scale().ok_or(moq_net::TimeOverflow)?)?;
+		// An overlap, or no packet length to count the hole in yet.
+		if timestamp <= next || self.frame.is_zero() {
+			return Ok(false);
+		}
+		let hole = Duration::try_from(timestamp.checked_sub(next)?)?;
+		if hole > recovery.max_burst + self.frame / 2 {
+			return Ok(false);
+		}
+		let lost = (hole.as_secs_f64() / self.frame.as_secs_f64()).round() as usize;
+		if lost == 0 {
+			return Ok(false);
+		}
+		for missing in 0..lost {
+			let at = self.next_start.unwrap_or(next);
+			let delay = self.decoder.delay_remaining();
+			let rebuilt = self.decoder.recover(Some(packet), lost - missing)?;
+			self.place(at, delay, false)?;
+			match rebuilt {
+				true => self.losses.recovered += 1,
+				false => self.losses.concealed += 1,
 			}
 		}
+		Ok(true)
+	}
+
+	/// Turn a loss held for recovery into the gap it is, when something other than the
+	/// packet after it came next.
+	fn flush_deferred(&mut self) -> Result<(), Error> {
+		let Some((timestamp, duration)) = self.deferred.take() else {
+			return Ok(());
+		};
+		self.losses.gaps += 1;
+		self.boundary = Some(Duration::try_from(timestamp)?);
+		self.restart()?;
+		self.warmup_pending = !self.warmup.is_zero();
+		self.ready.push_back(Read::Gap { timestamp, duration });
+		Ok(())
+	}
+
+	/// Place the one output the decoder readied for the packet at `timestamp`, which had
+	/// `delay` frames of codec delay left to trim before it: resample, label, and queue it.
+	fn place(&mut self, timestamp: moq_net::Timestamp, delay: usize, track_start: bool) -> Result<(), Error> {
+		let rate = self.decoder.sample_rate();
+		let epoch = *self.epoch.get_or_insert(timestamp);
+		// Each packet is placed by its own samples, which a decoder that holds or splits
+		// its output would hand back somewhere else.
+		let contract = |name: &str| {
+			Error::Codec(format!(
+				"{name} did not ready exactly one output for one packet, and playback places exactly one"
+			))
+		};
+		let Some(decoded) = self.decoder.receive()? else {
+			return Err(contract(self.decoder.name()));
+		};
+		if self.decoder.receive()?.is_some() {
+			return Err(contract(self.decoder.name()));
+		}
+		// Anchored only once a packet decodes: a refused one primed nothing. The track's
+		// first packet has no history to warm up from: the codec's pre-skip, trimmed by
+		// the decoder, is all the priming its encoder declared.
+		if std::mem::take(&mut self.warmup_pending) && !track_start {
+			let warmup = self.warmup.saturating_sub(self.primed);
+			if !warmup.is_zero() {
+				let warmup =
+					moq_net::Timestamp::try_from(warmup)?.convert(timestamp.scale().ok_or(moq_net::TimeOverflow)?)?;
+				self.warmup_until = Some(timestamp.checked_add(warmup)?);
+			}
+		}
+		// Codec delay trimmed off the front is media this packet covered even
+		// though no samples came out, so it still moves the packet after it along.
+		let trimmed = delay - self.decoder.delay_remaining();
+		self.delay_trimmed += trimmed;
+		let activity = decoded.activity;
+		let mut decoded = decoded.samples;
+		// The packet's duration as the codec states it, never read off the
+		// timestamps: those carry every tune-in and hole along with the spacing.
+		let covered = decoded.len() / self.decoder.layout().channels() as usize + trimmed;
+		if covered > 0 {
+			self.target.set_frame(covered as f64 * 1000.0 / rate as f64);
+			self.frame = Duration::from_secs_f64(covered as f64 / rate as f64);
+			self.primed = self.primed.saturating_add(self.frame).min(self.warmup);
+		}
+		if let Some(end) = self.end {
+			let terminal_start = *self
+				.terminal_start
+				.get_or_insert(later(rewind(timestamp, self.delay_trimmed, rate)?, epoch));
+			let total = frames_between(terminal_start, end, rate)?;
+			let remaining = total.saturating_sub(self.frames_decoded);
+			decoded.truncate(remaining.saturating_mul(self.decoder.layout().channels() as usize));
+		}
+
+		let frames = decoded.len() / self.decoder.layout().channels() as usize;
+		let decoded_at = if let Some(terminal_start) = self.terminal_start {
+			advance(terminal_start, self.frames_decoded, rate)?
+		} else {
+			// The codec delay is padding before the epoch, not a hole after the
+			// first short frame. Keep later output contiguous by moving it back over
+			// everything trimmed since this decoder epoch began.
+			later(rewind(timestamp, self.delay_trimmed, rate)?, epoch)
+		};
+		if self.end.is_some() {
+			self.frames_decoded += frames;
+		}
+		// Packet continuity stays on the encoded timeline. `decoded_at` may be
+		// earlier because codec pre-skip is padding before the decoded epoch.
+		self.next_start = Some(advance(timestamp, frames + trimmed, rate)?);
+		if decoded.is_empty() {
+			return Ok(());
+		}
+
+		if self.resampler.is_none() && rate != self.resolved_sample_rate {
+			// A decoded frame pays for the channel count. Bound the input
+			// window in frames, and its duration at low rates, so neither
+			// side's allocation grows with a catalog's rate declaration.
+			let chunk_frames = (rate as usize / 50).clamp(1, 960);
+			self.resampler = Some(Resampler::new(
+				rate,
+				self.resolved_sample_rate,
+				self.decoder.layout().channels(),
+				chunk_frames,
+			)?);
+		}
+
+		let (pcm, timestamp) = match self.resampler.as_mut() {
+			// The resampler works in fixed chunks, so it holds back whatever didn't
+			// fill one. What comes out next starts with those held-back samples, which
+			// arrived before this packet did, so it is stamped where they arrived.
+			// Reading that off this packet instead would place the audio late by up to
+			// a chunk, sawtoothing A/V sync, and drag it the whole way whenever the
+			// source jumps forward without declaring a hole.
+			Some(r) => {
+				let held = if r.pending_frames() == 0 {
+					decoded_at
+				} else {
+					r.held_at().unwrap_or(decoded_at)
+				};
+				let timestamp = r.output_at(held)?;
+				let pcm = r.process(&decoded, decoded_at)?;
+				(pcm, timestamp)
+			}
+			None => (decoded, decoded_at),
+		};
+
+		let decoded_end = advance(decoded_at, frames, rate)?;
+
+		// The resampler hands back samples it was holding from earlier packets,
+		// so what comes out starts before the packet that filled its chunk. Track
+		// where each packet's activity ends so the output can be labelled by
+		// where it actually begins, not by the packet just submitted.
+		let resampled = self.resampler.is_some();
+		if resampled {
+			self.spans.push_back(ActivitySpan {
+				end: decoded_end,
+				activity,
+			});
+		}
+
+		// A packet shorter than the resampler's chunk leaves nothing to hand
+		// over yet. Read on rather than returning a frame with no samples, which
+		// a caller would otherwise see as audio arriving.
+		if pcm.is_empty() {
+			return Ok(());
+		}
+
+		let activity = if resampled {
+			self.activity_at(timestamp)
+		} else {
+			activity
+		};
+		// Queued rather than returned, so a tail drained at a gap earlier in this
+		// same iteration still comes out first. The next turn of the loop pops it.
+		if let Some(frame) = self.frame(pcm, timestamp, activity)? {
+			self.ready.push_back(Read::Frame(frame));
+		}
+		Ok(())
 	}
 
 	/// The next packet or boundary the gate admits, reading and observing every packet
@@ -2780,6 +2896,281 @@ mod tests {
 		}
 		assert!(!after.is_empty(), "no frame after the loss");
 		after
+	}
+
+	/// Opus recovers only when asked: with DRED on the encoder, a recovering consumer rebuilds
+	/// a lost packet with no gap, and a default one reports the gap as upstream always has.
+	#[tokio::test]
+	async fn opus_recovers_only_when_asked() {
+		let mut config = EncodeConfig::new(48_000, Layout::Mono);
+		config.kind = Some(crate::encode::Kind::Voice);
+		config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(32_000));
+		config.dred = Some(Duration::from_millis(100));
+		let mut encoder = Encoder::new(&config).unwrap();
+		let mut catalog = encoder.catalog();
+		catalog.warmup = None;
+		let frames = encoder.frame_size();
+		let packets: Vec<Bytes> = (0..60)
+			.map(|packet| {
+				let pcm: Vec<f32> = (packet * frames..(packet + 1) * frames)
+					.map(|i| (std::f32::consts::TAU * 220.0 * i as f32 / 48_000.0).sin() * 0.3)
+					.collect();
+				crate::single(encoder.encode_all(&pcm).unwrap()).payload
+			})
+			.collect();
+
+		for recover in [None, Some(true)] {
+			let broadcast = moq_net::broadcast::Info::new().produce();
+			let track = broadcast
+				.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+				.unwrap();
+			let container = moq_mux::catalog::hang::Container::try_from(&catalog).unwrap();
+			for (index, payload) in packets.iter().enumerate().filter(|(index, _)| *index != 40) {
+				let start = index as u64 * 20_000;
+				let mut group = track.create_group(moq_net::group::Info { start }).unwrap();
+				let packet = moq_mux::container::Frame {
+					timestamp: Timestamp::from_micros(start).unwrap(),
+					payload: payload.clone(),
+					keyframe: true,
+					duration: None,
+				};
+				moq_mux::container::Container::write(&container, &mut group, &[packet]).unwrap();
+				group.finish().unwrap();
+			}
+			let _track = track.finish().unwrap();
+			let mut consumer = Consumer::new(
+				&broadcast.consume(),
+				&catalog,
+				"audio",
+				Options {
+					delay: Delay {
+						max: Some(Duration::from_secs(10)),
+						..Delay::default()
+					},
+					recover,
+					..Options::new()
+				},
+			)
+			.await
+			.unwrap();
+			let mut gaps = 0;
+			while let Some(read) = consumer.read().await.unwrap() {
+				if matches!(read, Read::Gap { .. }) {
+					gaps += 1;
+				}
+			}
+			match recover {
+				None => assert_eq!((gaps, consumer.losses()), (1, Losses::default())),
+				_ => {
+					assert_eq!(gaps, 0);
+					assert_eq!((consumer.losses().recovered, consumer.losses().concealed), (1, 0));
+				}
+			}
+		}
+	}
+
+	/// How a test track shows its lost packets.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	enum Loss {
+		/// Only the stamps skip.
+		Stamps,
+		/// The publisher declares the skipped starts.
+		Declared,
+		/// Nothing declares them, so the container reports a gap.
+		Undeclared,
+	}
+
+	/// Writes one LiquidCodec-like packet per 80 ms group for each frame value, leaving out
+	/// the packets `lost` names (and declaring their groups skipped when `declared`), then
+	/// reads the whole track back: each frame's stamp in microseconds and its first sample,
+	/// the gaps, and the losses the consumer counted.
+	#[allow(
+		clippy::await_holding_lock,
+		reason = "the codec registry is process-global, so the test holds it for the whole read"
+	)]
+	async fn redundant_track(
+		values: &[f32],
+		lost: &[usize],
+		loss: Loss,
+		recover: Option<bool>,
+	) -> (Vec<(u128, f32, usize)>, usize, Losses, Duration) {
+		use crate::external::{self, test_codec};
+		let _guard = test_codec::LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+		external::register_liquid(Some(std::sync::Arc::new(test_codec::Redundant)));
+
+		let input = Input::new(24_000, Layout::Mono);
+		let mut encoder = Encoder::new(&EncodeConfig::from_input(crate::encode::Codec::Liquid, &input)).unwrap();
+		let mut catalog = encoder.catalog();
+		catalog.warmup = None;
+		let broadcast = moq_net::broadcast::Info::new().produce();
+		let track = broadcast
+			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+			.unwrap();
+		let frame = external::liquid::FRAME_SIZE;
+		let packets: Vec<(u64, Bytes)> = values
+			.iter()
+			.enumerate()
+			// Every packet is encoded, so the next one carries the lost one's copy.
+			.map(|(index, value)| {
+				let packet = crate::single(encoder.encode_all(&vec![*value; frame]).unwrap()).payload;
+				(index as u64 * 80_000, packet)
+			})
+			.enumerate()
+			.filter(|(index, _)| !lost.contains(index))
+			.map(|(_, packet)| packet)
+			.collect();
+		let container = moq_mux::catalog::hang::Container::try_from(&catalog).unwrap();
+		let track = track;
+		let mut producer = None;
+		match loss {
+			// Group by group, with nothing declaring the starts a lost group leaves: the
+			// container reports the loss itself.
+			Loss::Undeclared => {
+				for (micros, payload) in &packets {
+					let mut group = track.create_group(moq_net::group::Info { start: *micros }).unwrap();
+					let packet = moq_mux::container::Frame {
+						timestamp: Timestamp::from_micros(*micros).unwrap(),
+						payload: payload.clone(),
+						keyframe: true,
+						duration: None,
+					};
+					moq_mux::container::Container::write(&container, &mut group, &[packet]).unwrap();
+					group.finish().unwrap();
+				}
+			}
+			Loss::Stamps | Loss::Declared => {
+				let mut writer = moq_mux::container::Producer::new(track.clone(), container);
+				let mut previous = None;
+				for (micros, payload) in &packets {
+					if loss == Loss::Declared && previous.is_some_and(|previous| micros - previous > 80_000) {
+						writer.seek(*micros).unwrap();
+					}
+					previous = Some(*micros);
+					writer
+						.write(moq_mux::container::Frame {
+							timestamp: Timestamp::from_micros(*micros).unwrap(),
+							duration: None,
+							payload: payload.clone(),
+							keyframe: true,
+						})
+						.unwrap();
+					writer.cut(None).unwrap();
+				}
+				producer = Some(writer);
+			}
+		}
+		// Both kept until the track is read, as a finished track is.
+		let _written = producer.map(|writer| writer.finish().unwrap());
+		let _raw = (loss == Loss::Undeclared).then(|| track.finish().unwrap());
+
+		let mut consumer = Consumer::new(
+			&broadcast.consume(),
+			&catalog,
+			"audio",
+			Options {
+				delay: Delay {
+					max: Some(Duration::from_secs(10)),
+					..Delay::default()
+				},
+				estimate: false,
+				recover,
+				..Options::new()
+			},
+		)
+		.await
+		.unwrap();
+		let delay = consumer.delay();
+		let mut frames = Vec::new();
+		let mut gaps = 0;
+		while let Some(read) = consumer.read().await.unwrap() {
+			match read {
+				Read::Frame(f) => {
+					let samples: Vec<f32> = f
+						.data
+						.as_chunks::<4>()
+						.0
+						.iter()
+						.map(|chunk| f32::from_le_bytes(*chunk))
+						.collect();
+					frames.push((f.timestamp.as_micros().unwrap(), samples[0], samples.len()));
+				}
+				Read::Gap { .. } => gaps += 1,
+				Read::End { .. } => {}
+			}
+		}
+		let losses = consumer.losses();
+		external::register_liquid(None);
+		(frames, gaps, losses, delay)
+	}
+
+	/// Equal within the rounding of the stand-in's mean.
+	fn close(a: &[f32], b: &[f32]) -> bool {
+		a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-5)
+	}
+
+	/// The value each 80 ms frame codes: distinct, so a rebuilt frame shows where it came from.
+	fn ramp(count: usize) -> Vec<f32> {
+		(0..count).map(|index| 0.01 * (index + 1) as f32).collect()
+	}
+
+	/// A single lost packet is rebuilt exactly from the copy the next packet carries, at its
+	/// own place in the timeline, with no gap: whether the container declares the loss or the
+	/// stamps alone show it.
+	#[tokio::test]
+	async fn a_lost_packet_is_rebuilt_from_the_next() {
+		for declared in [Loss::Stamps, Loss::Declared, Loss::Undeclared] {
+			let values = ramp(6);
+			let (frames, gaps, losses, delay) = redundant_track(&values, &[2], declared, None).await;
+			assert_eq!(gaps, 0, "loss={declared:?}: {frames:?}");
+			assert_eq!(losses.recovered, 1, "loss={declared:?}");
+			assert_eq!(losses.concealed, 0);
+			// The first frame loses the decoder's priming; every frame after it is whole.
+			let decoded: Vec<f32> = frames.iter().map(|frame| frame.1).collect();
+			assert!(close(&decoded, &values), "loss={declared:?}: {decoded:?}");
+			for pair in frames.windows(2) {
+				let ends = pair[0].0 + pair[0].2 as u128 * 1_000_000 / 24_000;
+				assert_eq!(
+					pair[1].0, ends,
+					"loss={declared:?}: the timeline broke at {}",
+					pair[1].0
+				);
+			}
+			// The look-ahead is one frame of playout delay, and nothing more.
+			assert_eq!(delay, Duration::from_millis(80));
+		}
+	}
+
+	/// In a burst of two, only the packet right before the next one has a copy, so the first
+	/// is concealed and the second rebuilt.
+	#[tokio::test]
+	async fn a_burst_conceals_all_but_the_last() {
+		let values = ramp(7);
+		let (frames, gaps, losses, _) = redundant_track(&values, &[2, 3], Loss::Undeclared, None).await;
+		assert_eq!(gaps, 0, "{frames:?}");
+		assert_eq!((losses.recovered, losses.concealed), (1, 1));
+		let decoded: Vec<f32> = frames.iter().map(|frame| frame.1).collect();
+		let mut expected = values.clone();
+		expected[2] = crate::external::test_codec::CONCEALED;
+		assert!(close(&decoded, &expected), "{decoded:?}");
+		let stamps: Vec<u128> = frames.iter().skip(1).map(|frame| frame.0).collect();
+		let want: Vec<u128> = (1..7).map(|index| index * 80_000 - 20_000).collect();
+		assert_eq!(stamps, want, "frames moved off the timeline");
+	}
+
+	/// A hole longer than the codec bridges is still a gap, and so is any hole when the
+	/// caller turns recovery off.
+	#[tokio::test]
+	async fn long_holes_and_opting_out_keep_the_gap() {
+		let values = ramp(20);
+		let lost: Vec<usize> = (2..16).collect();
+		let (_, gaps, losses, _) = redundant_track(&values, &lost, Loss::Undeclared, None).await;
+		assert_eq!(gaps, 1);
+		assert_eq!((losses.recovered, losses.concealed, losses.gaps), (0, 0, 1));
+
+		let (frames, gaps, losses, delay) = redundant_track(&ramp(6), &[2], Loss::Undeclared, Some(false)).await;
+		assert_eq!(gaps, 1, "{frames:?}");
+		assert_eq!(losses, Losses::default());
+		assert_eq!(delay, Duration::ZERO);
 	}
 
 	thread_local! {

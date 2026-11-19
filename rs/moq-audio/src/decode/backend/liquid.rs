@@ -10,6 +10,9 @@ use crate::{Activity, Error, Layout};
 
 pub(super) const NAME: &str = "liquid";
 
+/// One packet's media.
+const FRAME: std::time::Duration = std::time::Duration::from_millis(80);
+
 pub(super) struct Liquid {
 	inner: AssertUnwindSafe<Box<dyn ExternalDecoder>>,
 	/// Outputs submitted but not yet received.
@@ -55,8 +58,8 @@ impl Liquid {
 impl Backend for Liquid {
 	fn decode(&mut self, packet: &[u8]) -> Result<(), Error> {
 		// An empty packet marks one lost packet, as for Opus: the implementation
-		// conceals one frame. Recovering from the next packet's redundant copy needs
-		// a look-ahead the consumer does not give a backend.
+		// conceals one frame. A consumer that recovers calls `recover` with the next
+		// packet instead.
 		let samples = if packet.is_empty() {
 			self.inner.recover(None, 0)
 		} else {
@@ -77,6 +80,24 @@ impl Backend for Liquid {
 		self.ready.clear();
 		self.inner.reset();
 		Ok(())
+	}
+
+	/// A packet carries the previous frame too, so one lost packet is rebuilt from the
+	/// next once it arrives: one 80 ms frame of look-ahead.
+	fn recovery(&self) -> Option<crate::decode::Recovery> {
+		Some(crate::decode::Recovery::new(
+			FRAME,
+			std::time::Duration::from_secs(1),
+			true,
+		))
+	}
+
+	fn recover(&mut self, next: Option<&[u8]>, frames_to_next: usize) -> Result<bool, Error> {
+		let next = next.filter(|packet| !packet.is_empty());
+		let samples = self.inner.recover(next, frames_to_next);
+		self.push(samples)?;
+		// The implementation rebuilds the frame right before a packet from its copy.
+		Ok(next.is_some() && frames_to_next == 1)
 	}
 
 	fn sample_rate(&self) -> u32 {

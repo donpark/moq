@@ -121,6 +121,60 @@ pub(crate) mod test_codec {
 		}
 	}
 
+	/// A stand-in with LiquidCodec's redundancy: a packet is the frame's mean and the
+	/// previous frame's mean, 4 bytes each. Decoding yields a constant frame of the mean;
+	/// recovering the frame right before a packet yields that packet's copy, and anything
+	/// else yields [`CONCEALED`].
+	pub struct Redundant;
+	/// The value a [`Redundant`] decoder conceals with.
+	pub const CONCEALED: f32 = 7.0;
+	struct RedEnc {
+		prev: f32,
+	}
+	struct RedDec;
+
+	impl ExternalEncoder for RedEnc {
+		fn encode(&mut self, pcm: &[f32]) -> Result<Vec<u8>, String> {
+			let mean = pcm.iter().sum::<f32>() / pcm.len() as f32;
+			let mut packet = mean.to_le_bytes().to_vec();
+			packet.extend_from_slice(&self.prev.to_le_bytes());
+			self.prev = mean;
+			Ok(packet)
+		}
+		fn reset(&mut self) {
+			self.prev = 0.0;
+		}
+		fn bitrate(&self) -> u64 {
+			800
+		}
+	}
+
+	impl ExternalDecoder for RedDec {
+		fn decode(&mut self, packet: &[u8]) -> Result<Vec<f32>, String> {
+			let bytes: [u8; 4] = packet[..4].try_into().map_err(|_| "bad packet".to_string())?;
+			Ok(vec![f32::from_le_bytes(bytes); liquid::FRAME_SIZE])
+		}
+		fn recover(&mut self, next: Option<&[u8]>, frames_to_next: usize) -> Result<Vec<f32>, String> {
+			match next {
+				Some(next) if frames_to_next == 1 && next.len() == 8 => {
+					let bytes: [u8; 4] = next[4..].try_into().unwrap();
+					Ok(vec![f32::from_le_bytes(bytes); liquid::FRAME_SIZE])
+				}
+				_ => Ok(vec![CONCEALED; liquid::FRAME_SIZE]),
+			}
+		}
+		fn reset(&mut self) {}
+	}
+
+	impl ExternalCodec for Redundant {
+		fn encoder(&self) -> Result<Box<dyn ExternalEncoder>, String> {
+			Ok(Box::new(RedEnc { prev: 0.0 }))
+		}
+		fn decoder(&self) -> Result<Box<dyn ExternalDecoder>, String> {
+			Ok(Box::new(RedDec))
+		}
+	}
+
 	/// The registry is process-global; tests that touch it hold this lock.
 	pub static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

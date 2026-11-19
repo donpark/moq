@@ -169,6 +169,14 @@ pub struct Config {
 	pub frame_duration: Duration,
 	/// Which encoder implementation to use.
 	pub backend: Backend,
+	/// Opus deep redundancy (DRED): each packet carries up to this much of the audio
+	/// before it, so a receiver that recovers (see
+	/// [`decode::Options::recover`](crate::decode::Options::recover)) rebuilds a burst of
+	/// lost packets from the packet after it rather than concealing them. `None`, the
+	/// default, sends none. Opus only, up to 1 s, rounded up to 10 ms. The encoder runs a
+	/// small neural network for it and spends some of its bitrate on it, which its rate
+	/// control may cut to nothing when the bitrate is low.
+	pub dred: Option<Duration>,
 }
 
 impl Config {
@@ -182,6 +190,7 @@ impl Config {
 			kind: None,
 			frame_duration: Duration::from_millis(20),
 			backend: Backend::Auto,
+			dred: None,
 		}
 	}
 
@@ -218,6 +227,15 @@ impl Config {
 		self.layout.validate()?;
 		let (rate, channels) = (self.sample_rate, self.layout.channels());
 
+		if self.dred.is_some() && self.codec != Codec::Opus {
+			return Err(Error::Unsupported("deep redundancy (dred) is Opus only".into()));
+		}
+		if self
+			.dred
+			.is_some_and(|dred| dred.is_zero() || dred > Duration::from_secs(1))
+		{
+			return Err(Error::Unsupported("opus dred runs from 10 ms to 1 s".into()));
+		}
 		match self.codec {
 			Codec::Opus => {
 				opus::validate_rate(rate)?;
@@ -1179,5 +1197,18 @@ mod tests {
 		let finish = enc.finish(&[0.0; 100]).unwrap();
 		assert_eq!(indices(finish.packets()), [0, 1, 2, 3]);
 		assert_eq!(finish.discard_padding(), 3 * 1024 - backend::stub::DELAY - 100);
+	}
+
+	#[test]
+	fn dred_is_opus_only_and_bounded() {
+		let mut config = Config::new(48_000, Layout::Mono);
+		config.dred = Some(Duration::from_millis(100));
+		assert!(Encoder::new(&config).is_ok());
+		config.dred = Some(Duration::from_secs(2));
+		assert!(matches!(Encoder::new(&config), Err(Error::Unsupported(_))));
+		let mut pcm = Config::new(48_000, Layout::Mono);
+		pcm.codec = Codec::Pcm;
+		pcm.dred = Some(Duration::from_millis(100));
+		assert!(matches!(Encoder::new(&pcm), Err(Error::Unsupported(_))));
 	}
 }

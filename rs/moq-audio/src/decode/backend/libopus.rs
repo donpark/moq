@@ -1,11 +1,16 @@
 //! Opus through libopus, the software decoder for every host.
 //!
-//! Every stream goes through the multistream decoder, which is also how a
-//! family 0 (mono/stereo) stream decodes: one stream, coupled when stereo.
+//! Family 0 (mono/stereo) decodes through the plain Opus decoder, which is what
+//! recovery needs: in-band FEC and deep redundancy (DRED) decode on the same
+//! state, so a rebuilt packet keeps prediction continuity. Family 1 (surround)
+//! decodes through the multistream decoder, which has neither, so it only conceals.
 
 use opusic_sys::{
-	OPUS_OK, OPUS_RESET_STATE, OPUS_SET_GAIN_REQUEST, OpusMSDecoder, opus_multistream_decode_float,
-	opus_multistream_decoder_create, opus_multistream_decoder_ctl, opus_multistream_decoder_destroy,
+	OPUS_OK, OPUS_RESET_STATE, OPUS_SET_GAIN_REQUEST, OpusDRED, OpusDREDDecoder, OpusDecoder, OpusMSDecoder,
+	opus_decode_float, opus_decoder_create, opus_decoder_ctl, opus_decoder_destroy, opus_decoder_dred_decode_float,
+	opus_dred_alloc, opus_dred_decoder_create, opus_dred_decoder_destroy, opus_dred_free, opus_dred_parse,
+	opus_multistream_decode_float, opus_multistream_decoder_create, opus_multistream_decoder_ctl,
+	opus_multistream_decoder_destroy, opus_packet_has_lbrr,
 };
 
 use std::collections::VecDeque;
@@ -23,8 +28,38 @@ const MAX_FRAME_MS: usize = 120;
 const MONO: &[u8] = &[0];
 const STEREO: &[u8] = &[0, 1];
 
+/// The decoder behind [`Libopus`]: the plain one for family 0, the multistream one for family 1.
+#[derive(Clone, Copy)]
+enum Inner {
+	One(*mut OpusDecoder),
+	Many(*mut OpusMSDecoder),
+}
+
+/// The DRED parse behind recovery, kept for the packet it came from, so a burst parses
+/// the packet after it once rather than once per lost packet.
+struct Dred {
+	decoder: *mut OpusDREDDecoder,
+	state: *mut OpusDRED,
+	/// The packet the parse came from.
+	from: Vec<u8>,
+	/// How far back the parse reaches, in samples before `from` starts.
+	reach: usize,
+}
+
+impl Drop for Dred {
+	fn drop(&mut self) {
+		// SAFETY: both are live and owned by this parse alone.
+		unsafe {
+			opus_dred_free(self.state);
+			opus_dred_decoder_destroy(self.decoder);
+		}
+	}
+}
+
 pub(super) struct Libopus {
-	inner: *mut OpusMSDecoder,
+	inner: Inner,
+	/// The DRED parse, from the first hole on (family 0 only).
+	dred: Option<Dred>,
 	layout: Layout,
 	/// For each canonical channel, the Vorbis-order channel it comes from, when they differ.
 	reorder: Option<&'static [usize]>,
@@ -79,25 +114,36 @@ impl Libopus {
 		};
 
 		let mut err = 0i32;
-		// SAFETY: `table` holds one entry per output channel, the count we pass,
-		// and the out-pointer is valid; inner is checked for null below.
-		let inner = unsafe {
-			opus_multistream_decoder_create(
-				opus::DECODE_RATE as i32,
-				table.len() as i32,
-				streams,
-				coupled,
-				table.as_ptr(),
-				&mut err,
-			)
+		let inner = if head.mapping.is_none() {
+			// SAFETY: the out-pointer is valid; inner is checked for null below.
+			let inner = unsafe { opus_decoder_create(opus::DECODE_RATE as i32, channel_count as i32, &mut err) };
+			if err != OPUS_OK || inner.is_null() {
+				return Err(opus::error(err, "opus_decoder_create"));
+			}
+			Inner::One(inner)
+		} else {
+			// SAFETY: `table` holds one entry per output channel, the count we pass,
+			// and the out-pointer is valid; inner is checked for null below.
+			let inner = unsafe {
+				opus_multistream_decoder_create(
+					opus::DECODE_RATE as i32,
+					table.len() as i32,
+					streams,
+					coupled,
+					table.as_ptr(),
+					&mut err,
+				)
+			};
+			if err != OPUS_OK || inner.is_null() {
+				return Err(opus::error(err, "opus_multistream_decoder_create"));
+			}
+			Inner::Many(inner)
 		};
-		if err != OPUS_OK || inner.is_null() {
-			return Err(opus::error(err, "opus_multistream_decoder_create"));
-		}
 
 		// Owned before the gain ctl so a failure there still destroys the decoder.
 		let decoder = Self {
 			inner,
+			dred: None,
 			layout,
 			reorder,
 			streams: streams as u8,
@@ -111,13 +157,134 @@ impl Libopus {
 		// Same Q7.8 dB units as OpusHead, and it survives OPUS_RESET_STATE.
 		// SAFETY: `inner` owns a live decoder and OPUS_SET_GAIN takes one i32.
 		let rc = unsafe {
-			opus_multistream_decoder_ctl(decoder.inner, OPUS_SET_GAIN_REQUEST, head.output_gain as i32)
+			match decoder.inner {
+				Inner::One(dec) => opus_decoder_ctl(dec, OPUS_SET_GAIN_REQUEST, head.output_gain as i32),
+				Inner::Many(dec) => opus_multistream_decoder_ctl(dec, OPUS_SET_GAIN_REQUEST, head.output_gain as i32),
+			}
 		};
 		if rc != OPUS_OK {
 			return Err(opus::error(rc, "OPUS_SET_GAIN"));
 		}
 
 		Ok(Box::new(decoder))
+	}
+}
+
+impl Libopus {
+	/// One decode through whichever decoder `inner` owns. `fec` asks for the packet before
+	/// `packet` from its in-band copy instead, concealing when it carries none.
+	///
+	/// # Safety
+	///
+	/// `out` holds `frame_size` samples per channel.
+	unsafe fn decode_raw(&self, packet: &[u8], frame_size: usize, out: &mut [f32], fec: bool) -> i32 {
+		// SAFETY: the decoder is live and exclusively owned; the slices are bounded by the
+		// lengths passed.
+		unsafe {
+			match self.inner {
+				Inner::One(dec) => opus_decode_float(
+					dec,
+					packet.as_ptr(),
+					packet.len() as i32,
+					out.as_mut_ptr(),
+					frame_size as i32,
+					i32::from(fec),
+				),
+				Inner::Many(dec) => opus_multistream_decode_float(
+					dec,
+					packet.as_ptr(),
+					packet.len() as i32,
+					out.as_mut_ptr(),
+					frame_size as i32,
+					i32::from(fec),
+				),
+			}
+		}
+	}
+
+	/// Reorder, label, and queue `samples` frames decoded into `out` for `packet`
+	/// (empty for audio made up for a lost one).
+	fn ready(&mut self, packet: &[u8], samples: i32, mut out: Vec<f32>) -> Result<(), Error> {
+		if samples < 0 {
+			return Err(opus::decode_error(samples));
+		}
+		let channels = self.layout.channels() as usize;
+		out.truncate(samples as usize * channels);
+		if let Some(order) = self.reorder {
+			let mut vorbis = [0.0f32; 8];
+			for frame in out.chunks_exact_mut(channels) {
+				vorbis[..channels].copy_from_slice(frame);
+				for (sample, &from) in frame.iter_mut().zip(order) {
+					*sample = vorbis[from];
+				}
+			}
+		}
+		let activity = opus::multistream_activity(packet, self.streams, self.in_dtx);
+		self.in_dtx = activity.is_dtx();
+		self.ready.push_back(Decoded { samples: out, activity });
+		Ok(())
+	}
+
+	/// Decode the deep redundancy `packet` carries for the audio `offset` samples before it
+	/// into `out`, or `None` when it carries none that far back.
+	fn dred(&mut self, packet: &[u8], offset: usize, frame_size: usize, out: &mut [f32]) -> Result<Option<i32>, Error> {
+		let Inner::One(dec) = self.inner else {
+			return Ok(None);
+		};
+		if self.dred.is_none() {
+			let mut err = 0i32;
+			// SAFETY: the out-pointer is valid; the decoder is checked below.
+			let decoder = unsafe { opus_dred_decoder_create(&mut err) };
+			if err != OPUS_OK || decoder.is_null() {
+				return Err(opus::error(err, "opus_dred_decoder_create"));
+			}
+			// SAFETY: the out-pointer is valid; the state is checked below.
+			let state = unsafe { opus_dred_alloc(&mut err) };
+			if err != OPUS_OK || state.is_null() {
+				// SAFETY: `decoder` is live and owned here alone.
+				unsafe { opus_dred_decoder_destroy(decoder) };
+				return Err(opus::error(err, "opus_dred_alloc"));
+			}
+			self.dred = Some(Dred {
+				decoder,
+				state,
+				from: Vec::new(),
+				reach: 0,
+			});
+		}
+		let dred = self.dred.as_mut().expect("created above");
+		if dred.from != packet {
+			let mut end = 0i32;
+			// SAFETY: the DRED states are live and exclusively owned; the packet is bounded by
+			// the length passed. The work hint is a second whatever the depth needed: libopus
+			// decodes latents in batches sized off it, so asking for exactly the depth decodes
+			// only about half of it.
+			let reach = unsafe {
+				opus_dred_parse(
+					dred.decoder,
+					dred.state,
+					packet.as_ptr(),
+					packet.len() as i32,
+					opus::DECODE_RATE as i32,
+					opus::DECODE_RATE as i32,
+					&mut end,
+					0,
+				)
+			};
+			if reach < 0 {
+				return Err(opus::decode_error(reach));
+			}
+			dred.from = packet.to_vec();
+			dred.reach = reach as usize;
+		}
+		if offset > dred.reach {
+			return Ok(None);
+		}
+		// SAFETY: the decoder and the parse are live; `out` holds `frame_size` samples per channel.
+		let samples = unsafe {
+			opus_decoder_dred_decode_float(dec, dred.state, offset as i32, out.as_mut_ptr(), frame_size as i32)
+		};
+		Ok(Some(samples))
 	}
 }
 
@@ -168,40 +335,55 @@ impl Backend for Libopus {
 			self.max_frame_size
 		};
 		let mut out = vec![0.0f32; frame_size * channels];
-		// SAFETY: `inner` owns a live OpusMSDecoder; packet/out slices are bounded by
-		// the lengths we pass.
-		let samples = unsafe {
-			opus_multistream_decode_float(
-				self.inner,
-				packet.as_ptr(),
-				packet.len() as i32,
-				out.as_mut_ptr(),
-				frame_size as i32,
-				0,
-			)
-		};
-		if samples < 0 {
-			return Err(opus::decode_error(samples));
-		}
-		if !packet.is_empty() {
+		// SAFETY: `out` holds `frame_size` samples per channel.
+		let samples = unsafe { self.decode_raw(packet, frame_size, &mut out, false) };
+		if samples >= 0 && !packet.is_empty() {
 			self.last_frame_size = Some(samples as usize);
 		}
-		out.truncate(samples as usize * channels);
+		self.ready(packet, samples, out)
+	}
 
-		if let Some(order) = self.reorder {
-			let mut vorbis = [0.0f32; 8];
-			for frame in out.chunks_exact_mut(channels) {
-				vorbis[..channels].copy_from_slice(frame);
-				for (sample, &from) in frame.iter_mut().zip(order) {
-					*sample = vorbis[from];
-				}
-			}
+	/// Mono and stereo rebuild a lost packet from the next packet's in-band FEC or deep
+	/// redundancy, when the encoder sent them. Off unless the consumer asks, since an
+	/// encoder sends neither by default.
+	fn recovery(&self) -> Option<crate::decode::Recovery> {
+		match self.inner {
+			Inner::One(_) => Some(crate::decode::Recovery::new(
+				std::time::Duration::from_millis(20),
+				std::time::Duration::from_secs(1),
+				false,
+			)),
+			Inner::Many(_) => None,
 		}
+	}
 
-		let activity = opus::multistream_activity(packet, self.streams, self.in_dtx);
-		self.in_dtx = activity.is_dtx();
-		self.ready.push_back(Decoded { samples: out, activity });
-		Ok(())
+	/// The best source first, in `opus_demo`'s order: the next packet's in-band copy for the
+	/// packet right before it, then its deep redundancy that far back, then concealment.
+	fn recover(&mut self, next: Option<&[u8]>, frames_to_next: usize) -> Result<bool, Error> {
+		let channels = self.layout.channels() as usize;
+		let frame_size = self.last_frame_size.ok_or_else(|| {
+			Error::Decode("opus packet lost before any packet decoded, so no length to conceal".into())
+		})?;
+		let mut out = vec![0.0f32; frame_size * channels];
+		let next = next.filter(|packet| !packet.is_empty());
+		let (samples, rebuilt) = match next {
+			// SAFETY (all three decodes): `out` holds `frame_size` samples per channel.
+			Some(packet)
+				if frames_to_next == 1
+					&& matches!(self.inner, Inner::One(_))
+					// SAFETY: the packet is bounded by the length passed.
+					&& unsafe { opus_packet_has_lbrr(packet.as_ptr(), packet.len() as i32) } > 0 =>
+			{
+				(unsafe { self.decode_raw(packet, frame_size, &mut out, true) }, true)
+			}
+			Some(packet) => match self.dred(packet, frames_to_next * frame_size, frame_size, &mut out)? {
+				Some(samples) => (samples, true),
+				None => (unsafe { self.decode_raw(&[], frame_size, &mut out, false) }, false),
+			},
+			None => (unsafe { self.decode_raw(&[], frame_size, &mut out, false) }, false),
+		};
+		self.ready(&[], samples, out)?;
+		Ok(rebuilt)
 	}
 
 	fn receive(&mut self) -> Result<Option<Decoded>, Error> {
@@ -215,7 +397,12 @@ impl Backend for Libopus {
 
 	fn reset(&mut self) -> Result<(), Error> {
 		// SAFETY: `inner` owns a live decoder and OPUS_RESET_STATE takes no arguments.
-		let rc = unsafe { opus_multistream_decoder_ctl(self.inner, OPUS_RESET_STATE) };
+		let rc = unsafe {
+			match self.inner {
+				Inner::One(dec) => opus_decoder_ctl(dec, OPUS_RESET_STATE),
+				Inner::Many(dec) => opus_multistream_decoder_ctl(dec, OPUS_RESET_STATE),
+			}
+		};
 		if rc != OPUS_OK {
 			return Err(opus::error(rc, "OPUS_RESET_STATE"));
 		}
@@ -243,8 +430,13 @@ impl Backend for Libopus {
 
 impl Drop for Libopus {
 	fn drop(&mut self) {
-		// SAFETY: `inner` is a live OpusMSDecoder that nothing else aliases.
-		unsafe { opus_multistream_decoder_destroy(self.inner) };
+		// SAFETY: `inner` is live and nothing else aliases it.
+		unsafe {
+			match self.inner {
+				Inner::One(dec) => opus_decoder_destroy(dec),
+				Inner::Many(dec) => opus_multistream_decoder_destroy(dec),
+			}
+		}
 	}
 }
 

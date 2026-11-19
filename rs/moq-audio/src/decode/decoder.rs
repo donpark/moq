@@ -116,6 +116,27 @@ impl Decoder {
 		self.backend.decode(packet)
 	}
 
+	/// How the codec recovers lost packets from later ones, or `None` when it only
+	/// conceals them.
+	///
+	/// LiquidCodec rebuilds a lost packet from the copy the next packet carries. Opus
+	/// (mono and stereo) rebuilds one from the next packet's in-band FEC or deep redundancy
+	/// (DRED), when the encoder sent them.
+	pub fn recovery(&self) -> Option<super::Recovery> {
+		self.backend.recovery()
+	}
+
+	/// Ready one packet's worth of audio for a lost packet, which [`receive`](Self::receive)
+	/// returns like a decoded one.
+	///
+	/// `next` is the packet that arrived after the hole, if one has, and `frames_to_next`
+	/// how many packets before it the lost one was: `1` for the packet right before it.
+	/// A codec with [`recovery`](Self::recovery) rebuilds what `next` carries redundancy
+	/// for; anything else is concealed. Returns whether the audio was rebuilt.
+	pub fn recover(&mut self, next: Option<&[u8]>, frames_to_next: usize) -> Result<bool, Error> {
+		self.backend.recover(next, frames_to_next)
+	}
+
 	/// Pop the oldest ready output in stream order, with its codec activity and
 	/// any startup delay left trimmed off, or `None` while the codec holds the rest.
 	///
@@ -438,6 +459,118 @@ pub(crate) mod tests {
 			hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, head.sample_rate, head.channel_count);
 		catalog.description = Some(head.encode().unwrap());
 		catalog
+	}
+
+	/// A vowel-like test signal: harmonics of a gliding pitch, shaped by two formants and
+	/// a syllable-rate envelope, so the speech model behind DRED has something to code.
+	fn voice(samples: usize) -> Vec<f32> {
+		let mut phase = 0.0f32;
+		(0..samples)
+			.map(|i| {
+				let t = i as f32 / 48_000.0;
+				let pitch = 140.0 + 40.0 * (std::f32::consts::TAU * 0.7 * t).sin();
+				phase += std::f32::consts::TAU * pitch / 48_000.0;
+				let mut sample = 0.0;
+				for harmonic in 1..=20 {
+					let freq = pitch * harmonic as f32;
+					let formants =
+						(-((freq - 700.0) / 250.0).powi(2)).exp() + 0.6 * (-((freq - 1200.0) / 300.0).powi(2)).exp();
+					sample += formants * (phase * harmonic as f32).sin();
+				}
+				let envelope = 0.6 + 0.4 * (std::f32::consts::TAU * 4.0 * t).sin();
+				sample * envelope * 0.2
+			})
+			.collect()
+	}
+
+	/// Magnitude spectrum, 25 Hz bins to 4 kHz, of a 20 ms run at 48 kHz.
+	fn spectrum(samples: &[f32]) -> Vec<f32> {
+		(1..160)
+			.map(|bin| {
+				let freq = bin as f32 * 25.0;
+				let (mut re, mut im) = (0.0f32, 0.0f32);
+				for (i, sample) in samples.iter().enumerate() {
+					let angle = std::f32::consts::TAU * freq * i as f32 / 48_000.0;
+					re += sample * angle.cos();
+					im += sample * angle.sin();
+				}
+				(re * re + im * im).sqrt()
+			})
+			.collect()
+	}
+
+	/// Pearson correlation of two equal-length runs.
+	fn correlation(a: &[f32], b: &[f32]) -> f32 {
+		let n = a.len().min(b.len()) as f32;
+		let (ma, mb) = (a.iter().sum::<f32>() / n, b.iter().sum::<f32>() / n);
+		let (mut ab, mut aa, mut bb) = (0.0, 0.0, 0.0);
+		for (x, y) in a.iter().zip(b) {
+			ab += (x - ma) * (y - mb);
+			aa += (x - ma).powi(2);
+			bb += (y - mb).powi(2);
+		}
+		ab / (aa.sqrt() * bb.sqrt()).max(f32::EPSILON)
+	}
+
+	/// With DRED on the encoder, a lost packet, and each packet of a short burst, is rebuilt
+	/// from the packet after the hole. DRED resynthesizes speech from a neural vocoder, so the
+	/// waveform differs; the magnitude spectrum stays close to what the packet itself decodes
+	/// to, and closer than concealment's.
+	#[test]
+	fn opus_dred_rebuilds_lost_packets_from_the_next() {
+		let mut config = crate::encode::Config::new(48_000, Layout::Mono);
+		config.kind = Some(crate::encode::Kind::Voice);
+		config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(32_000));
+		config.dred = Some(std::time::Duration::from_millis(200));
+		let mut encoder = crate::encode::Encoder::new(&config).unwrap();
+		let frames = encoder.frame_size();
+		let pcm = voice(frames * 120);
+		let packets: Vec<_> = pcm
+			.chunks_exact(frames)
+			.map(|chunk| crate::single(encoder.encode_all(chunk).unwrap()).payload)
+			.collect();
+		let catalog = encoder.catalog();
+		let mut reference = Decoder::new(&catalog, &Config::default()).unwrap();
+		let decoded: Vec<Vec<f32>> = packets
+			.iter()
+			.map(|packet| samples(reference.decode_all(packet).unwrap()).concat())
+			.collect();
+
+		// Lose `lost`, rebuild each packet from the one after the hole, and compare with
+		// what that packet decodes to: rebuilt, then concealed.
+		let rebuild = |lost: std::ops::Range<usize>, use_next: bool| -> Vec<(bool, f32, f32)> {
+			let mut decoder = Decoder::new(&catalog, &Config::default()).unwrap();
+			assert!(decoder.recovery().is_some_and(|recovery| !recovery.by_default));
+			for packet in &packets[..lost.start] {
+				decoder.decode_all(packet).unwrap();
+			}
+			let next = &packets[lost.end];
+			lost.clone()
+				.map(|index| {
+					let rebuilt = decoder
+						.recover(use_next.then_some(&next[..]), lost.end - index)
+						.unwrap();
+					let out = samples(decoder.ready().unwrap()).concat();
+					let level = rms(&out) / rms(&decoded[index]);
+					(rebuilt, correlation(&spectrum(&out), &spectrum(&decoded[index])), level)
+				})
+				.collect()
+		};
+
+		for lost in [80..81, 90..93] {
+			let rebuilt = rebuild(lost.clone(), true);
+			let concealed = rebuild(lost.clone(), false);
+			for ((was_rebuilt, close, level), (was_concealed, far, _)) in rebuilt.iter().zip(&concealed) {
+				assert!(*was_rebuilt && !*was_concealed, "{lost:?}: {rebuilt:?} {concealed:?}");
+				assert!(*close > 0.8, "{lost:?}: rebuilt spectrum correlates {close}");
+				assert!(
+					close > far,
+					"{lost:?}: rebuilt {close} is no closer than concealed {far}"
+				);
+				// The vocoder keeps the envelope, not the waveform, and plays it somewhat quieter.
+				assert!((0.3..2.0).contains(level), "{lost:?}: rebuilt level {level}");
+			}
+		}
 	}
 
 	fn rms(samples: &[f32]) -> f32 {

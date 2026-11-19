@@ -5,9 +5,9 @@ use std::collections::VecDeque;
 use bytes::Bytes;
 use opusic_sys::{
 	OPUS_APPLICATION_AUDIO, OPUS_APPLICATION_VOIP, OPUS_GET_BITRATE_REQUEST, OPUS_GET_IN_DTX_REQUEST,
-	OPUS_GET_LOOKAHEAD_REQUEST, OPUS_OK, OPUS_RESET_STATE, OPUS_SET_BITRATE_REQUEST, OPUS_SET_DTX_REQUEST,
-	OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_MUSIC, OPUS_SIGNAL_VOICE, OpusEncoder, opus_encode_float, opus_encoder_create,
-	opus_encoder_ctl, opus_encoder_destroy,
+	OPUS_GET_LOOKAHEAD_REQUEST, OPUS_OK, OPUS_RESET_STATE, OPUS_SET_BITRATE_REQUEST, OPUS_SET_DRED_DURATION_REQUEST,
+	OPUS_SET_DTX_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST, OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_MUSIC,
+	OPUS_SIGNAL_VOICE, OpusEncoder, opus_encode_float, opus_encoder_create, opus_encoder_ctl, opus_encoder_destroy,
 };
 
 use super::Backend;
@@ -37,6 +37,9 @@ pub(super) struct Libopus {
 // struct; libopus encoder methods take a single &mut, so a unique owner is
 // allowed to move it across threads.
 unsafe impl Send for Libopus {}
+
+/// The loss, in percent, an encoder sending DRED tells libopus to expect.
+const DRED_EXPECTED_LOSS: i32 = 10;
 
 impl Libopus {
 	/// Opens at the config's rate and layout, which the front end has already
@@ -92,6 +95,17 @@ impl Libopus {
 			backend.set_ctl(OPUS_SET_SIGNAL_REQUEST, signal, "OPUS_SET_SIGNAL")?;
 		}
 		backend.set_ctl(OPUS_SET_DTX_REQUEST, i32::from(dtx), "OPUS_SET_DTX")?;
+		if let Some(dred) = config.dred {
+			// In 10 ms units. libopus sizes the redundancy it can afford from the loss it
+			// expects, and spends none at a loss of zero.
+			let units = dred.as_millis().div_ceil(10).clamp(1, 100) as i32;
+			backend.set_ctl(OPUS_SET_DRED_DURATION_REQUEST, units, "OPUS_SET_DRED_DURATION")?;
+			backend.set_ctl(
+				OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+				DRED_EXPECTED_LOSS,
+				"OPUS_SET_PACKET_LOSS_PERC",
+			)?;
+		}
 
 		let bitrate = backend.get_ctl(OPUS_GET_BITRATE_REQUEST, "OPUS_GET_BITRATE")?;
 		backend.bitrate = u64::try_from(bitrate)

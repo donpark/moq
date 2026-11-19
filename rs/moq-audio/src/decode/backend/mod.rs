@@ -58,6 +58,24 @@ pub(crate) trait Backend: Send + std::panic::UnwindSafe + std::panic::RefUnwindS
 		0
 	}
 
+	/// How this backend recovers lost packets from later ones, or `None` when it only
+	/// conceals them.
+	fn recovery(&self) -> Option<super::Recovery> {
+		None
+	}
+
+	/// Ready one packet's worth of audio for a lost packet, `frames_to_next` packets before
+	/// `next` (the packet that arrived after the hole, when one has), as
+	/// [`decode`](Self::decode) readies a received one. Returns whether the audio was rebuilt
+	/// from redundancy rather than concealed.
+	///
+	/// The default conceals, as an empty packet does.
+	fn recover(&mut self, next: Option<&[u8]>, frames_to_next: usize) -> Result<bool, Error> {
+		let _ = (next, frames_to_next);
+		self.decode(&[])?;
+		Ok(false)
+	}
+
 	/// The stable lowercase name of this backend, as [`Decoder::name`](super::Decoder::name)
 	/// reports it. Callers never select by it.
 	fn name(&self) -> &str;

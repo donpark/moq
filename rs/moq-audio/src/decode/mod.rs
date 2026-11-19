@@ -19,8 +19,10 @@ mod backpressure;
 mod consumer;
 mod decoded;
 mod decoder;
+mod recovery;
 
 pub use backpressure::Backpressure;
 pub use consumer::{Consumer, Delay, Options, Output, Read, Start};
 pub use decoded::Decoded;
 pub use decoder::{Backend, Config, Decoder};
+pub use recovery::{Losses, Recovery};
