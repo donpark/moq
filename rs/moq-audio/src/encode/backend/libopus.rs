@@ -6,8 +6,9 @@ use bytes::Bytes;
 use opusic_sys::{
 	OPUS_APPLICATION_AUDIO, OPUS_APPLICATION_VOIP, OPUS_GET_BITRATE_REQUEST, OPUS_GET_IN_DTX_REQUEST,
 	OPUS_GET_LOOKAHEAD_REQUEST, OPUS_OK, OPUS_RESET_STATE, OPUS_SET_BITRATE_REQUEST, OPUS_SET_DRED_DURATION_REQUEST,
-	OPUS_SET_DTX_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST, OPUS_SET_SIGNAL_REQUEST, OPUS_SIGNAL_MUSIC,
-	OPUS_SIGNAL_VOICE, OpusEncoder, opus_encode_float, opus_encoder_create, opus_encoder_ctl, opus_encoder_destroy,
+	OPUS_SET_DTX_REQUEST, OPUS_SET_INBAND_FEC_REQUEST, OPUS_SET_PACKET_LOSS_PERC_REQUEST, OPUS_SET_SIGNAL_REQUEST,
+	OPUS_SIGNAL_MUSIC, OPUS_SIGNAL_VOICE, OpusEncoder, opus_encode_float, opus_encoder_create, opus_encoder_ctl,
+	opus_encoder_destroy,
 };
 
 use super::Backend;
@@ -95,6 +96,14 @@ impl Libopus {
 			backend.set_ctl(OPUS_SET_SIGNAL_REQUEST, signal, "OPUS_SET_SIGNAL")?;
 		}
 		backend.set_ctl(OPUS_SET_DTX_REQUEST, i32::from(dtx), "OPUS_SET_DTX")?;
+		if config.fec {
+			backend.set_ctl(OPUS_SET_INBAND_FEC_REQUEST, 1, "OPUS_SET_INBAND_FEC")?;
+			backend.set_ctl(
+				OPUS_SET_PACKET_LOSS_PERC_REQUEST,
+				DRED_EXPECTED_LOSS,
+				"OPUS_SET_PACKET_LOSS_PERC",
+			)?;
+		}
 		if let Some(dred) = config.dred {
 			// In 10 ms units. libopus sizes the redundancy it can afford from the loss it
 			// expects, and spends none at a loss of zero.

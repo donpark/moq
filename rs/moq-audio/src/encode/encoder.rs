@@ -177,6 +177,11 @@ pub struct Config {
 	/// small neural network for it and spends some of its bitrate on it, which its rate
 	/// control may cut to nothing when the bitrate is low.
 	pub dred: Option<Duration>,
+	/// Opus in-band forward error correction (LBRR): each packet carries a low-rate copy
+	/// of the one before it, which a receiver that recovers rebuilds a single lost packet
+	/// from. Off by default. Opus only. The encoder is also told to expect loss, without
+	/// which libopus writes no copy.
+	pub fec: bool,
 }
 
 impl Config {
@@ -191,6 +196,7 @@ impl Config {
 			frame_duration: Duration::from_millis(20),
 			backend: Backend::Auto,
 			dred: None,
+			fec: false,
 		}
 	}
 
@@ -227,6 +233,9 @@ impl Config {
 		self.layout.validate()?;
 		let (rate, channels) = (self.sample_rate, self.layout.channels());
 
+		if self.fec && self.codec != Codec::Opus {
+			return Err(Error::Unsupported("in-band fec is Opus only".into()));
+		}
 		if self.dred.is_some() && self.codec != Codec::Opus {
 			return Err(Error::Unsupported("deep redundancy (dred) is Opus only".into()));
 		}
@@ -1209,6 +1218,17 @@ mod tests {
 		let mut pcm = Config::new(48_000, Layout::Mono);
 		pcm.codec = Codec::Pcm;
 		pcm.dred = Some(Duration::from_millis(100));
+		assert!(matches!(Encoder::new(&pcm), Err(Error::Unsupported(_))));
+	}
+
+	#[test]
+	fn fec_is_opus_only() {
+		let mut config = Config::new(48_000, Layout::Mono);
+		config.fec = true;
+		assert!(Encoder::new(&config).is_ok());
+		let mut pcm = Config::new(48_000, Layout::Mono);
+		pcm.codec = Codec::Pcm;
+		pcm.fec = true;
 		assert!(matches!(Encoder::new(&pcm), Err(Error::Unsupported(_))));
 	}
 }
